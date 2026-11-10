@@ -322,15 +322,10 @@ impl NoticeState {
                         if claimed.is_empty() {
                             return true;
                         }
-                        let resolved = claimed
-                            .iter()
-                            .map(|id| resolution(&actor.id, id))
-                            .collect::<Vec<_>>();
-                        if resolved.iter().any(Option::is_none) {
-                            return true;
-                        }
-                        let closure = resolved.into_iter().flatten().max().unwrap_or(0);
-                        mail.iter().any(|source| source.position <= closure)
+                        // Only the notice's actual source IDs are covered. A new
+                        // Mail may precede this read receipt without belonging
+                        // to the cursor snapshot that the receipt consumed.
+                        claimed.iter().any(|id| resolution(&actor.id, id).is_none())
                     });
                 let first = timestamp(&mail[0].ts, now);
                 let first = resume_at.map_or(first, |resume| first.max(resume));

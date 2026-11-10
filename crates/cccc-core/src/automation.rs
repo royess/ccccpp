@@ -756,10 +756,6 @@ fn unread_notices(
         }
 
         if mail_delays.busy > 0 && !mail_pending.is_empty() {
-            let pending_ids = mail_pending
-                .iter()
-                .map(|event| event.id.clone())
-                .collect::<HashSet<_>>();
             let active_claim = mail_claims
                 .get(&(actor.id.clone(), actor.created_at.clone()))
                 .into_iter()
@@ -778,19 +774,11 @@ fn unread_notices(
                     if claimed.is_empty() {
                         return true;
                     }
-                    let resolutions = claimed
+                    // A resolved notice does not cover later independent Mail,
+                    // even if that Mail predates the read receipt in the ledger.
+                    claimed
                         .iter()
-                        .map(|source| resolution_position(&actor.id, source))
-                        .collect::<Vec<_>>();
-                    if resolutions.iter().any(Option::is_none) {
-                        return true;
-                    }
-                    let closure_position = resolutions.into_iter().flatten().max().unwrap_or(0);
-                    pending_ids.iter().any(|source| {
-                        positions
-                            .get(source)
-                            .is_some_and(|position| *position <= closure_position)
-                    })
+                        .any(|source| resolution_position(&actor.id, source).is_none())
                 });
             let first_at = timestamp(&mail_pending[0].ts, now);
             let first_at = resume_at.map_or(first_at, |resume| first_at.max(resume));
@@ -985,6 +973,77 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn resolved_mail_notice_does_not_cover_an_independent_source_before_its_read_receipt() {
+        for new_before_read in [false, true] {
+            for read_old in [false, true] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let home = HomeLayout::from_path(temp.path()).expect("home");
+                let (store, group) = mail_for_both(&home);
+                let eligible = HashSet::from(["first".to_owned()]);
+                let idle = HashSet::new();
+                let due = || {
+                    due_unread_notices(
+                        &home,
+                        &store,
+                        &group,
+                        Some(&eligible),
+                        &idle,
+                        UnreadPass::Scheduled,
+                    )
+                    .expect("projection and ordered oracle agree")
+                    .map(|(_, events)| events)
+                    .unwrap_or_default()
+                };
+                let first_notice = due().remove(0);
+                let old_source = first_notice.data["context"]["source_event_ids"][0]
+                    .as_str()
+                    .expect("old source")
+                    .to_owned();
+                let path = store.ledger_path(&group.group_id).expect("ledger");
+                ledger::append(&path, &first_notice).expect("announce old source");
+                let mut incoming = Event::new("chat.message", &group.group_id);
+                incoming.by = "user".into();
+                incoming.ts = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+                incoming.data =
+                    json!({"to":["first"],"message_mode":"mail","text":"independent follow-up"})
+                        .as_object()
+                        .expect("message")
+                        .clone();
+                if new_before_read {
+                    ledger::append(&path, &incoming).expect("Mail before partial read");
+                }
+                if read_old {
+                    let read = inbox::consume_unread(&home, &group, "first", "first", 1)
+                        .expect("read only original source");
+                    assert_eq!(read.messages.len(), 1);
+                    assert_eq!(read.messages[0].id, old_source);
+                }
+                if !new_before_read {
+                    ledger::append(&path, &incoming).expect("Mail after partial read");
+                }
+                let notices = due();
+                if read_old {
+                    assert_eq!(notices.len(), 1, "arrival before read: {new_before_read}");
+                    assert_eq!(
+                        notices[0].data["context"]["source_event_ids"],
+                        json!([incoming.id])
+                    );
+                    ledger::append(&path, &notices[0]).expect("announce follow-up once");
+                    assert!(
+                        due().is_empty(),
+                        "unresolved follow-up is not announced twice"
+                    );
+                } else {
+                    assert!(
+                        notices.is_empty(),
+                        "an unresolved original notice stays deduplicated"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

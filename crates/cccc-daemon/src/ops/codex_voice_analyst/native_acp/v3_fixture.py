@@ -6,7 +6,7 @@ import sys
 import uuid
 from pathlib import Path
 
-root = Path.cwd()
+root = Path(os.environ.get("ACP_FIXTURE_ROOT", Path.cwd()))
 home = Path(os.environ["HOME"])
 home.mkdir(parents=True, exist_ok=True)
 saved = home / "v3_sessions.json"

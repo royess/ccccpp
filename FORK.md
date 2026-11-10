@@ -92,6 +92,12 @@ Host opt-ins are generic configuration, with no deployment values stored here:
 
 ## Maintenance
 
+Mail-notice coverage follows the notice's actual source IDs. Reading an earlier
+Mail snapshot cannot silently cover an independent message that arrived before
+the read receipt was recorded. The projection and ordered reducer share this
+rule; unresolved notices remain deduplicated. Native tests cover both arrival
+orders, unresolved notices and repeat-notification suppression.
+
 Codex new threads follow the provider's default paginated history format rather
 than forcing legacy storage for terminal attachment. Existing history is not
 automatically migrated. See [Codex history storage](docs/reference/codex-history.md)

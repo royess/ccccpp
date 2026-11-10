@@ -42,6 +42,10 @@ fn actor_start_preserves_a_healthy_acp_owner_despite_a_failed_native_receipt() {
             temp.path().join("codex").to_string_lossy().into_owned(),
         ),
         ("ACP_FIXTURE_CLI".into(), "/bin/true".into()),
+        (
+            "ACP_FIXTURE_ROOT".into(),
+            temp.path().to_string_lossy().into_owned(),
+        ),
     ]);
     group.actors.push(actor.clone());
     store.save(&group).expect("save ACP actor");
@@ -87,8 +91,24 @@ fn actor_start_preserves_a_healthy_acp_owner_despite_a_failed_native_receipt() {
             );
             assert_eq!(std::fs::read(&receipt).expect("retained receipt"), retained);
         }
-        let requests =
-            std::fs::read_to_string(temp.path().join("v3_requests.jsonl")).expect("ACP requests");
+        // The managed owner can become healthy before its fixture flushes the
+        // first session request. Wait for the observable frame, not a fixed sleep.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let requests = loop {
+            if let Ok(text) = std::fs::read_to_string(temp.path().join("v3_requests.jsonl"))
+                && text.lines().any(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .is_ok_and(|frame| frame["method"] == "session/new")
+                })
+            {
+                break text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ACP session request was not recorded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert_eq!(
             requests
                 .lines()
