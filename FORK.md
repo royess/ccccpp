@@ -92,6 +92,11 @@ Host opt-ins are generic configuration, with no deployment values stored here:
 
 ## Maintenance
 
+Codex new threads follow the provider's default paginated history format rather
+than forcing legacy storage for terminal attachment. Existing history is not
+automatically migrated. See [Codex history storage](docs/reference/codex-history.md)
+for compatibility checks and the operator-controlled migration boundary.
+
 Use separate `origin` and `upstream` remotes. Select an explicit upstream revision
 and merge it on a review branch; do not force-push published downstream history.
 Review policy, MCP scope, transport, approvals, original-thread resume and browser
@@ -160,3 +165,17 @@ Focus/online/visibility changes and one visible-page
 60-second catch-up read retrieve changes from other devices. This uses no model,
 Agent reminder or inbox consumption. The shared authentication, CSRF and exhibit
 write guards apply unchanged. Preferences confer no Group or execution access.
+
+## Original-thread resume budget and diagnostics
+
+Original Codex thread resume waits up to180seconds for the existing app-server
+response. Long retained histories can exceed ordinary RPC budgets without being
+corrupt. New-thread startup and unrelated RPC deadlines remain unchanged.
+Resume failures retain the original identity/history and stop automatic retry;
+there is no fallback new thread or synthetic model turn. A65second synthetic
+resume verifies the actual connection path, same identity and restrictive policy.
+Daemon lifecycle start/restart calls allow300seconds; ordinary calls and explicit
+caller deadline overrides are unchanged. Safe error-kind classification distinguishes timeout, missing dependency,
+permission and closed transport without retaining private provider error text.
+Interactive Actors should use the native remote TUI of their owned app-server;
+stdio-only mode remains available for explicitly required recovery roles.

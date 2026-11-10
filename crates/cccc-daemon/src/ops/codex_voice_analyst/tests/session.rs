@@ -495,3 +495,86 @@ async fn new_and_resumed_codex_threads_run_the_model_the_command_declares() {
         drop(session);
     }
 }
+
+#[tokio::test]
+async fn slow_original_thread_resume_survives_sixty_seconds_without_replacement_or_turn() {
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::json;
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let endpoint = format!("ws://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("websocket");
+        for method in ["initialize", "config/read", "thread/resume"] {
+            let Message::Text(text) = socket.next().await.expect("frame").expect("text") else {
+                panic!("request");
+            };
+            let request: Value = serde_json::from_str(&text).expect("JSON");
+            assert_eq!(request["method"], method);
+            let result = if method == "thread/resume" {
+                assert_eq!(request["params"]["threadId"], "retained-conversation");
+                assert_eq!(request["params"]["excludeTurns"], true);
+                assert_eq!(request["params"]["model"], "fixture-model");
+                assert_eq!(request["params"]["sandbox"], "read-only");
+                assert_eq!(request["params"]["approvalPolicy"], "on-request");
+                // Exercise the actual connection path beyond the former deadline.
+                tokio::time::sleep(Duration::from_secs(65)).await;
+                json!({"thread":{"id":"retained-conversation"},"approvalPolicy":"on-request","sandbox":{"type":"readOnly"}})
+            } else if method == "config/read" {
+                json!({"config":{"approval_policy":"on-request","sandbox_mode":"read-only"}})
+            } else {
+                json!({})
+            };
+            socket
+                .send(Message::Text(
+                    json!({"id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("reply");
+        }
+        if let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout(Duration::from_millis(100), socket.next()).await
+        {
+            panic!("resume must not start a replacement or model turn: {text}");
+        }
+    });
+    let session = AnalystSession::connect(ConnectConfig {
+        binding: WorkspaceBinding {
+            root: std::env::current_dir().expect("cwd"),
+        },
+        generation: "slow-resume".into(),
+        endpoint,
+        remote_tui_prefix: [
+            "codex",
+            "--model",
+            "fixture-model",
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "on-request",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        environment: std::collections::BTreeMap::from([(
+            "CCCC_CODEX_PRESERVE_POLICY".into(),
+            "1".into(),
+        )]),
+        resume_thread_id: Some("retained-conversation".into()),
+        process: None,
+        delegations: HashMap::new(),
+        purpose: SessionPurpose::Actor,
+    })
+    .await
+    .expect("slow original resume must succeed within the bounded deadline");
+    assert_eq!(session.thread_id(), "retained-conversation");
+    server.await.expect("no replacement thread or model turn");
+    session.stop("slow-resume").await.expect("stop fixture");
+}

@@ -43,13 +43,13 @@ async fn new_session_is_not_ready_until_the_same_thread_can_resume() {
                     "thread/read" => {
                         assert!(materialized);
                         assert_eq!(request["params"]["threadId"], "new-thread");
-                        assert_eq!(request["params"]["includeTurns"], true);
+                        assert_eq!(request["params"]["includeTurns"], false);
                         observed.store(true, Ordering::SeqCst);
                         if fail_resume {
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32600,"message":"no rollout found"}}).to_string().into())).await.expect("send test event");
                             continue;
                         }
-                        json!({"thread":{"id":"new-thread","turns":[]}})
+                        json!({"thread":{"id":"new-thread","path":"fixture-rollout.jsonl"}})
                     }
                     other => panic!("startup must not send model work: {other}"),
                 };

@@ -350,6 +350,26 @@ async fn native_stdio_real_codex_preserves_policy_and_resumes_same_thread() {
     .await
     .expect("real stdio start and restrictive-policy assertion");
     assert!(session.structured_only());
+    if let super::super::ManagedProtocol::Codex(protocol) = &session.protocol {
+        let metadata = protocol
+            .request(
+                "thread/read",
+                json!({"threadId":session.thread_id(),"includeTurns":false}),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("metadata without full history");
+        assert_eq!(metadata["thread"]["historyMode"], "paginated");
+        let page = protocol
+            .request(
+                "thread/turns/list",
+                json!({"threadId":session.thread_id(),"limit":2,"itemsView":"summary"}),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("bounded native history page");
+        assert_eq!(page["data"], json!([]));
+    }
     let thread = session.thread_id().to_owned();
     let generation = session.generation().to_owned();
     session.stop(&generation).await.expect("old owner exits");

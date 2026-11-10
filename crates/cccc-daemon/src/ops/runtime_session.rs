@@ -52,7 +52,7 @@ pub fn prepare_codex_app_thread(
         || string(&document, "transport") != CODEX_MANAGED_TRANSPORT
         || string(&document, "runtime") != "codex"
         || string(&document, "workspace_path") != workspace_path(cwd)
-        || string(&document, "command_fingerprint") != app_thread_command_fingerprint(command)
+        || !compatible_app_thread_command(&string(&document, "command_fingerprint"), command)
         || string(&document, "model") != model.trim()
         || string(&document, "identity_fingerprint")
             != codex_identity_fingerprint(command, environment)
@@ -332,19 +332,40 @@ fn codex_identity_fingerprint(
     .identity_fingerprint()
 }
 
+fn compatible_app_thread_command(stored: &str, command: &[String]) -> bool {
+    if stored == app_thread_command_fingerprint(command) {
+        return true;
+    }
+    // Older receipts included the listen value when global flags preceded the
+    // subcommand. Accept only those exact known transport spellings; all other
+    // argv, model, policy and credential-root bindings remain enforced.
+    let Some(index) = command.iter().rposition(|item| item == "app-server") else {
+        return false;
+    };
+    if command.len() != index + 3 || command[index + 1] != "--listen" {
+        return false;
+    }
+    ["stdio://", "ws://127.0.0.1:0"].iter().any(|endpoint| {
+        let mut legacy = command.to_vec();
+        legacy[index + 2] = (*endpoint).into();
+        stored == command_fingerprint(&legacy)
+    })
+}
+
 fn stable_app_thread_command(command: &[String]) -> Vec<String> {
-    if command.len() < 2
-        || Path::new(&command[0])
-            .file_name()
-            .and_then(|value| value.to_str())
-            != Some("codex")
-        || command[1] != "app-server"
+    if Path::new(command.first().map(String::as_str).unwrap_or_default())
+        .file_name()
+        .and_then(|value| value.to_str())
+        != Some("codex")
     {
         return command.to_vec();
     }
-    let mut stable = Vec::with_capacity(command.len());
+    let Some(index) = command.iter().rposition(|item| item == "app-server") else {
+        return command.to_vec();
+    };
+    let mut stable = command[..=index].to_vec();
     let mut skip_next = false;
-    for item in command {
+    for item in &command[index + 1..] {
         if skip_next {
             skip_next = false;
         } else if item == "--listen" {
@@ -613,6 +634,35 @@ mod tests {
                 .expect("legacy receipt")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn flagged_codex_transport_migration_preserves_legacy_binding_only() {
+        let old: Vec<String> = [
+            "/owned/bin/codex",
+            "-c",
+            "sandbox_mode=read-only",
+            "--model",
+            "fixture-model",
+            "app-server",
+            "--listen",
+            "stdio://",
+        ]
+        .map(str::to_owned)
+        .into();
+        let legacy = command_fingerprint(&old);
+        let mut remote = old.clone();
+        *remote.last_mut().unwrap() = "ws://127.0.0.1:0".into();
+        assert_eq!(
+            app_thread_command_fingerprint(&old),
+            app_thread_command_fingerprint(&remote)
+        );
+        assert!(compatible_app_thread_command(&legacy, &remote));
+        remote[4] = "changed-model".into();
+        assert!(!compatible_app_thread_command(&legacy, &remote));
+        remote[4] = "fixture-model".into();
+        remote[2] = "sandbox_mode=danger-full-access".into();
+        assert!(!compatible_app_thread_command(&legacy, &remote));
     }
 
     #[test]

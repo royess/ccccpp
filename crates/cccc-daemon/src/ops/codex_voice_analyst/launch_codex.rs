@@ -5,6 +5,10 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+// Saved rollout loading can exceed ordinary RPC deadlines on long-lived threads.
+// Keep a bounded resume-only allowance; unrelated RPC deadlines stay unchanged.
+pub(super) const THREAD_RESUME_TIMEOUT: Duration = Duration::from_secs(180);
+
 impl AnalystSession {
     pub(super) async fn launch_prepared(
         binding: WorkspaceBinding,
@@ -285,15 +289,15 @@ impl AnalystSession {
             // disconnect then repeats on every reconnect.
             resume_params["excludeTurns"] = json!(true);
             match protocol
-                .request("thread/resume", resume_params, Duration::from_secs(20))
+                .request("thread/resume", resume_params, THREAD_RESUME_TIMEOUT)
                 .await
             {
                 Ok(started) => (started, true),
                 Err(error) => return Err(error),
             }
         } else {
-            // Stock Codex TUI can resume legacy history, which lets Web attach to this thread.
-            params["historyMode"] = json!("legacy");
+            // Follow Codex's default paginated storage. Do not force legacy history
+            // for the native viewer: current Codex TUI supports paginated resume.
             (
                 protocol
                     .request("thread/start", params, Duration::from_secs(20))
@@ -364,12 +368,14 @@ impl AnalystSession {
             let persisted = protocol
                 .request(
                     "thread/read",
-                    json!({"threadId":thread_id,"includeTurns":true}),
+                    json!({"threadId":thread_id,"includeTurns":false}),
                     Duration::from_secs(20),
                 )
                 .await?;
             if persisted["thread"]["id"].as_str() != Some(thread_id.as_str())
-                || !persisted["thread"]["turns"].is_array()
+                || persisted["thread"]["path"]
+                    .as_str()
+                    .is_none_or(str::is_empty)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,

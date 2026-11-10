@@ -75,6 +75,7 @@ pub fn failed(
     group: &str,
     actor: &str,
     attempt: &ResumeAttempt,
+    cause: io::ErrorKind,
 ) -> io::Result<io::Error> {
     let mut document = read(home, group, actor)?;
     let id = if string(&document, "runtime") == "codex" {
@@ -82,7 +83,18 @@ pub fn failed(
     } else {
         string(&document, "provider_session_id")
     };
-    let diagnostic = "The saved Runtime conversation could not be resumed. Its identity and history have been retained.";
+    let cause = match cause {
+        io::ErrorKind::TimedOut => "timeout",
+        io::ErrorKind::NotFound => "not_found",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset => "transport_closed",
+        _ => "startup_error",
+    };
+    let diagnostic = if cause == "timeout" {
+        "Saved Runtime conversation startup timed out. Its identity and history have been retained."
+    } else {
+        "The saved Runtime conversation could not be resumed. Its identity and history have been retained."
+    };
     if supported(&document)
         && id == attempt.session_id
         && string(&document, "last_resume_attempt_id") == attempt.attempt_id
@@ -94,6 +106,7 @@ pub fn failed(
         document.insert("status".into(), json!("resume_failed"));
         document.insert("resume_eligible".into(), json!(false));
         document.insert("last_resume_error".into(), json!(diagnostic));
+        document.insert("last_resume_error_kind".into(), json!(cause));
         document.insert("failure_count".into(), json!(failures.saturating_add(1)));
         document.insert("last_resume_attempt_id".into(), json!(""));
         document.insert("updated_at".into(), json!(utc_now()));
@@ -110,7 +123,7 @@ pub fn finish_launch<T>(
 ) -> io::Result<T> {
     match (result, actor, attempt) {
         (Err(error), Some((group, actor)), Some(attempt)) => {
-            let diagnostic = failed(home, group, actor, attempt).unwrap_or_else(|_| {
+            let diagnostic = failed(home, group, actor, attempt, error.kind()).unwrap_or_else(|_| {
                 io::Error::other("Saved conversation startup failed and its recovery state could not be recorded. The saved identity has not been replaced.")
             });
             // A failed teardown still owns a process. Preserve that type and
@@ -169,6 +182,41 @@ mod tests {
     use cccc_contracts::ActorRuntime;
     use receipt::{grok, opencode};
     use std::{collections::BTreeMap, path::Path};
+
+    #[test]
+    fn resume_timeout_retains_identity_and_only_safe_error_class() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = HomeLayout::from_path(temp.path().join("home")).unwrap();
+        home.initialize().unwrap();
+        record(ActorRuntime::Codex, &home, temp.path(), "original-thread");
+        let mut document = read(&home, "g_resume", "peer").unwrap();
+        let attempt = begin(&mut document, "original-thread".into())
+            .unwrap()
+            .unwrap();
+        write(&home, "g_resume", "peer", &document).unwrap();
+        let result: io::Result<()> = finish_launch(
+            &home,
+            Some(("g_resume", "peer")),
+            Some(&attempt),
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "synthetic-secret private startup details",
+            )),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out"));
+        assert!(!error.contains("synthetic-secret"));
+        let saved = read(&home, "g_resume", "peer").unwrap();
+        assert_eq!(saved["provider_thread_id"], "original-thread");
+        assert_eq!(saved["last_resume_error_kind"], "timeout");
+        assert_eq!(saved["resume_eligible"], false);
+        assert_eq!(saved["failure_count"], 1);
+        assert!(retry(&home, "g_resume", "peer", ActorRuntime::Codex).unwrap());
+        assert_eq!(
+            read(&home, "g_resume", "peer").unwrap()["provider_thread_id"],
+            "original-thread"
+        );
+    }
 
     fn record(runtime: ActorRuntime, home: &HomeLayout, cwd: &Path, id: &str) {
         let command = cccc_runtime::default_command(runtime);
@@ -380,12 +428,13 @@ mod tests {
         let current = prepare(runtime, &home, temp.path())
             .expect("lookup")
             .expect("current");
-        failed(&home, "g_resume", "peer", &old).expect("late failure");
+        failed(&home, "g_resume", "peer", &old, io::ErrorKind::Other).expect("late failure");
         let stored = read(&home, "g_resume", "peer").expect("receipt");
         assert_eq!(stored["status"], "usable");
         assert_eq!(stored["last_resume_attempt_id"], current.attempt_id);
         record(runtime, &home, temp.path(), "ses_saved");
-        failed(&home, "g_resume", "peer", &current).expect("late failure after success");
+        failed(&home, "g_resume", "peer", &current, io::ErrorKind::Other)
+            .expect("late failure after success");
         assert_eq!(
             read(&home, "g_resume", "peer").expect("receipt")["status"],
             "usable"

@@ -31,6 +31,7 @@ pub enum ClientError {
 pub struct DaemonClient {
     home: HomeLayout,
     timeout: Duration,
+    lifecycle_timeout: Duration,
     shared: Arc<ClientShared>,
 }
 
@@ -59,6 +60,7 @@ impl DaemonClient {
         Self {
             home,
             timeout: Duration::from_secs(60),
+            lifecycle_timeout: Duration::from_secs(300),
             shared: Arc::new(ClientShared::default()),
         }
     }
@@ -66,7 +68,18 @@ impl DaemonClient {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self.lifecycle_timeout = timeout;
         self
+    }
+
+    fn request_timeout(&self, op: &str) -> Duration {
+        // Original history loading and owned-process teardown may exceed a
+        // normal request budget. A caller's explicit timeout still wins.
+        if matches!(op, "actor_start" | "actor_restart" | "actor_new_session") {
+            self.lifecycle_timeout
+        } else {
+            self.timeout
+        }
     }
 
     pub async fn call(&self, request: &DaemonRequest) -> Result<DaemonResponse, ClientError> {
@@ -82,7 +95,11 @@ impl DaemonClient {
             );
         }
         let exchange_started = AtomicBool::new(false);
-        match tokio::time::timeout(self.timeout, self.call_inner(&request, &exchange_started)).await
+        match tokio::time::timeout(
+            self.request_timeout(&request.op),
+            self.call_inner(&request, &exchange_started),
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) if exchange_started.load(Ordering::Acquire) => {
@@ -234,3 +251,27 @@ fn outcome_unknown(request: &DaemonRequest, error: ClientError) -> ClientError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lifecycle_budget_tests {
+    use super::*;
+    #[test]
+    fn lifecycle_budget_does_not_extend_other_calls_or_explicit_deadlines() {
+        let home = HomeLayout::from_path(PathBuf::from("/synthetic/lifecycle-budget")).unwrap();
+        let client = DaemonClient::new(home);
+        assert_eq!(
+            client.request_timeout("actor_start"),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            client.request_timeout("actor_restart"),
+            Duration::from_secs(300)
+        );
+        assert_eq!(client.request_timeout("send"), Duration::from_secs(60));
+        let client = client.with_timeout(Duration::from_millis(100));
+        assert_eq!(
+            client.request_timeout("actor_start"),
+            Duration::from_millis(100)
+        );
+    }
+}

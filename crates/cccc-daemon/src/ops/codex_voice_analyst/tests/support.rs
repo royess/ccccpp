@@ -51,7 +51,7 @@ pub(super) async fn fake_app_server() -> (
                         assert_eq!(request["params"]["model"], "glm-5.3");
                         assert_eq!(request["params"]["approvalPolicy"], "never");
                         assert_eq!(request["params"]["sandbox"], "danger-full-access");
-                        assert_eq!(request["params"]["historyMode"], "legacy");
+                        assert!(request["params"].get("historyMode").is_none());
                         assert_eq!(
                             request["params"]["developerInstructions"],
                             json!(launch::ANALYST_INSTRUCTIONS)
@@ -75,11 +75,11 @@ pub(super) async fn fake_app_server() -> (
                     }
                     "thread/read" => {
                         assert!(materialized, "a reserved thread id is not durable history");
-                        assert_eq!(request["params"]["includeTurns"], true);
+                        assert_eq!(request["params"]["includeTurns"], false);
                         send_result(
                             &mut socket,
                             id,
-                            json!({"thread":{"id":"thread-1","turns":[]}}),
+                            json!({"thread":{"id":"thread-1","path":"fixture-rollout.jsonl","turns":[]}}),
                         )
                         .await;
                     }
@@ -181,7 +181,7 @@ pub(super) async fn fake_disconnecting_app_server() -> (String, JoinHandle<()>, 
                     send_result(
                         &mut socket,
                         id,
-                        json!({"thread":{"id":"thread-drop","turns":[]}}),
+                        json!({"thread":{"id":"thread-drop","path":"fixture-rollout.jsonl","turns":[]}}),
                     )
                     .await;
                 }
