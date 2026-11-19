@@ -272,6 +272,7 @@ function MessageBubbleBody({
       />
 
       <MessageContent
+        groupId={blobGroupId}
         fallbackText={bodyText}
         shouldRenderMarkdown={shouldRenderMarkdown}
         isDark={isDark}

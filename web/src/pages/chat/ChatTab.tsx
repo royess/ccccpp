@@ -1,3 +1,4 @@
+import { workspaceReportLink } from "../../components/workspace/workspaceReportLink";
 import { MessageSelection } from "../../features/messageRelay/MessageSelection";
 // ChatTab is the main chat page component.
 // Refactored to use useChatTab hook for business logic, reducing prop drilling.
@@ -442,6 +443,19 @@ export function ChatTab({
     workspaceScope?.scope_key || "",
     workspaceScope?.url || "",
   );
+  const openedReport = useRef("");
+  const openReportFile = workspaceFiles.openFile;
+  useEffect(() => {
+    const link = workspaceReportLink(window.location.search);
+    if (!link || link.group !== selectedGroupId || !workspaceScope?.url) return;
+    const key = JSON.stringify([link.group, workspaceScope.scope_key, link.file]);
+    if (openedReport.current === key) return;
+    openedReport.current = key;
+    if (isSmallScreen) setChatMobileSurface(selectedGroupId, "files");
+    else if (activeSidePanel !== "files") selectSidePanel("files");
+    void openReportFile(link.file);
+  }, [selectedGroupId, workspaceScope, isSmallScreen, activeSidePanel, selectSidePanel,
+    setChatMobileSurface, openReportFile]);
   const hasWorkspaceViewer =
     workspaceFiles.mode === "changes" ? !!workspaceFiles.changes.selection : !!workspaceFiles.file;
   const showWorkspaceFileViewer = showSplitFiles && hasWorkspaceViewer;

@@ -84,6 +84,7 @@ export function useDeepLink({
     if (url.searchParams.get("group") === gid) return;
     url.searchParams.set("group", gid);
     url.searchParams.delete("event");
+    url.searchParams.delete("file");
     url.searchParams.delete("tab");
     window.history.replaceState(window.history.state, "", url.pathname + url.search + url.hash);
   }, [groups, selectedGroupId]);
@@ -99,6 +100,7 @@ export function useDeepLink({
         // Update URL
         const url = new URL(window.location.href);
         url.searchParams.set("group", gid);
+        url.searchParams.delete("file");
         url.searchParams.set("event", eid);
         url.searchParams.set("tab", "chat");
         window.history.replaceState({}, "", url.pathname + "?" + url.searchParams.toString());
