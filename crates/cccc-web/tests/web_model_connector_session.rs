@@ -387,7 +387,7 @@ async fn file_read_and_send_keep_distinct_effects_and_bound_identity() {
     let sent = f
         .call(
             "cccc_file_send",
-            json!({"path":"sample.txt","to":"user","mode":"send","actor_id":"beta","by":"user"}),
+            json!({"path":"sample.txt","to":"user","mode":"send","text":"Attached for review.","actor_id":"beta","by":"user"}),
             meta("chat-a"),
         )
         .await;
@@ -396,6 +396,11 @@ async fn file_read_and_send_keep_distinct_effects_and_bound_identity() {
     assert_eq!(event["by"], "alpha");
     assert_eq!(event["group_id"], f.group);
     assert_eq!(event["data"]["to"], json!(["user"]));
+    assert!(event["data"].get("text").is_none());
+    assert_eq!(
+        sent["result"]["structuredContent"]["mcp_omitted_fields"]["result.event"],
+        json!(["text"])
+    );
     assert_eq!(
         event["data"]["attachments"]
             .as_array()
@@ -532,6 +537,7 @@ async fn stopped_deleted_replaced_and_revoked_actors_lose_access() {
     f.bind("alpha", "chat-a");
     f.bind("beta", "chat-b");
     let groups = GroupStore::new(f.home.clone()).expect("valid test fixture");
+    let original = groups.load(&f.group).expect("group").actors[0].clone();
     for mutation in ["stop", "generation", "runtime", "remove"] {
         groups
             .mutate(&f.group, |g| {
@@ -540,6 +546,7 @@ async fn stopped_deleted_replaced_and_revoked_actors_lose_access() {
                     .iter_mut()
                     .find(|a| a.id == "alpha")
                     .expect("valid test fixture");
+                *a = original.clone();
                 a.enabled = true;
                 match mutation {
                     "stop" => a.enabled = false,
@@ -559,6 +566,18 @@ async fn stopped_deleted_replaced_and_revoked_actors_lose_access() {
             .await;
         assert_eq!(
             response["result"]["isError"], true,
+            "{mutation}: {response}"
+        );
+        let reason = match mutation {
+            "stop" => "paired_actor_stopped",
+            "generation" => "paired_actor_identity_changed",
+            "runtime" => "paired_actor_runtime_changed",
+            _ => "paired_actor_unavailable",
+        };
+        assert!(
+            response["result"]["structuredContent"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(reason)),
             "{mutation}: {response}"
         );
         assert_eq!(
@@ -957,3 +976,5 @@ async fn connector_list_reports_the_public_base_before_any_connector_exists() {
         "https://cccc.example.test"
     );
 }
+
+cccc_daemon::session_owner_test_entry!();

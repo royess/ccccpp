@@ -28,6 +28,17 @@ const SUPPORTED: &[&str] = &[
     "custom",
 ];
 
+/// Hermes members get CCCC's server in their own sessions. A `cccc` server
+/// saved in the Hermes profile would give every session there one identity,
+/// so CCCC no longer asks for one and refuses to start past it.
+fn hermes_setup() -> serde_json::Value {
+    json!({
+        "runtime":"hermes","mode":"managed_session","status":"ready","managed":true,
+        "mcp":"injected_per_session",
+        "note":"CCCC gives each Hermes member its own CCCC server in its session. Set up Hermes itself (login, model) with `hermes model`; do not add a cccc server to the Hermes profile."
+    })
+}
+
 pub fn run(home: &HomeLayout, args: SetupArgs) -> Result<()> {
     let executable = public_executable()?;
     let runtime = args.runtime.as_deref().map(str::trim).unwrap_or("");
@@ -71,6 +82,20 @@ pub fn run(home: &HomeLayout, args: SetupArgs) -> Result<()> {
     if runtime.is_empty() {
         let mut results = Vec::new();
         for runtime in SUPPORTED {
+            // Batch setup configures installed CLIs only; without this check
+            // these runtimes would write files or report a bare OS error.
+            if let Some(program) = batch_required_cli(runtime)
+                && cccc_core::runtime_mcp::find_program(
+                    program,
+                    std::env::var_os("PATH").as_deref(),
+                )
+                .is_none()
+            {
+                results.push(json!({
+                    "runtime":runtime,"status":"unavailable","error":format!("{program} CLI not found")
+                }));
+                continue;
+            }
             match setup_one(home, &args, runtime, &executable, &config) {
                 Ok(value) => results.push(value),
                 Err(error) => results.push(json!({
@@ -78,15 +103,7 @@ pub fn run(home: &HomeLayout, args: SetupArgs) -> Result<()> {
                 })),
             }
         }
-        let configured = results
-            .iter()
-            .filter(|value| {
-                matches!(
-                    value["status"].as_str(),
-                    Some("added" | "managed_by_cccc_actor" | "ready")
-                )
-            })
-            .count();
+        let configured = configured_count(&results);
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -101,14 +118,18 @@ pub fn run(home: &HomeLayout, args: SetupArgs) -> Result<()> {
             SUPPORTED.join(", ")
         );
     }
-    if matches!(runtime, "custom" | "hermes") {
+    if runtime == "hermes" {
+        println!("{}", serde_json::to_string_pretty(&hermes_setup())?);
+        return Ok(());
+    }
+    if runtime == "custom" {
         println!("{}", serde_json::to_string_pretty(&config)?);
         return Ok(());
     }
     if runtime == "deepseek" {
         println!(
             "{}",
-            serde_json::to_string_pretty(&setup_deepseek(home, &executable)?)?
+            serde_json::to_string_pretty(&setup_deepseek(home, true))?
         );
         return Ok(());
     }
@@ -119,20 +140,35 @@ pub fn run(home: &HomeLayout, args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
-fn setup_deepseek(home: &HomeLayout, executable: &Path) -> Result<serde_json::Value> {
-    let mut env = std::env::vars().collect();
-    match cccc_daemon::deepseek_setup::ensure(home, &mut env, executable) {
-        Ok(outcome) => Ok(json!({
+fn setup_deepseek(home: &HomeLayout, install: bool) -> serde_json::Value {
+    let mut env = cccc_runtime::unicode_environment().collect();
+    let result = if install {
+        cccc_daemon::deepseek_setup::ensure(home, &mut env)
+    } else {
+        let command = cccc_runtime::default_command(cccc_contracts::ActorRuntime::Deepseek);
+        cccc_daemon::deepseek_setup::prepare_for_start(home, &mut env, &command)
+    };
+    deepseek_setup_json(home, result)
+}
+
+fn deepseek_setup_json(
+    home: &HomeLayout,
+    result: Result<cccc_daemon::deepseek_setup::DeepSeekSetupOutcome, String>,
+) -> serde_json::Value {
+    match result {
+        Ok(outcome) => json!({
             "runtime":"deepseek",
+            "mode":"managed_session",
             "status":"ready",
             "managed":true,
+            "mcp":"injected_per_session",
             "home":home.root(),
             "dsh_home":outcome.dsh_home,
             "profile":outcome.profile,
             "packages_installed":outcome.packages_installed,
             "profile_created":outcome.profile_created
-        })),
-        Err(error) => Ok(setup_required(error)),
+        }),
+        Err(error) => setup_required(error),
     }
 }
 
@@ -145,7 +181,7 @@ fn setup_required(message: String) -> serde_json::Value {
     })
 }
 
-fn public_executable() -> Result<PathBuf> {
+pub(super) fn public_executable() -> Result<PathBuf> {
     let current = std::env::current_exe()?;
     Ok(select_public_executable(
         current,
@@ -163,6 +199,32 @@ fn select_public_executable(current: PathBuf, launcher: Option<PathBuf>) -> Path
         .unwrap_or(current)
 }
 
+/// Counts the runtimes whose `cccc` MCP entry setup wrote or confirmed. A
+/// runtime whose CCCC server is injected into each managed session needs no
+/// entry, so its "ready" is not counted.
+fn configured_count(results: &[serde_json::Value]) -> usize {
+    results
+        .iter()
+        .filter(|value| {
+            matches!(value["status"].as_str(), Some("added" | "ready"))
+                && value["mcp"] != "injected_per_session"
+        })
+        .count()
+}
+
+/// The CLI batch setup looks for before preparing a runtime whose setup would
+/// otherwise write a file (Cursor and Kimi Code have no `mcp add`; Antigravity
+/// locks its configuration first) or fail with a bare OS error (Grok).
+fn batch_required_cli(runtime: &str) -> Option<&'static str> {
+    match runtime {
+        "antigravity" => Some("agy"),
+        "cursor" => Some("cursor-agent"),
+        "grok" => Some("grok"),
+        "kimi" => Some("kimi"),
+        _ => None,
+    }
+}
+
 fn setup_one(
     home: &HomeLayout,
     args: &SetupArgs,
@@ -171,22 +233,29 @@ fn setup_one(
     config: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     if runtime == "deepseek" {
-        return setup_deepseek(home, executable);
+        return Ok(setup_deepseek(home, false));
     }
-    if matches!(runtime, "custom" | "hermes") {
+    if runtime == "hermes" {
+        return Ok(hermes_setup());
+    }
+    if runtime == "custom" {
         return Ok(json!({
             "runtime":runtime,"mode":"manual","status":"requires_action","config":config
         }));
     }
     if runtime == "cursor" {
+        let path = cccc_core::runtime_mcp::ensure_cursor(
+            &absolute(&args.path)?,
+            &std::collections::BTreeMap::new(),
+            executable,
+        )?;
         return Ok(json!({
-            "runtime":runtime,"mode":"prompt_assisted","status":"requires_action",
-            "project_path":absolute(&args.path)?,"config":config,
-            "instruction":"Add or replace the stdio MCP server named cccc with this configuration, then verify it is enabled."
+            "runtime":runtime,"mode":"auto","status":"ready","path":path,
+            "note":outside_session_note("A Cursor session")
         }));
     }
     if runtime == "antigravity" {
-        let environment = std::env::vars().collect();
+        let environment = cccc_runtime::unicode_environment().collect();
         let cwd = absolute(&args.path)?;
         let command = add_command(runtime, executable)?;
         let path = cccc_core::runtime_mcp::ensure_antigravity(&cwd, &environment, || {
@@ -196,7 +265,9 @@ fn setup_one(
                 &cwd,
             );
             let output = cccc_runtime::capture_command_blocking(
-                Command::new(program).args(&command[1..]).current_dir(&cwd),
+                cccc_runtime::background_command(program)
+                    .args(&command[1..])
+                    .current_dir(&cwd),
                 None,
                 std::time::Duration::from_secs(30),
                 32_768,
@@ -215,7 +286,7 @@ fn setup_one(
         );
     }
     if runtime == "grok" {
-        let environment = std::env::vars().collect();
+        let environment = cccc_runtime::unicode_environment().collect();
         let path = cccc_core::runtime_mcp::ensure_grok(
             &absolute(&args.path)?,
             &environment,
@@ -238,7 +309,8 @@ fn setup_one(
         }));
     }
     if runtime == "kimi" {
-        let mut environment = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+        let mut environment =
+            cccc_runtime::unicode_environment().collect::<std::collections::BTreeMap<_, _>>();
         environment.insert(
             "CCCC_HOME".into(),
             home.root().to_string_lossy().into_owned(),
@@ -249,6 +321,38 @@ fn setup_one(
     }
     let command = add_command(runtime, executable)?;
     let cwd = absolute(&args.path)?;
+    if runtime == "codex"
+        && let Some(registered) = codex_mcp_entry(home, &cwd)?
+    {
+        // The provider's public registry is authoritative. Ordinary setup must
+        // not downgrade a native entry or move it to this invocation's Home.
+        let transport = &registered["transport"];
+        let registered_args = transport["args"].as_array().and_then(|args| {
+            args.iter()
+                .map(serde_json::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        });
+        let native = transport["type"] == "stdio"
+            && transport["command"]
+                .as_str()
+                .is_some_and(|command| !command.trim().is_empty())
+            && registered_args.is_some_and(|args| {
+                args.contains(&"--local-session-runtime=codex")
+                    || args
+                        .windows(2)
+                        .any(|pair| pair == ["--local-session-runtime", "codex"])
+            });
+        if native {
+            // Leave the complete entry untouched, including enabled state,
+            // filters, timeouts, launcher and any additional environment.
+            return Ok(json!({
+                "runtime":"codex","mode":"native_session","status":"ready",
+                "mcp":"native_registry","preserved":true,
+                "enabled":registered["enabled"],"home":transport["env"]["CCCC_HOME"],
+                "note":"Existing native-session MCP configuration and CCCC_HOME were preserved. Use `cccc sessions disable --runtime codex` to switch to ordinary MCP."
+            }));
+        }
+    }
     let mut output = run_command(&command, &cwd, home)?;
     if !output.status.success()
         && already_exists(&output)
@@ -271,15 +375,86 @@ fn setup_one(
             failure_detail(&output)
         );
     }
-    Ok(json!({
+    let mut result = json!({
         "runtime":runtime,"mode":"auto","status":"added","command":command,"config":config
-    }))
+    });
+    if runtime == "auggie" {
+        result["note"] = json!(outside_session_note("An Auggie session"));
+    }
+    Ok(result)
+}
+
+/// For runtimes whose user entry maps the context variables instead of fixing them.
+fn outside_session_note(session: &str) -> String {
+    format!(
+        "{session} started outside CCCC takes CCCC_HOME, CCCC_GROUP_ID and CCCC_ACTOR_ID from the shell that starts it; without CCCC_HOME it uses the default CCCC home."
+    )
+}
+
+pub(super) fn codex_mcp_entry(home: &HomeLayout, cwd: &Path) -> Result<Option<serde_json::Value>> {
+    let output = cccc_runtime::capture_command_blocking(
+        &mut codex_registry_command(home, cwd),
+        None,
+        std::time::Duration::from_secs(30),
+        32_768,
+    )
+    .context(CODEX_INSPECTION_ERROR)?;
+    parse_codex_registry(&output)
+}
+
+pub(super) async fn codex_mcp_entry_async(
+    home: &HomeLayout,
+    cwd: &Path,
+) -> Result<Option<serde_json::Value>> {
+    let output = cccc_runtime::capture_command(
+        &mut codex_registry_command(home, cwd),
+        None,
+        std::time::Duration::from_secs(30),
+        32_768,
+    )
+    .await
+    .context(CODEX_INSPECTION_ERROR)?;
+    parse_codex_registry(&output)
+}
+
+const CODEX_INSPECTION_ERROR: &str = "Could not safely identify Codex's cccc MCP configuration; it was left unchanged. Inspect it with `codex mcp list --json` before retrying.";
+
+fn codex_registry_command(home: &HomeLayout, cwd: &Path) -> Command {
+    let program =
+        cccc_core::runtime_mcp::resolve_program("codex", std::env::var_os("PATH").as_deref());
+    let mut command = cccc_runtime::background_command(program);
+    command
+        .args(["mcp", "list", "--json"])
+        .current_dir(cwd)
+        .env("CCCC_HOME", home.root());
+    command
+}
+
+fn parse_codex_registry(
+    output: &cccc_runtime::CapturedOutput,
+) -> Result<Option<serde_json::Value>> {
+    let inspection_error = CODEX_INSPECTION_ERROR;
+    anyhow::ensure!(
+        output.status.success() && !output.stdout_truncated && !output.stderr_truncated,
+        "{inspection_error}"
+    );
+    let registry: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|_| anyhow::anyhow!(inspection_error))?;
+    let entries = registry.as_array().context(inspection_error)?;
+    anyhow::ensure!(
+        entries.iter().all(|entry| entry["name"].is_string()),
+        "{inspection_error}"
+    );
+    let mut matches = entries.iter().filter(|entry| entry["name"] == "cccc");
+    let entry = matches.next().cloned();
+    anyhow::ensure!(matches.next().is_none(), "{inspection_error}");
+    Ok(entry)
 }
 
 fn run_command(command: &[String], cwd: &Path, home: &HomeLayout) -> Result<std::process::Output> {
     let inherited_path = std::env::var_os("PATH");
     let program = cccc_core::runtime_mcp::resolve_program(&command[0], inherited_path.as_deref());
-    Command::new(program)
+    cccc_runtime::background_command(program)
         .args(&command[1..])
         .current_dir(cwd)
         .env("CCCC_HOME", home.root())

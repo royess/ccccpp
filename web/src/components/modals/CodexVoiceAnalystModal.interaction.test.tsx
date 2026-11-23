@@ -6,7 +6,12 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type { CodexVoiceSessionController } from "../../features/codexVoice/useCodexVoiceSessionController";
 import { useModalStore } from "../../stores";
 import { CodexVoiceAnalystModal } from "./CodexVoiceAnalystModal";
+import { chetConversationStub } from "../../features/chet/chetTestSupport";
 
+vi.mock("../../services/api/chet", async (original) => ({
+  ...(await original<typeof import("../../services/api/chet")>()),
+  fetchChetUnattended: vi.fn(async () => ({ ok: true, result: { enabled: false, since: null } })),
+}));
 vi.mock("react-i18next", () => {
   const t = (key: string) => key;
   return { useTranslation: () => ({ t }) };
@@ -70,6 +75,7 @@ function controller(): CodexVoiceSessionController {
     playbackBlocked: false,
     outputStatus: { queued: 0, blocked: null },
     error: "",
+    recoveryOwners: [],
     refreshError: "",
     isStarting: false,
     isEngaged: true,
@@ -129,6 +135,7 @@ describe("CodexVoiceAnalystModal settings navigation", () => {
           isDark={false}
           isSmallScreen={false}
           controller={controller()}
+          chet={chetConversationStub()}
           onClose={vi.fn()}
         />,
       ),
@@ -142,7 +149,7 @@ describe("CodexVoiceAnalystModal settings navigation", () => {
       await act(async () => button.click());
     };
     expect(terminal?.getAttribute("data-visible")).toBe("false");
-    await clickText("codexVoiceAnalystTitle");
+    await clickText("chet.activity");
     expect(terminal?.getAttribute("data-visible")).toBe("true");
     await act(async () => {
       desktop = true;
@@ -170,6 +177,7 @@ describe("CodexVoiceAnalystModal settings navigation", () => {
           isDark={false}
           isSmallScreen={false}
           controller={voice}
+          chet={chetConversationStub()}
           onClose={onClose}
         />,
       ),
@@ -216,6 +224,7 @@ describe("CodexVoiceAnalystModal settings navigation", () => {
             isDark={false}
             isSmallScreen={false}
             controller={voice}
+            chet={chetConversationStub()}
             onClose={vi.fn()}
           />,
         ),

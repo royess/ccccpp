@@ -10,7 +10,6 @@ import {
   SettingsPage,
   SettingsRow,
   SettingsSaveBar,
-  SettingsSwitch,
 } from "./SettingsKit";
 
 interface TranscriptTabProps {
@@ -21,10 +20,6 @@ interface TranscriptTabProps {
   // Policy settings
   terminalVisibility: "off" | "foreman" | "all";
   setTerminalVisibility: (v: "off" | "foreman" | "all") => void;
-  terminalNotifyTail: boolean;
-  setTerminalNotifyTail: (v: boolean) => void;
-  terminalNotifyLines: number;
-  setTerminalNotifyLines: (v: number) => void;
   onSaveTranscriptSettings: () => void;
   // Tail viewer
   tailActorId: string;
@@ -51,10 +46,6 @@ export function TranscriptTab({
   devActors,
   terminalVisibility,
   setTerminalVisibility,
-  terminalNotifyTail,
-  setTerminalNotifyTail,
-  terminalNotifyLines,
-  setTerminalNotifyLines,
   onSaveTranscriptSettings,
   tailActorId,
   setTailActorId,
@@ -74,7 +65,7 @@ export function TranscriptTab({
   onClearTail,
 }: TranscriptTabProps) {
   const { t } = useTranslation("settings");
-  const ids = { visibility: useId(), notifyTail: useId(), notifyLines: useId(), maxChars: useId() };
+  const ids = { visibility: useId(), maxChars: useId() };
   const ghost = secondaryButtonClass("sm");
 
   return (
@@ -111,23 +102,6 @@ export function TranscriptTab({
               className={inputClass()}
             />
           </div>
-        </SettingsRow>
-        <SettingsRow label={t("transcript.includeTail")} labelId={ids.notifyTail}>
-          <SettingsSwitch
-            checked={terminalNotifyTail}
-            onChange={setTerminalNotifyTail}
-            labelledBy={ids.notifyTail}
-          />
-        </SettingsRow>
-        <SettingsRow label={t("transcript.notificationLines")} htmlFor={ids.notifyLines}>
-          <SettingsNumberInput
-            id={ids.notifyLines}
-            value={terminalNotifyLines}
-            min={1}
-            max={80}
-            disabled={!terminalNotifyTail}
-            onChange={(value) => setTerminalNotifyLines(value || 20)}
-          />
         </SettingsRow>
       </SettingsCard>
 
@@ -209,15 +183,22 @@ export function TranscriptTab({
             </label>
           </div>
           {tailCopyInfo ? (
-            <div className="text-xs text-emerald-600 dark:text-emerald-400">{tailCopyInfo}</div>
+            <div className="text-xs text-emerald-600 dark:text-emerald-400" data-status-tone="ok">
+              {tailCopyInfo}
+            </div>
           ) : null}
           {tailErr ? (
-            <div className="text-xs text-rose-600 dark:text-rose-400">{tailErr}</div>
+            <div className="text-xs text-rose-600 dark:text-rose-400" data-status-tone="error">
+              {tailErr}
+            </div>
           ) : null}
           {tailHint && !tailErr ? (
             <div className="text-xs text-[var(--color-text-muted)]">{tailHint}</div>
           ) : null}
-          <pre className="m-0 max-h-[420px] min-h-[180px] overflow-auto rounded-[10px] bg-zinc-900 p-3.5 font-mono text-xs leading-6 whitespace-pre text-zinc-200">
+          <pre
+            className="m-0 max-h-[420px] min-h-[180px] overflow-auto rounded-[10px] bg-zinc-900 p-3.5 font-mono text-xs leading-6 whitespace-pre text-zinc-200"
+            data-settings-code
+          >
             <code>{tailText || "\u2014"}</code>
           </pre>
         </div>

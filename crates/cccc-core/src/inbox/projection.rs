@@ -1,4 +1,4 @@
-use super::deliveries::DeliveryState;
+use super::deliveries::{DeliveryState, PendingFilter};
 use super::notices::NoticeState;
 use super::*;
 use crate::ledger::snapshot::{Location, Snapshot, Source};
@@ -72,17 +72,19 @@ fn cached(path: &Path) -> Option<Entry> {
         .map(|(_, entry)| entry.clone())
 }
 fn routing(group: &GroupDoc) -> Value {
-    json!(
+    json!((
         group
             .actors
             .iter()
             .map(|actor| (
                 &actor.id,
+                &actor.created_at,
                 effective_role(group, &actor.id),
                 &actor.internal_kind
             ))
-            .collect::<Vec<_>>()
-    )
+            .collect::<Vec<_>>(),
+        crate::automation::delivery_timing_value(group, "mail_notice_repeat_seconds", 0),
+    ))
 }
 impl Projection {
     fn build(
@@ -194,12 +196,50 @@ impl Projection {
 
 // The query mutex serializes cache publication, never append. Snapshot identity
 // includes source order and inode; growth is decoded from committed offsets.
+#[derive(Clone, Copy)]
+enum CursorPolicy {
+    Effective,
+    Summary,
+}
+
+impl CursorPolicy {
+    fn load(self, home: &HomeLayout, group_id: &str) -> io::Result<InboxState> {
+        match self {
+            Self::Effective => load(home, group_id),
+            Self::Summary => load_raw(home, group_id),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn with_projection<T>(
     home: &HomeLayout,
     group: &GroupDoc,
     actor_ids: &[String],
     state: &InboxState,
-    mut inspect: impl FnMut(&Projection, &Snapshot) -> io::Result<T>,
+    mut inspect: impl FnMut(&mut Projection, &Snapshot) -> io::Result<T>,
+) -> io::Result<T> {
+    with_projection_policy(
+        home,
+        group,
+        actor_ids,
+        state,
+        CursorPolicy::Effective,
+        |projection, snapshot, _| inspect(projection, snapshot),
+    )
+}
+
+fn with_projection_policy<T>(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor_ids: &[String],
+    state: &InboxState,
+    cursor_policy: CursorPolicy,
+    mut inspect: impl FnMut(&mut Projection, &Snapshot, &InboxState) -> io::Result<T>,
 ) -> io::Result<T> {
     let path = GroupStore::new(home.clone())?.ledger_path(&group.group_id)?;
     let entry = entry(&path);
@@ -224,7 +264,12 @@ fn with_projection<T>(
                         unknown |= !projection.deliveries.can_append(&event);
                         ControlFlow::Continue(())
                     })?;
-                    if unknown || !projection.move_cursors(&state, &snapshot)? {
+                    // Summary filtering uses captured durable cursors and read
+                    // facts, without rewinding another reader's mailbox cache.
+                    if unknown
+                        || (matches!(cursor_policy, CursorPolicy::Effective)
+                            && !projection.move_cursors(&state, &snapshot)?)
+                    {
                         true
                     } else {
                         let old_offsets = projection.offsets.clone();
@@ -239,9 +284,15 @@ fn with_projection<T>(
                 _ => true,
             };
             if rebuild {
+                #[cfg(test)]
+                TEST_REBUILDS.with(|count| count.set(count.get().saturating_add(1)));
                 *guard = Some(Projection::build(group, &state, &snapshot, actor_ids)?);
             }
-            inspect(guard.as_ref().expect("projection initialized"), &snapshot)
+            inspect(
+                guard.as_mut().expect("projection initialized"),
+                &snapshot,
+                &state,
+            )
         })();
         if result.is_err() {
             // A failed suffix read/refill may have reduced only a prefix.
@@ -255,7 +306,7 @@ fn with_projection<T>(
         // and must not starve publication. A missed try_lock callback merges
         // by byte offset on the next query.
         let current = Snapshot::open(&path)?;
-        let current_state = load(home, &group.group_id)?;
+        let current_state = cursor_policy.load(home, &group.group_id)?;
         if !current.extends(&snapshot.sources)
             || current_state.cursors != state.cursors
             || entry.cursor_epoch.load(Ordering::Acquire) != cursor_epoch
@@ -264,6 +315,59 @@ fn with_projection<T>(
             continue;
         }
         return result;
+    }
+}
+
+#[cfg(test)]
+mod summary_cursor_tests {
+    use super::*;
+    use cccc_contracts::Actor;
+
+    #[test]
+    fn summary_publication_retry_receives_the_new_raw_cursor_state() {
+        // Synthetic publication-race control, not a daemon-produced read.
+        let temp = tempfile::tempdir().expect("publication test directory");
+        let home = HomeLayout::from_path(temp.path().join("home")).expect("publication home");
+        let store = GroupStore::new(home.clone()).expect("publication group store");
+        let mut group = store
+            .create("summary publication", "")
+            .expect("publication group");
+        group.actors.push(Actor::new("reader"));
+        store.save(&group).expect("save publication group");
+        let ledger_path = store
+            .ledger_path(&group.group_id)
+            .expect("publication ledger path");
+        let mut mail = Event::new("chat.message", &group.group_id);
+        mail.data = json!({"to":["reader"],"message_mode":"mail"})
+            .as_object()
+            .cloned()
+            .expect("publication Mail data");
+        ledger::append(&ledger_path, &mail).expect("append publication Mail");
+        let state = load_raw(&home, &group.group_id).expect("initial raw cursor state");
+        let mut observed = Vec::new();
+        let result = with_projection_policy(
+            &home,
+            &group,
+            &[],
+            &state,
+            CursorPolicy::Summary,
+            |_, _, current| {
+                let cursor = current.cursors.get("reader").cloned();
+                observed.push(cursor.clone());
+                if observed.len() == 1 {
+                    write_json(
+                        &path(&home, &group.group_id)?,
+                        &json!({
+                            "schema":MAIL_CURSOR_SCHEMA,"cursors":{"reader":{"event_id":mail.id}}
+                        }),
+                    )?;
+                }
+                Ok(cursor)
+            },
+        )
+        .expect("retry changed raw cursor state");
+        assert_eq!(observed, vec![None, Some(mail.id.clone())]);
+        assert_eq!(result, Some(mail.id));
     }
 }
 
@@ -330,6 +434,32 @@ pub(super) fn pending(
             .map(|mail| (mailbox.count, mail.ts.clone())))
     })
 }
+pub(super) fn overdue_summary(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    cutoff: DateTime<Utc>,
+) -> io::Result<(DateTime<Utc>, Vec<OverdueMailSummary>)> {
+    let state = load_raw(home, &group.group_id)?;
+    with_projection_policy(
+        home,
+        group,
+        &[],
+        &state,
+        CursorPolicy::Summary,
+        |projection, _, state| {
+            // Sample after loading/replaying the captured prefix, including on a
+            // publication retry. Cold-load time must not make newly loaded Mail
+            // appear to have a future timestamp relative to this observation.
+            let observed_at = Utc::now();
+            let actors =
+                projection
+                    .notices
+                    .overdue_summary(group, &state.cursors, cutoff, observed_at);
+            Ok((observed_at, actors))
+        },
+    )
+}
+
 pub(crate) fn due(
     home: &HomeLayout,
     group: &GroupDoc,
@@ -367,10 +497,67 @@ pub(super) fn pending_deliveries(
     group: &GroupDoc,
     actor: &str,
     limit: usize,
+    filter: PendingFilter,
+    bounds: Option<(&str, &str)>,
 ) -> io::Result<Vec<Event>> {
     let state = load(home, &group.group_id)?;
     with_projection(home, group, &[], &state, |projection, snapshot| {
-        snapshot.events(&projection.deliveries.pending(actor, limit))
+        let deliveries = &projection.deliveries;
+        let mut range = 0..=usize::MAX;
+        if let Some((first, last)) = bounds {
+            let mut start = deliveries.source_position(first);
+            let mut end = deliveries.source_position(last);
+            // A change of roles can remove an endpoint from the audience projection.
+            // Its position in the ledger still bounds the other messages in this gap.
+            if start.is_none() || end.is_none() {
+                let mut position = 0;
+                snapshot.visit(&[], |event, _| {
+                    if event.id == first {
+                        start = Some(position);
+                    }
+                    if event.id == last {
+                        end = Some(position);
+                    }
+                    position += 1;
+                    if start.is_some() && end.is_some() {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })?;
+            }
+            range = match (start, end) {
+                (Some(start), Some(end)) if start <= end => start..=end,
+                _ => {
+                    tracing::warn!(group_id = %group.group_id, %actor, %first, %last,
+                        "delivery range unavailable; checking all eligible sources for this member");
+                    0..=usize::MAX
+                }
+            };
+        }
+        snapshot.events(&deliveries.pending(group, actor, limit, filter, range))
+    })
+}
+pub(super) fn delivery_retry_closed(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &str,
+    source: &str,
+) -> io::Result<bool> {
+    let state = load(home, &group.group_id)?;
+    with_projection(home, group, &[], &state, |projection, _| {
+        Ok(projection.deliveries.retry_closed(actor, source))
+    })
+}
+pub(super) fn delivery_is_unsubmitted(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &str,
+    source: &str,
+) -> io::Result<bool> {
+    let state = load(home, &group.group_id)?;
+    with_projection(home, group, &[], &state, |projection, _| {
+        Ok(projection.deliveries.is_unsubmitted(actor, source))
     })
 }
 pub(super) fn delivery_states(
@@ -390,6 +577,21 @@ pub(super) fn delivery_states(
                     .map(|state| (actor.clone(), state))
             })
             .collect())
+    })
+}
+
+pub(super) fn latest_delivery_receipt(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &str,
+    source: &str,
+) -> io::Result<Option<Event>> {
+    let state = load(home, &group.group_id)?;
+    with_projection(home, group, &[], &state, |projection, snapshot| {
+        let Some(location) = projection.deliveries.latest_location(actor, source) else {
+            return Ok(None);
+        };
+        Ok(snapshot.events(&[location])?.pop())
     })
 }
 
@@ -445,6 +647,34 @@ pub(crate) fn note_cursor(path: &Path) {
     if let Some(entry) = cached(path) {
         entry.cursor_epoch.fetch_add(1, Ordering::Release);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn retained_mail_notice_claims(
+    home: &HomeLayout,
+    group: &GroupDoc,
+) -> io::Result<usize> {
+    let state = load(home, &group.group_id)?;
+    with_projection(home, group, &[], &state, |projection, _| {
+        Ok(projection.notices.retained_mail_claims())
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn cached_actor_generation(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &str,
+) -> io::Result<Option<String>> {
+    let state = load(home, &group.group_id)?;
+    with_projection(home, group, &[], &state, |projection, _| {
+        Ok(projection
+            .group
+            .actors
+            .iter()
+            .find(|a| a.id == actor)
+            .map(|a| a.created_at.clone()))
+    })
 }
 
 #[cfg(test)]

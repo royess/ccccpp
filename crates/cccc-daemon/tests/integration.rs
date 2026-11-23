@@ -1,3 +1,5 @@
+#[path = "suite/actor_context_cleanup.rs"]
+mod actor_context_cleanup;
 #[path = "suite/admin_ops.rs"]
 mod admin_ops;
 #[path = "suite/assistant_voice_ops.rs"]
@@ -10,6 +12,10 @@ mod capability_install_events;
 mod capability_install_events_support;
 #[path = "suite/capability_state.rs"]
 mod capability_state;
+#[path = "suite/capability_url_privacy.rs"]
+mod capability_url_privacy;
+#[path = "suite/chet_obligations.rs"]
+mod chet_obligations;
 #[path = "suite/cross_group_attachments.rs"]
 mod cross_group_attachments;
 #[path = "suite/cross_group_foreman_default.rs"]
@@ -30,8 +36,10 @@ mod presentation_ops;
 mod profile_access;
 #[path = "suite/registry_reconcile.rs"]
 mod registry_reconcile;
-#[path = "suite/reme_parity.rs"]
-mod reme_parity;
+#[path = "suite/reply_requests.rs"]
+mod reply_requests;
+#[path = "suite/running_owner.rs"]
+mod running_owner;
 #[path = "suite/runtime_completion.rs"]
 mod runtime_completion;
 #[path = "suite/runtime_completion_replay.rs"]
@@ -42,3 +50,5 @@ mod runtime_lifecycle;
 mod runtime_state_ops;
 #[path = "suite/sdk_compatibility.rs"]
 mod sdk_compatibility;
+#[path = "suite/team_review.rs"]
+mod team_review;

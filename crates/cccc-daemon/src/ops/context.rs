@@ -3,12 +3,14 @@ use super::operation::{
     Policy::{Read, Write},
 };
 use cccc_contracts::{ActorRole, DaemonRequest, Event};
-use cccc_core::context::{ContextDoc, ContextStore};
+use cccc_core::context::{ContextDoc, ContextStore, SyncMode};
 use cccc_core::ledger;
-use cccc_core::{GroupDoc, HomeLayout, actors};
+use cccc_core::{GroupDoc, HomeLayout, SELF_EVOLUTION_CAPABILITY_ID, actors};
 use serde_json::{Map, Value, json};
 
 use crate::dispatch::{OpError, OpResult, bool_arg, object, required_arg, store, string_arg};
+
+const TEAM_REVIEW_EVERY_FINISHED_TASKS: u64 = 10;
 
 pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
     Some(match request.op.as_str() {
@@ -21,7 +23,7 @@ pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
 
 fn get(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let group_id = required_arg(request, "group_id")?;
-    load_group(home, &group_id)?;
+    let group = load_group(home, &group_id)?;
     let contexts = ContextStore::new(home.clone()).map_err(OpError::io)?;
     let detail = string_arg(request, "detail").unwrap_or_else(|| "full".into());
     if !matches!(detail.as_str(), "overview" | "summary" | "full") {
@@ -30,13 +32,18 @@ fn get(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
             "detail must be 'overview', 'summary', or 'full'",
         ));
     }
-    let document = if detail == "overview" {
+    let mut document = if detail == "overview" {
         contexts.load_overview(&group_id)
     } else {
         contexts.load(&group_id)
     }
     .map_err(OpError::io)?;
     let version = contexts.version(&document).map_err(OpError::io)?;
+    // Removal clears the stored state but can leave an empty entry. Membership
+    // controls what is shown; the version still identifies the stored document.
+    document
+        .agent_states
+        .retain(|id, _| group.actors.iter().any(|actor| actor.id == *id));
     match page(request)? {
         Some(page) if detail == "overview" => {
             let value = super::context_projection::project(document, version, &detail);
@@ -113,7 +120,7 @@ fn page_too_small(smallest: usize) -> OpError {
     )
 }
 
-fn sync(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
+pub(super) fn sync(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let group_id = required_arg(request, "group_id")?;
     let group = load_group(home, &group_id)?;
     let operations = parse_operations(request)?;
@@ -129,15 +136,31 @@ fn sync(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
             )
         })?)
     };
+    let dry_run = bool_arg(request, "dry_run", false);
+    let review_every =
+        (!dry_run && role == Some(ActorRole::Foreman) && operations.iter().any(is_task_operation))
+            .then_some(TEAM_REVIEW_EVERY_FINISHED_TASKS);
     let mut denied = None;
+    let mut finished_sources = std::collections::BTreeSet::new();
     let result = contexts
         .sync_checked(
             &group_id,
             &operations,
             string_arg(request, "if_version").as_deref(),
             &by,
-            bool_arg(request, "dry_run", false),
+            SyncMode {
+                dry_run,
+                review_every,
+            },
             |document, operation| {
+                let name = operation.get("op").and_then(Value::as_str).unwrap_or_default();
+                if name == "task.move"
+                    && operation.get("status").and_then(Value::as_str) == Some("done")
+                    && let Some(task) = document.tasks.iter().find(|task| task.get("id").and_then(Value::as_str) == operation.get("task_id").and_then(Value::as_str).map(str::trim))
+                    && !cccc_core::context::task_is_completed(task)
+                {
+                    finished_sources.insert(task.get("id").and_then(Value::as_str).unwrap_or_default().to_owned());
+                }
                 authorize(role, document, operation, &by).map_err(|error| {
                     denied = Some(error);
                     std::io::Error::other("context authorization rejected")
@@ -147,6 +170,10 @@ fn sync(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         .map_err(|error| {
             if let Some(error) = denied.take() {
                 error
+            } else if let Some(conflict) = error.get_ref().and_then(|cause| cause.downcast_ref::<cccc_core::context::TaskConflict>()) {
+                let mut failure = OpError::new("task_conflict", conflict.to_string());
+                failure.details = json!({"task_id":conflict.task_id,"expected":conflict.expected,"actual":conflict.actual}).as_object().cloned().unwrap_or_default();
+                failure
             } else if error.to_string() == "version_conflict" {
                 OpError::new("version_conflict", "context version conflict")
             } else if error.kind() == std::io::ErrorKind::InvalidInput {
@@ -157,7 +184,7 @@ fn sync(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         })?;
     if !result.dry_run && !result.changes.is_empty() {
         let mut event = Event::new("context.sync", &group_id);
-        event.by = by;
+        event.by = by.clone();
         event.data = json!({"version": &result.version, "changes": &result.changes})
             .as_object()
             .cloned()
@@ -168,12 +195,68 @@ fn sync(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         )
         .map_err(OpError::io)?;
     }
-    object(json!({
+    let mut response = json!({
         "success": true,
         "dry_run": result.dry_run,
         "changes": result.changes,
         "version": result.version,
-    }))
+    });
+    if !result.dry_run {
+        let followup = finished_sources.into_iter().filter_map(|id| {
+            let task = result.context.tasks.iter().find(|task| task.get("id").and_then(Value::as_str) == Some(id.as_str()) && task.get("status").and_then(Value::as_str) == Some("done"))?;
+            let source = task.get("source").filter(|source| source.is_object())?;
+            Some(json!({"task_id":id,"source":source,"note":"If this result changes the backlog entry this task came from, update it with the relevant outcome; close the entry only if its topic is finished. Otherwise no backlog action is needed."}))
+        }).collect::<Vec<_>>();
+        if !followup.is_empty() {
+            response["backlog_followup"] = json!(followup);
+        }
+    }
+    if let Some(finished) = result.review_due
+        && team_review_offered(home, &group_id, &by)
+    {
+        response["review_reminder"] = Value::String(team_review_reminder(finished));
+    }
+    object(response)
+}
+
+fn is_task_operation(operation: &Map<String, Value>) -> bool {
+    operation
+        .get("op")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.starts_with("task."))
+}
+
+/// The reminder offers the skill, so it follows the user's choice: a skill that
+/// is blocked, removed, switched off or hidden from this foreman is not offered.
+/// A failed read must not fail the task write, and only costs this reminder.
+fn team_review_offered(home: &HomeLayout, group_id: &str, foreman: &str) -> bool {
+    let request = DaemonRequest {
+        v: 1,
+        op: "capability_state".into(),
+        args: Map::from_iter([
+            ("group_id".into(), Value::from(group_id)),
+            ("actor_id".into(), Value::from(foreman)),
+            ("by".into(), Value::from(foreman)),
+        ]),
+    };
+    super::capabilities::state(home, &request).is_ok_and(|state| {
+        state["active_capsule_skills"]
+            .as_array()
+            .is_some_and(|skills| {
+                skills
+                    .iter()
+                    .any(|skill| skill["capability_id"] == SELF_EVOLUTION_CAPABILITY_ID)
+            })
+    })
+}
+
+fn team_review_reminder(finished: u64) -> String {
+    format!(
+        "{finished} top-level tasks have been finished since the last reminder. If the team has \
+         not looked at how it works lately, cccc_capability_use(capability_id=\
+         \"{SELF_EVOLUTION_CAPABILITY_ID}\") returns the rules for a short review. This is a \
+         reminder only."
+    )
 }
 
 pub(super) fn load_group(home: &HomeLayout, group_id: &str) -> Result<GroupDoc, OpError> {
@@ -273,7 +356,25 @@ fn authorize(
                         .iter()
                         .any(|field| task.get(*field).and_then(Value::as_str) == Some(by))
                 });
-            if !owns_tasks {
+            // Open work nobody holds can be taken up by a peer, for itself only.
+            // History stays with those who held it.
+            let claims_unowned = name == "task.update"
+                && operation.get("assignee").and_then(Value::as_str) == Some(by)
+                && document
+                    .tasks
+                    .iter()
+                    .filter(|task| task.get("id").and_then(Value::as_str) == Some(task_id))
+                    .all(|task| {
+                        matches!(
+                            task.get("status").and_then(Value::as_str),
+                            Some("planned" | "active")
+                        ) && ["assignee", "handoff_to"].iter().all(|field| {
+                            task.get(*field)
+                                .and_then(Value::as_str)
+                                .is_none_or(|value| value.trim().is_empty())
+                        })
+                    });
+            if !owns_tasks && !claims_unowned {
                 return Err(OpError::new(
                     "permission_denied",
                     format!("{name} requires the assignee, handoff target, foreman, or user"),

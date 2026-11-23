@@ -1,5 +1,6 @@
 use cccc_client::DaemonClient;
-use cccc_core::{GroupDoc, HomeLayout};
+use cccc_core::HomeLayout;
+use cccc_core::group_scope::EffectiveScope;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -57,6 +58,7 @@ pub async fn call(
     // still in flight. Keep using the captured identity, never a newer grant.
     revalidate(home, &args)?;
     let binding = args.get("_cccc_web_binding").cloned();
+    let native_binding = args.get("_cccc_native_binding").cloned();
     let payload = match name {
         "cccc_repo" | "cccc_repo_edit" => {
             let operation = action(&args).to_owned();
@@ -86,11 +88,13 @@ pub async fn call(
             )
             .await?;
             revalidate_binding(home, binding.as_ref())?;
+            revalidate_native_binding(home, native_binding.as_ref())?;
             return Ok(result);
         }
         _ => return Err(format!("unsupported local tool: {name}").into()),
     };
     revalidate_binding(home, binding.as_ref())?;
+    revalidate_native_binding(home, native_binding.as_ref())?;
     Ok(if matches!(name, "cccc_code_exec" | "cccc_code_wait") {
         crate::code_mode::tool_result(payload)
     } else {
@@ -99,6 +103,15 @@ pub async fn call(
 }
 
 pub(crate) fn revalidate(home: &HomeLayout, args: &Map<String, Value>) -> Result<(), String> {
+    if let Some(binding) = args.get("_cccc_native_binding") {
+        if args.get("group_id") != binding.get("group_id")
+            || args.get("by") != binding.get("actor_id")
+            || args.contains_key("_cccc_web_binding")
+        {
+            return Err("permission_denied: Native request identity mismatch".into());
+        }
+        revalidate_native_binding(home, Some(binding))?;
+    }
     let binding = args.get("_cccc_web_binding");
     if let Some(binding) = binding
         && (args.get("group_id") != binding.get("group_id")
@@ -107,6 +120,16 @@ pub(crate) fn revalidate(home: &HomeLayout, args: &Map<String, Value>) -> Result
         return Err(retired_authority());
     }
     revalidate_binding(home, binding)
+}
+
+fn revalidate_native_binding(home: &HomeLayout, binding: Option<&Value>) -> Result<(), String> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    let invalid =
+        || "permission_denied: The captured native session authority is no longer valid".to_owned();
+    let binding = serde_json::from_value(binding.clone()).map_err(|_| invalid())?;
+    cccc_core::local_sessions::validate_binding(home, &binding).map_err(|_| invalid())
 }
 
 pub(crate) fn revalidate_binding(home: &HomeLayout, binding: Option<&Value>) -> Result<(), String> {
@@ -133,27 +156,28 @@ async fn scope(client: &DaemonClient, args: &Map<String, Value>) -> Result<PathB
         .ok_or("group_id is required")?;
     let mut request = Map::new();
     request.insert("group_id".into(), group_id);
-    for key in ["by", "_cccc_web_binding"] {
+    for key in ["by", "_cccc_web_binding", "_cccc_native_binding"] {
         if let Some(value) = args.get(key) {
             request.insert(key.into(), value.clone());
         }
     }
     let result = daemon(client, "group_show", request).await?;
-    let group: GroupDoc = serde_json::from_value(result.get("group").cloned().unwrap_or_default())
-        .map_err(|error| error.to_string())?;
-    group
-        .scopes
-        .iter()
-        .find(|scope| scope.scope_key == group.active_scope_key)
-        .or_else(|| group.scopes.first())
-        .map(|scope| PathBuf::from(&scope.url))
+    // The daemon owns the running process. Re-resolving Actor configuration in
+    // this MCP process would move tools before the actual owner is restarted.
+    let scope: EffectiveScope =
+        serde_json::from_value(result.get("effective_scope").cloned().unwrap_or_default())
+            .map_err(|_| "caller has no effective local scope")?;
+    scope
+        .path
+        .canonicalize()
+        .ok()
         .filter(|path| path.is_dir())
-        .ok_or_else(|| "group has no active local scope".into())
+        .ok_or_else(|| "caller has no effective local scope".into())
 }
 
 async fn one_shot(root: &Path, cmd: Vec<String>, seconds: u64) -> Result<Value, String> {
     let (program, arguments) = cmd.split_first().ok_or("command is required")?;
-    let mut command = std::process::Command::new(program);
+    let mut command = cccc_runtime::background_command(program);
     command.args(arguments).current_dir(root);
     capture(&mut command, seconds, 2_000_000).await
 }
@@ -161,7 +185,7 @@ async fn one_shot(root: &Path, cmd: Vec<String>, seconds: u64) -> Result<Value, 
 async fn shell(root: &Path, args: &Map<String, Value>) -> Result<Value, String> {
     let cmd = command(args)?;
     let (program, arguments) = cmd.split_first().ok_or("command is required")?;
-    let mut process = std::process::Command::new(program);
+    let mut process = cccc_runtime::background_command(program);
     process
         .args(arguments)
         .current_dir(command_cwd(root, args)?)
@@ -285,7 +309,7 @@ pub(super) async fn apply_patch(root: &Path, args: &Map<String, Value>) -> Resul
         let changed = crate::local_patch::apply(root, patch)?;
         return Ok(json!({"applied":true,"files":changed}));
     }
-    let mut command = std::process::Command::new("git");
+    let mut command = cccc_runtime::background_command("git");
     command.args(["apply", "-"]).current_dir(root);
     let output = cccc_runtime::capture_command(
         &mut command,
@@ -308,30 +332,15 @@ async fn file(
     args: &Map<String, Value>,
     action: &str,
 ) -> Result<Value, ToolCallError> {
+    if action == "send" {
+        return send_files(client, root, args).await;
+    }
     let raw = first_non_blank(args, &["path", "rel_path"]).ok_or("path is required")?;
     if args.contains_key("dst_instance_id") {
-        if action != "send" {
-            return Err(
-                "Connect does not expose remote file tools; use the received local attachment path"
-                    .into(),
-            );
-        }
-        let mut request = args.clone();
-        for key in ["action", "path", "rel_path", "mode"] {
-            request.remove(key);
-        }
-        request.insert(
-            "message_mode".into(),
-            Value::String(file_message_mode(args)?),
+        return Err(
+            "Connect does not expose remote file tools; use the received local attachment path"
+                .into(),
         );
-        request.insert("paths".into(), json!([raw]));
-        crate::argument_normalization::normalize_message_author(&mut request);
-        crate::argument_normalization::normalize_recipients(&mut request);
-        crate::mapping::connect_destination(&mut request)?;
-        let result = daemon(client, "connect_send_files", request).await?;
-        return Ok(tool_result(
-            json!({"accepted":true,"queued":result.get("queued"),"result":result}),
-        ));
     }
     let path = if raw.starts_with("state/blobs/") {
         let group_id = args
@@ -340,32 +349,8 @@ async fn file(
             .ok_or("group_id is required")?;
         cccc_core::blobs::resolve(home, group_id, raw).map_err(|error| error.to_string())?
     } else {
-        crate::repo::resolve(root, raw, false)?
+        crate::repo::resolve(root, &scope_relative(root, raw), false)?
     };
-    if action == "send" {
-        let message_mode = file_message_mode(args)?;
-        if raw.starts_with("state/blobs/") {
-            return Err("send expects a file under the active project scope".into());
-        }
-        let mut request = args.clone();
-        request.remove("action");
-        request.remove("path");
-        request.remove("rel_path");
-        request.remove("mode");
-        request.insert("message_mode".into(), Value::String(message_mode));
-        crate::argument_normalization::normalize_message_author(&mut request);
-        crate::argument_normalization::normalize_recipients(&mut request);
-        request.insert("paths".into(), json!([path.to_string_lossy().into_owned()]));
-        let result = daemon(client, "send_files", request).await?;
-        let attachment = result["event"]["data"]["attachments"]
-            .as_array()
-            .and_then(|attachments| attachments.first())
-            .cloned()
-            .unwrap_or(Value::Null);
-        return Ok(tool_result(
-            json!({"sent":true,"attachment":attachment,"result":result}),
-        ));
-    }
     if action == "blob_path" || action == "info" {
         return Ok(tool_result(
             json!({"path":path,"bytes":path.metadata().map(|meta|meta.len()).unwrap_or(0)}),
@@ -380,6 +365,102 @@ async fn file(
     .await
     .map_err(|error| format!("file read task failed: {error}"))?
     .map_err(Into::into)
+}
+
+/// Files one message may carry; IM bridges split larger sets on their own.
+const MAX_FILES_PER_SEND: usize = 10;
+
+/// `cccc_file_send` takes one path, or a list sent together as one message
+/// with one caption, so a set of screenshots arrives as one message. The flag
+/// is whether the caller passed a list, which decides the receipt's shape.
+fn send_paths(args: &Map<String, Value>) -> Result<(Vec<&str>, bool), String> {
+    // Refused even beside path, so no caller thinks a second set of files was sent.
+    if args.contains_key("paths") {
+        return Err(format!(
+            "invalid_args: use path, not paths; path takes a file path or a list of 1 to {MAX_FILES_PER_SEND} file paths"
+        ));
+    }
+    let Some(Value::Array(values)) = args.get("path") else {
+        return first_non_blank(args, &["path", "rel_path"])
+            .map(|raw| (vec![raw], false))
+            .ok_or_else(|| "path is required".to_owned());
+    };
+    let paths: Vec<&str> = values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .collect();
+    if paths.is_empty() || paths.len() != values.len() || paths.len() > MAX_FILES_PER_SEND {
+        return Err(format!(
+            "path must be a file path or a list of 1 to {MAX_FILES_PER_SEND} file paths"
+        ));
+    }
+    Ok((paths, true))
+}
+
+/// A path to send, checked by form only: inside the effective tool workspace
+/// and not a stored blob. The daemon resolves links and reads the file after
+/// its retry lookup, so a retry still gets its receipt after a source file is
+/// removed. Paths stay under this call's workspace root.
+fn send_path(root: &Path, raw: &str) -> Result<String, String> {
+    if raw.starts_with("state/blobs/") {
+        return Err("send expects a file under the effective tool scope".into());
+    }
+    let relative = scope_relative(root, raw);
+    let relative = Path::new(&relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("path must be relative and remain inside the active scope".into());
+    }
+    Ok(root.join(relative).to_string_lossy().into_owned())
+}
+
+async fn send_files(
+    client: &DaemonClient,
+    root: &Path,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolCallError> {
+    let (raws, listed) = send_paths(args)?;
+    let mut request = args.clone();
+    let default = crate::argument_normalization::default_new_message_mode(args, false);
+    let message_mode = crate::argument_normalization::message_mode(&mut request, default)?;
+    for key in ["action", "path", "rel_path"] {
+        request.remove(key);
+    }
+    request.insert("message_mode".into(), Value::String(message_mode));
+    crate::argument_normalization::normalize_message_author(&mut request);
+    crate::argument_normalization::normalize_recipients(&mut request);
+    if args.contains_key("dst_instance_id") {
+        let scoped: Vec<String> = raws.iter().map(|raw| scope_relative(root, raw)).collect();
+        request.insert("paths".into(), json!(scoped));
+        crate::mapping::connect_destination(&mut request)?;
+        let result = daemon(client, "connect_send_files", request).await?;
+        return Ok(tool_result(
+            json!({"accepted":true,"queued":result.get("queued"),"result":result}),
+        ));
+    }
+    // The retry key names the logical send, as it does for Connect.
+    crate::argument_normalization::alias(&mut request, "idempotency_key", "client_id");
+    // Check every path before sending any: one bad path sends nothing.
+    let paths = raws
+        .iter()
+        .map(|raw| send_path(root, raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    request.insert("paths".into(), json!(paths));
+    let result = daemon(client, "send_files", request).await?;
+    let attachments = result["event"]["data"]["attachments"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    Ok(tool_result(if listed {
+        json!({"sent":true,"attachments":attachments,"result":result})
+    } else {
+        json!({"sent":true,"attachment":attachments.first().cloned().unwrap_or(Value::Null),"result":result})
+    }))
 }
 
 pub(super) fn command(args: &Map<String, Value>) -> Result<Vec<String>, String> {
@@ -404,7 +485,7 @@ pub(super) fn command_cwd(root: &Path, args: &Map<String, Value>) -> Result<Path
     let cwd = first_non_blank(args, &["cwd", "workdir"]).unwrap_or(".");
     let path = crate::repo::resolve(root, cwd, false)?;
     if !path.is_dir() {
-        return Err("cwd must be a directory inside the active scope".into());
+        return Err("cwd must be a directory inside the effective tool scope".into());
     }
     Ok(path)
 }
@@ -434,6 +515,38 @@ fn output_limit(args: &Map<String, Value>) -> usize {
         .clamp(1, 1_000_000) as usize
 }
 
+/// The file tools accept an absolute path inside the scope as the same file as
+/// its relative path. Any other absolute path is left for `repo::resolve`,
+/// which refuses it.
+fn scope_relative(root: &Path, raw: &str) -> String {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return raw.to_owned();
+    }
+    let canonical_root = root.canonicalize().ok();
+    [
+        Some(root.to_path_buf()),
+        Some(cccc_runtime::compatible_path(root).to_path_buf()),
+        canonical_root.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|base| path.strip_prefix(base).ok().map(Path::to_path_buf))
+    // Windows paths can also differ in case or UNC spelling. Compare the
+    // actual existing file to the canonical scope before accepting it.
+    .or_else(|| {
+        path.canonicalize()
+            .ok()?
+            .strip_prefix(canonical_root.as_ref()?)
+            .ok()
+            .map(Path::to_path_buf)
+    })
+    .map_or_else(
+        || raw.to_owned(),
+        |rest| rest.to_string_lossy().into_owned(),
+    )
+}
+
 fn first_non_blank<'a>(args: &'a Map<String, Value>, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| {
         args.get(*name)
@@ -446,18 +559,6 @@ fn first_non_blank<'a>(args: &'a Map<String, Value>, names: &[&str]) -> Option<&
 fn action(args: &Map<String, Value>) -> &str {
     args.get("action").and_then(Value::as_str).unwrap_or("read")
 }
-fn file_message_mode(args: &Map<String, Value>) -> Result<String, String> {
-    let mode = args
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("mail")
-        .trim();
-    if matches!(mode, "mail" | "send" | "request_reply") {
-        Ok(mode.to_owned())
-    } else {
-        Err("mode must be mail, send, or request_reply".into())
-    }
-}
 fn timeout(args: &Map<String, Value>) -> u64 {
     args.get("timeout_s")
         .or_else(|| args.get("timeout_seconds"))
@@ -468,9 +569,39 @@ fn timeout(args: &Map<String, Value>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{command, file_message_mode, timeout};
+    use super::{command, send_paths, timeout};
     use crate::local_patch::apply as apply_codex_patch;
     use serde_json::json;
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_file_path_matches_a_canonical_windows_scope() {
+        let root = std::path::Path::new(r"\\?\C:\workspace\project");
+        assert_eq!(
+            super::scope_relative(root, r"C:\workspace\project\notes\result.txt"),
+            r"notes\result.txt"
+        );
+        let outside = r"C:\workspace\other\secret.txt";
+        assert_eq!(super::scope_relative(root, outside), outside);
+        assert_eq!(
+            super::scope_relative(root, r"\\?\C:\workspace\project\result.txt"),
+            "result.txt"
+        );
+
+        let temp = tempfile::tempdir().expect("scope");
+        let root = temp.path().join("MixedScope");
+        std::fs::create_dir(&root).expect("scope");
+        std::fs::write(root.join("Result.txt"), "fixture").expect("file");
+        let canonical_root = root.canonicalize().expect("canonical scope");
+        let other_case = root
+            .join("result.txt")
+            .to_string_lossy()
+            .to_ascii_uppercase();
+        assert_eq!(
+            super::scope_relative(&canonical_root, &other_case),
+            "Result.txt"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -680,6 +811,16 @@ mod tests {
     #[tokio::test]
     async fn unified_patch_uses_the_finite_command_path() {
         let temp = tempfile::tempdir().expect("tempdir");
+        // git apply follows Git's line-ending settings, and Git for Windows sets
+        // core.autocrlf system-wide by default; pin it to compare exact bytes.
+        for args in [&["init", "-q"][..], &["config", "core.autocrlf", "false"]] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        }
         std::fs::write(temp.path().join("file.txt"), "before\n").expect("fixture");
         let args = json!({"patch":"diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-before\n+after\n"}).as_object().cloned().expect("args");
         let result = super::apply_patch(temp.path(), &args)
@@ -721,25 +862,35 @@ mod tests {
     }
 
     #[test]
-    fn file_send_maps_the_tool_mode_to_the_canonical_message_mode() {
-        let omitted = json!({}).as_object().cloned().expect("omitted arguments");
-        assert_eq!(file_message_mode(&omitted).expect("default mode"), "mail");
-        let explicit = json!({"mode":"request_reply"})
-            .as_object()
-            .cloned()
-            .expect("explicit arguments");
+    fn file_send_refuses_paths_and_parses_mode_like_message_send() {
+        let args = |value: serde_json::Value| value.as_object().cloned().expect("arguments");
+        for value in [
+            json!({"paths":["a.png"]}),
+            json!({"path":"a.png","paths":["b.png"]}),
+            json!({"path":["a.png"],"paths":["b.png"]}),
+        ] {
+            assert!(
+                send_paths(&args(value.clone()))
+                    .expect_err("paths")
+                    .starts_with("invalid_args: use path, not paths;"),
+                "{value}"
+            );
+        }
+        let mode = |value: serde_json::Value| {
+            crate::argument_normalization::message_mode(&mut args(value), "mail")
+        };
         assert_eq!(
-            file_message_mode(&explicit).expect("explicit mode"),
+            mode(json!({"mode":"request_reply"})).expect("explicit"),
             "request_reply"
         );
-        let invalid = json!({"mode":"attention"})
-            .as_object()
-            .cloned()
-            .expect("invalid arguments");
-        assert_eq!(
-            file_message_mode(&invalid).expect_err("invalid mode"),
-            "mode must be mail, send, or request_reply"
-        );
+        for value in [
+            json!({"mode":"attention"}),
+            json!({"mode":null}),
+            json!({"mode":3}),
+            json!({"message_mode":"send"}),
+        ] {
+            assert!(mode(value.clone()).is_err(), "{value}");
+        }
     }
 
     #[test]

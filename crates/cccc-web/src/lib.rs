@@ -1,6 +1,8 @@
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 mod api;
 mod auth;
 mod browser_surface;
+mod chet_group_input;
 mod codex_voice;
 #[cfg(test)]
 mod connect_browser_fixture;
@@ -14,9 +16,12 @@ mod readonly;
 mod request_origin;
 mod routes;
 mod security_headers;
+pub mod session_node;
 mod shutdown;
+mod update_hook;
 mod web_banner;
 mod web_listener;
+mod web_push;
 mod web_runtime_state;
 
 use anyhow::Result;
@@ -38,6 +43,13 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 pub use readonly::WebMode;
+pub use update_hook::{
+    KeepPreview, KeepRefusal, LastUpdate, LocalBuild, LocalCandidate, UpdateAgent, UpdateAgents,
+    UpdateCheck, UpdateCheckHook, UpdateCheckScope, UpdateChecker, UpdateHook, UpdateHost,
+    UpdateMode, UpdatePreparation, UpdateRejection, UpdateRequest, UpdateServices, UpdateSource,
+    UpdateStatus,
+};
+pub use web_banner::print as print_listening_banner;
 
 /// Return the system browser executable used by projected browser sessions.
 pub fn system_browser_path() -> Option<std::path::PathBuf> {
@@ -46,11 +58,48 @@ pub fn system_browser_path() -> Option<std::path::PathBuf> {
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 const COMPONENT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+// Analyst protocol shutdown first requests TERM and allows two seconds before KILL.
+const VOICE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeOutcome {
     Stopped(SocketAddr),
     RestartRequested,
+    /// The host's update hook accepted an update; the host finishes it.
+    UpdateRequested,
+}
+
+pub type ListeningCallback = Arc<dyn Fn(SocketAddr) + Send + Sync>;
+
+/// Recovery provided only by a Web host holding the corresponding instance
+/// lock. A standalone library app has no authority to reconcile another host.
+#[derive(Clone)]
+pub struct VoiceProcessRecovery {
+    pub reconcile: Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>,
+    pub review: Arc<VoiceProcessReview>,
+    /// None means the daemon holds its lock and must be asked through IPC.
+    pub review_daemon_offline: Arc<DaemonProcessReview>,
+    /// Unix hosts use the daemon's process ledger; Windows uses Job ownership.
+    pub check_daemon_guard: bool,
+}
+
+pub type VoiceProcessReview = dyn Fn(
+        VoiceRecoveryRequest,
+    ) -> Result<serde_json::Value, cccc_runtime::process_recovery::RecoveryError>
+    + Send
+    + Sync;
+
+pub type DaemonProcessReview = dyn Fn(
+        VoiceRecoveryRequest,
+    ) -> Result<Option<serde_json::Value>, cccc_runtime::process_recovery::RecoveryError>
+    + Send
+    + Sync;
+
+#[derive(Clone)]
+pub enum VoiceRecoveryRequest {
+    List,
+    Retry { id: String, version: String },
+    Accept { id: String, version: String },
 }
 
 #[derive(Clone)]
@@ -88,10 +137,16 @@ struct WebAssets;
 mod web_assets;
 pub use web_assets::{WebAssetsInfo, web_assets_info};
 
+/// The browser launch a session owner runs, so that a browser it holds starts
+/// exactly as one this Web would start itself.
+pub fn browser_launcher() -> Arc<dyn cccc_daemon::session_owner::browser::BrowserLauncher> {
+    Arc::new(browser_surface::held::Launcher)
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     connect_frames: Arc<connect_frames::ConnectFrames>,
-    connect_http: Result<reqwest::Client, String>,
+    connect_http: Result<connect_frames::HttpClients, String>,
     client: DaemonClient,
     home: HomeLayout,
     browser_surfaces: Arc<browser_surface::BrowserSurfaces>,
@@ -106,17 +161,48 @@ pub(crate) struct AppState {
     runtime_proof_key: String,
     web_mode: WebMode,
     exhibit_allow_terminal: bool,
+    /// Wakes the Web Push notifier when a browser subscribes.
+    push: Arc<web_push::Runtime>,
 }
+
+/// The host's own interface starts an attended update through this, with the
+/// same handoff as the Web's route. It belongs to one serve: once that Web has
+/// closed, starting an update through it gives the update up.
+#[derive(Clone)]
+pub struct UpdateTrigger {
+    restart: Arc<RestartHandle>,
+    voice: Arc<codex_voice::CodexVoiceSessions>,
+}
+
+impl UpdateTrigger {
+    /// Resolves once the host has prepared the update and this Web has closed
+    /// for it, with the transaction; or with why nothing was carried out.
+    pub async fn start(&self, request: UpdateRequest) -> Result<String, UpdateRejection> {
+        routes::update::hand_over(&self.restart, &self.voice, request, || Ok(()))
+            .await
+            .map_err(|error| UpdateRejection {
+                code: error.code().to_owned(),
+                message: error.message().to_owned(),
+            })
+    }
+}
+
+/// Receives the [`UpdateTrigger`] of each serve.
+pub type TriggerCallback = Arc<dyn Fn(UpdateTrigger) + Send + Sync>;
 
 pub(crate) struct RestartHandle {
     requested: AtomicBool,
+    update_requested: AtomicBool,
+    update: UpdateServices,
     shutdown: broadcast::Sender<()>,
 }
 
 impl RestartHandle {
-    fn new(shutdown: broadcast::Sender<()>) -> Self {
+    fn new(shutdown: broadcast::Sender<()>, update: UpdateServices) -> Self {
         Self {
             requested: AtomicBool::new(false),
+            update_requested: AtomicBool::new(false),
+            update,
             shutdown,
         }
     }
@@ -128,6 +214,32 @@ impl RestartHandle {
 
     fn requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
+    }
+
+    /// The supervising host's update hook, when it can replace itself.
+    pub(crate) fn update_hook(&self) -> Option<UpdateHook> {
+        self.update.host.clone()
+    }
+
+    /// The supervising host's update check, when a CCCC host serves this Web.
+    pub(crate) fn update_checker(&self) -> Option<UpdateCheckHook> {
+        self.update.checker.clone()
+    }
+
+    /// Close this Web so the host can finish an update its hook accepted.
+    pub(crate) fn request_update(&self) -> Result<(), broadcast::error::SendError<()>> {
+        self.update_requested.store(true, Ordering::Release);
+        if let Err(error) = self.shutdown.send(()) {
+            // Not handed over: the host must see an ordinary stop and undo
+            // the prepared update.
+            self.update_requested.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn update_requested(&self) -> bool {
+        self.update_requested.load(Ordering::Acquire)
     }
 }
 
@@ -173,31 +285,73 @@ fn app_with_shutdown(
     Arc<browser_surface::BrowserSurfaces>,
     AppState,
 ) {
+    let (app, im_workers, browser_surfaces, state, _) = app_with_shutdown_and_recovery(
+        home,
+        shutdown,
+        web_mode,
+        restart,
+        live_binding,
+        runtime_id,
+        None,
+    );
+    (app, im_workers, browser_surfaces, state)
+}
+
+fn app_with_shutdown_and_recovery(
+    home: HomeLayout,
+    shutdown: broadcast::Sender<()>,
+    web_mode: WebMode,
+    restart: Option<Arc<RestartHandle>>,
+    live_binding: LiveBinding,
+    runtime_id: String,
+    process_recovery: Option<VoiceProcessRecovery>,
+) -> (
+    Router,
+    Arc<im_runtime::ImWorkerRegistry>,
+    Arc<browser_surface::BrowserSurfaces>,
+    AppState,
+    Option<tokio::task::JoinHandle<()>>,
+) {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let ledger_events = ledger_event_hub::LedgerEventHub::new(home.clone());
     let im_workers = Arc::new(im_runtime::ImWorkerRegistry::new(ledger_events.clone()));
-    im_workers.restore_enabled(home.clone(), DaemonClient::new(home.clone()));
+    im_workers.restore_enabled(
+        home.clone(),
+        DaemonClient::new(home.clone()).without_voice_origin(),
+    );
     let browser_surfaces = Arc::new(browser_surface::BrowserSurfaces::default());
-    let codex_voice = Arc::new(codex_voice::CodexVoiceSessions::new());
+    let codex_voice = Arc::new(if process_recovery.is_some() {
+        codex_voice::CodexVoiceSessions::with_process_recovery(process_recovery)
+    } else {
+        codex_voice::CodexVoiceSessions::new()
+    });
     let notebooklm_auth = Arc::new(notebooklm_auth::AuthFlowManager::default());
     spawn_notebooklm_auth_shutdown(
         Arc::clone(&notebooklm_auth),
         Arc::clone(&browser_surfaces),
         shutdown.subscribe(),
     );
-    spawn_codex_voice_shutdown(Arc::clone(&codex_voice), shutdown.subscribe());
+    let voice_shutdown = spawn_codex_voice_shutdown(Arc::clone(&codex_voice), shutdown.subscribe());
     spawn_group_resource_reaper(
         home.clone(),
         Arc::clone(&im_workers),
         Arc::clone(&browser_surfaces),
         shutdown.subscribe(),
     );
+    let push = Arc::new(web_push::Runtime::default());
+    // An exhibit's viewers are spectators: it neither subscribes nor sends.
+    if !web_mode.is_read_only() {
+        web_push::spawn(
+            home.clone(),
+            ledger_events.clone(),
+            Arc::clone(&push),
+            shutdown.subscribe(),
+        );
+    }
     let state = AppState {
         connect_frames: Arc::new(connect_frames::ConnectFrames::default()),
-        connect_http: connect_frames::http_client()
-            .build()
-            .map_err(|error| error.to_string()),
-        client: DaemonClient::new(home.clone()),
+        connect_http: connect_frames::HttpClients::new().map_err(|error| error.to_string()),
+        client: DaemonClient::new(home.clone()).without_voice_origin(),
         home,
         browser_surfaces: Arc::clone(&browser_surfaces),
         codex_voice,
@@ -211,13 +365,15 @@ fn app_with_shutdown(
         runtime_proof_key: new_web_runtime_proof_key(),
         web_mode,
         exhibit_allow_terminal: readonly::exhibit_allow_terminal_from_env(),
+        push,
     };
     let app = router_for_state(state.clone());
-    (app, im_workers, browser_surfaces, state)
+    (app, im_workers, browser_surfaces, state, voice_shutdown)
 }
 
 fn router_for_state(state: AppState) -> Router {
     let mut app = routes::router()
+        .merge(web_push::routes())
         .fallback(static_asset)
         .layer(CompressionLayer::new())
         .layer(
@@ -244,22 +400,48 @@ fn router_for_state(state: AppState) -> Router {
     if let Some(cors) = configured_cors_layer() {
         app = app.layer(cors);
     }
-    app.with_state(state)
+    let relay_routes = session_node::relay_routes(
+        state.home.clone(),
+        state.web_mode.is_read_only(),
+        state.shutdown.clone(),
+    );
+    // Device relay authentication is performed by iroh, independent of Web principals.
+    app.with_state(state).merge(relay_routes)
 }
 
 fn spawn_codex_voice_shutdown(
     sessions: Arc<codex_voice::CodexVoiceSessions>,
     mut shutdown: broadcast::Receiver<()>,
-) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    runtime.spawn(async move {
+) -> Option<tokio::task::JoinHandle<()>> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    Some(runtime.spawn(async move {
         let _ = shutdown.recv().await;
         if let Err(error) = sessions.shutdown().await {
             tracing::warn!(%error, "Codex Voice shutdown failed");
+            cccc_runtime::diagnostic(format_args!(
+                "[cccc] Voice cleanup failed; check the Web logs"
+            ));
         }
-    });
+    }))
+}
+
+async fn await_codex_voice_shutdown(
+    task: Option<tokio::task::JoinHandle<()>>,
+    timeout: std::time::Duration,
+) {
+    let Some(task) = task else { return };
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "Codex Voice shutdown worker failed");
+            cccc_runtime::diagnostic(format_args!(
+                "[cccc] Voice cleanup worker failed; cleanup was not confirmed"
+            ));
+        }
+        Err(_) => cccc_runtime::diagnostic(format_args!(
+            "[cccc] Voice cleanup timed out; completion was not confirmed"
+        )),
+    }
 }
 
 fn spawn_notebooklm_auth_shutdown(
@@ -342,11 +524,14 @@ async fn static_asset(method: axum::http::Method, uri: Uri) -> Response {
     } else {
         path
     };
+    // The push worker's scope holds no pages, so nothing there falls back
+    // to the app: a missing worker must not be answered with index.html.
     let asset = WebAssets::get(path).map(|asset| (asset, path)).or_else(|| {
-        (!path
-            .rsplit('/')
-            .next()
-            .is_some_and(|name| name.contains('.')))
+        (!path.starts_with("push/")
+            && !path
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name.contains('.')))
         .then(|| WebAssets::get("index.html").map(|asset| (asset, "index.html")))
         .flatten()
     });
@@ -402,11 +587,22 @@ where
     } else {
         RestartBehavior::Disabled
     };
-    match serve_until_mode_with_restart(home, host, port, web_mode, shutdown, restart_behavior)
-        .await?
+    match serve_until_mode_with_restart(
+        home,
+        host,
+        port,
+        web_mode,
+        shutdown,
+        restart_behavior,
+        None,
+        None,
+        UpdateServices::default(),
+    )
+    .await?
     {
         ServeOutcome::Stopped(address) => Ok(address),
         ServeOutcome::RestartRequested => unreachable!("process restart exits before returning"),
+        ServeOutcome::UpdateRequested => unreachable!("only a supervising host offers updates"),
     }
 }
 
@@ -416,6 +612,7 @@ pub async fn serve_until_mode_supervised<F>(
     port: u16,
     web_mode: WebMode,
     shutdown: F,
+    on_listening: Option<ListeningCallback>,
 ) -> Result<ServeOutcome>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -427,10 +624,42 @@ where
         web_mode,
         shutdown,
         RestartBehavior::ReturnToSupervisor,
+        on_listening,
+        None,
+        UpdateServices::default(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_until_mode_supervised_with_voice_recovery<F>(
+    home: HomeLayout,
+    host: &str,
+    port: u16,
+    web_mode: WebMode,
+    shutdown: F,
+    on_listening: Option<ListeningCallback>,
+    process_recovery: VoiceProcessRecovery,
+    update: UpdateServices,
+) -> Result<ServeOutcome>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_until_mode_with_restart(
+        home,
+        host,
+        port,
+        web_mode,
+        shutdown,
+        RestartBehavior::ReturnToSupervisor,
+        on_listening,
+        Some(process_recovery),
+        update,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn serve_until_mode_with_restart<F>(
     home: HomeLayout,
     host: &str,
@@ -438,6 +667,9 @@ async fn serve_until_mode_with_restart<F>(
     web_mode: WebMode,
     shutdown: F,
     restart_behavior: RestartBehavior,
+    on_listening: Option<ListeningCallback>,
+    process_recovery: Option<VoiceProcessRecovery>,
+    update: UpdateServices,
 ) -> Result<ServeOutcome>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -454,24 +686,35 @@ where
     ensure_listener_auth(&home, address)?;
     let runtime_id = new_web_runtime_id();
     let runtime_home = home.clone();
-    web_banner::print(host, address.port());
+    if let Some(on_listening) = on_listening {
+        on_listening(address);
+    } else {
+        web_banner::print(host, address.port());
+    }
     tracing::info!(%address, "CCCC Rust Web listening");
     let (web_shutdown, _) = broadcast::channel(1);
     let restart = (!matches!(restart_behavior, RestartBehavior::Disabled))
-        .then(|| Arc::new(RestartHandle::new(web_shutdown.clone())));
+        .then(|| Arc::new(RestartHandle::new(web_shutdown.clone(), update)));
     let mut restart_rx = web_shutdown.subscribe();
     let (shutdown_started, mut shutdown_started_rx) = tokio::sync::oneshot::channel();
-    let (app, im_workers, browser_surfaces, app_state) = app_with_shutdown(
-        home,
-        web_shutdown.clone(),
-        web_mode,
-        restart.clone(),
-        LiveBinding {
-            host: host.to_owned(),
-            port: address.port(),
-        },
-        runtime_id,
-    );
+    let (app, im_workers, browser_surfaces, app_state, voice_shutdown) =
+        app_with_shutdown_and_recovery(
+            home,
+            web_shutdown.clone(),
+            web_mode,
+            restart.clone(),
+            LiveBinding {
+                host: host.to_owned(),
+                port: address.port(),
+            },
+            runtime_id,
+            process_recovery,
+        );
+    // Where session owners run, they keep the shared browsers of Web model
+    // members, so those members keep running across Web restarts too.
+    if cccc_daemon::session_owner::platform_supported() && !web_mode.is_read_only() {
+        browser_surfaces.hold_shared_browsers(app_state.client.clone());
+    }
     if let Err(error) = web_runtime_state::write(
         &app_state.home,
         host,
@@ -483,9 +726,35 @@ where
     ) {
         tracing::warn!(%error, "failed to record live Web binding");
     }
+    // The host's own interface starts updates through the same handoff as the
+    // Web's route, and only while this Web serves.
+    if let Some(restart) = &restart
+        && let Some(on_trigger) = &restart.update.on_trigger
+        && restart.update_hook().is_some()
+    {
+        on_trigger(UpdateTrigger {
+            restart: Arc::clone(restart),
+            voice: Arc::clone(&app_state.codex_voice),
+        });
+    }
     routes::spawn_web_model_supervisor(app_state.clone());
+    if !web_mode.is_read_only()
+        && let Err(error) = session_node::restore(&app_state.home).await
+    {
+        tracing::warn!(%error, "Could not restore the paired LAN session gateway");
+    }
     routes::spawn_grok_webhooks(app_state.clone());
+    // An exhibit never installs voice models; the full Web clears what installs left behind.
+    if !web_mode.is_read_only() {
+        routes::spawn_voice_model_cleanup(app_state.home.clone());
+    }
+    if !web_mode.is_read_only() {
+        chet_group_input::spawn(app_state.clone());
+    }
     routes::spawn_dots_events(app_state);
+    // Also notify shutdown subscribers if the server fails before its graceful
+    // shutdown future fires.
+    let shutdown_after_server = web_shutdown.clone();
     let server = async move {
         axum::serve(
             listener,
@@ -503,30 +772,48 @@ where
         .await
     };
     tokio::pin!(server);
-    let server_result = tokio::select! {
+    let (server_result, shutdown_was_sent) = tokio::select! {
         biased;
-        result = &mut server => result,
-        _ = &mut shutdown_started_rx => {
-            match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut server).await {
+        result = &mut server => (result, shutdown_started_rx.try_recv().is_ok()),
+        started = &mut shutdown_started_rx => {
+            let result = match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut server).await {
                 Ok(result) => result,
                 Err(_) => {
                     tracing::warn!("Web graceful shutdown timed out; closing active connections");
                     Ok(())
                 }
-            }
+            };
+            (result, started.is_ok())
         }
     };
-    if tokio::time::timeout(COMPONENT_SHUTDOWN_TIMEOUT, im_workers.shutdown())
-        .await
-        .is_err()
-    {
-        tracing::warn!("Web component shutdown timed out; cancelling remaining IM workers");
+    if !shutdown_was_sent {
+        let _ = shutdown_after_server.send(());
     }
-    shutdown::browser_surfaces(&browser_surfaces).await;
+    let other_shutdown = async {
+        session_node::stop(&runtime_home).await;
+        if tokio::time::timeout(COMPONENT_SHUTDOWN_TIMEOUT, im_workers.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!("Web component shutdown timed out; cancelling remaining IM workers");
+        }
+        shutdown::browser_surfaces(&browser_surfaces).await;
+    };
+    tokio::join!(
+        await_codex_voice_shutdown(voice_shutdown, VOICE_SHUTDOWN_TIMEOUT),
+        other_shutdown,
+    );
     if let Err(error) = web_runtime_state::clear_if_owner(&runtime_home) {
         tracing::warn!(%error, "failed to clear live Web binding");
     }
     server_result?;
+    if matches!(restart_behavior, RestartBehavior::ReturnToSupervisor)
+        && restart
+            .as_ref()
+            .is_some_and(|handle| handle.update_requested())
+    {
+        return Ok(ServeOutcome::UpdateRequested);
+    }
     if restart.as_ref().is_some_and(|handle| handle.requested()) {
         match restart_behavior {
             RestartBehavior::ExitProcess => std::process::exit(75),
@@ -612,3 +899,6 @@ mod static_asset_tests;
 #[cfg(test)]
 #[path = "lib_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+cccc_daemon::session_owner_test_entry!(crate::browser_launcher());

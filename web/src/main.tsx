@@ -1,27 +1,25 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { AuthGate } from "./components/AuthGate";
-import App from "./App";
-import { CapabilityCenterStandaloneApp } from "./components/capabilities/CapabilityCenterStandaloneApp";
-import { isCapabilityCenterPath } from "./components/capabilities/capabilityCenterRoute";
 import { i18nReady } from "./i18n";
 import "./index.css";
 import { useBrandingStore } from "./stores";
 import { applyBrandingToDocument, DEFAULT_WEB_BRANDING } from "./utils/branding";
 import { applyTextScale, getStoredTextScale } from "./utils/textScale";
-import { ConnectEmbeddedApp } from "./features/connect/ConnectEmbeddedApp";
-import { isConnectFramePath } from "./features/connect/protocol";
-import { claimVitePreloadReload, recoverDynamicImportError } from "./utils/vitePreloadRecovery";
+import { applyUiStylePrefs, getUiStylePrefs } from "./utils/uiStyle";
+import { recoverDynamicImportError } from "./utils/vitePreloadRecovery";
+import { cleanupLegacyWorkers } from "./features/pushNotifications/legacyWorkers";
+import { WebRoot } from "./WebRoot";
+import { reloadForNewBuild } from "./features/connect/reloadPage";
+
+const reloadForNewModules = () => reloadForNewBuild(window.sessionStorage);
 
 function reloadAfterStaleModuleError(error: unknown): boolean {
-  return recoverDynamicImportError(error, window.sessionStorage, () => window.location.reload());
+  return recoverDynamicImportError(error, reloadForNewModules);
 }
 
+// Without a reload the import fails with its own error, which the part that loads it can show.
 window.addEventListener("vite:preloadError", (event) => {
-  event.preventDefault();
-  if (claimVitePreloadReload(window.sessionStorage)) {
-    window.location.reload();
-  }
+  if (reloadForNewModules()) event.preventDefault();
 });
 
 // Development imports are not wrapped by Vite's production preload helper.
@@ -37,42 +35,29 @@ window.addEventListener("unhandledrejection", (event) => {
   }
 });
 
-// v0.4: We intentionally do NOT use Service Workers.
-// Reason: SW caching frequently causes "stale UI" bugs in an ops/admin console.
-//
-// Best-effort cleanup: unregister any legacy SWs scoped to `/ui/` so clients
-// recover automatically after upgrades.
-if (
-  "serviceWorker" in navigator &&
-  typeof navigator.serviceWorker.getRegistrations === "function"
-) {
-  void navigator.serviceWorker.getRegistrations().then((registrations) => {
-    for (const r of registrations) {
-      try {
-        const scope = String(r.scope || "");
-        // Only touch our own scope to avoid impacting unrelated SWs on the same origin.
-        if (scope.includes("/ui/")) {
-          void r.unregister();
-        }
-      } catch {
-        // ignore
-      }
-    }
-  });
+// The legacy device-link notice needs only local appearance and translation assets.
+function startWorkbench() {
+  // Keep removing old page-controlling workers: their caches can serve stale UI.
+  // The narrowly scoped push worker handles no fetches and is retained.
+  if (
+    "serviceWorker" in navigator &&
+    typeof navigator.serviceWorker.getRegistrations === "function"
+  ) {
+    void navigator.serviceWorker
+      .getRegistrations()
+      .then(cleanupLegacyWorkers)
+      .catch(() => {});
+  }
+  void useBrandingStore.getState().refreshBranding();
 }
 
 applyBrandingToDocument(DEFAULT_WEB_BRANDING);
 applyTextScale(getStoredTextScale());
-void useBrandingStore.getState().refreshBranding();
-const isCapabilityCenterPage = isCapabilityCenterPath(window.location.pathname);
+applyUiStylePrefs(getUiStylePrefs());
 
 function renderApp() {
   ReactDOM.createRoot(document.getElementById("root")!).render(
-    isConnectFramePath(window.location.pathname) ? (
-      <ConnectEmbeddedApp />
-    ) : (
-      <AuthGate>{isCapabilityCenterPage ? <CapabilityCenterStandaloneApp /> : <App />}</AuthGate>
-    ),
+    <WebRoot pathname={window.location.pathname} onWorkbenchEntry={startWorkbench} />,
   );
 }
 

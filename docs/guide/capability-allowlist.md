@@ -44,17 +44,23 @@ Runtime blocklist model:
 
 ## 3. Runtime Discovery Model
 
-Runtime path does not run daemon-side periodic source sync loops.
+Search uses the built-in capabilities and locally stored catalog records, including
+records imported explicitly or retained from an earlier installation. It does not
+query remote registries or run a periodic source sync. Source identifiers in existing
+records describe their origin; they do not imply that automatic search of that source
+is available.
 
-Discovery flow:
+Unimported results saved from the retired SkillsMP remote search are left out of
+search, because their name and content may not match. They are not deleted: existing bindings keep
+working, they can still be used by ID, and the Capability Center and the member and
+profile pickers list them as **Unverified old search result**. To rely on one, find a
+trusted original source and import it with a supported method; when that source is
+gone, the skill may not be recoverable. An explicit import records where it came from;
+it does not verify the content.
 
-1. search local curated catalog first
-2. optionally augment from remote fallback when local results are insufficient:
-   - MCP: official MCP Registry
-   - skill: GitHub / AgentSkills-aligned / SkillsMP / ClawHub remote search
-3. cache accepted remote hits into local catalog
-
-This keeps runtime stable while preserving long-tail discoverability.
+A user or agent can still explicitly install a supported local path, URL, or GitHub
+target, subject to the applicable policy. Explicit remote installation may use the
+network; it is separate from catalog search.
 
 ## 4. Daemon Ops (Global Overlay)
 

@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 use cccc_contracts::{DaemonAddress, DaemonRequest, DaemonResponse};
 use cccc_core::HomeLayout;
 use std::path::PathBuf;
@@ -7,9 +8,18 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+pub mod attended_update;
 mod connection;
+pub mod owned_mcp;
+pub mod session_node;
 use connection::Connection;
 pub use connection::DaemonStream;
+
+/// The address file the running daemon writes for its clients.
+#[must_use]
+pub fn address_path(home: &HomeLayout) -> PathBuf {
+    home.daemon_dir().join("ccccd.addr.json")
+}
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -32,7 +42,9 @@ pub struct DaemonClient {
     home: HomeLayout,
     timeout: Duration,
     lifecycle_timeout: Duration,
+    connect_wait: Duration,
     shared: Arc<ClientShared>,
+    use_voice_origin: bool,
 }
 
 #[derive(Debug, Default)]
@@ -61,7 +73,9 @@ impl DaemonClient {
             home,
             timeout: Duration::from_secs(60),
             lifecycle_timeout: Duration::from_secs(300),
+            connect_wait: Duration::ZERO,
             shared: Arc::new(ClientShared::default()),
+            use_voice_origin: true,
         }
     }
 
@@ -82,18 +96,57 @@ impl DaemonClient {
         }
     }
 
-    pub async fn call(&self, request: &DaemonRequest) -> Result<DaemonResponse, ClientError> {
-        let mut request = request.clone();
+    /// Wait for a daemon that is temporarily absent, only before a request
+    /// can be sent. This does not start a daemon or replay an exchange. The
+    /// ordinary request timeout still bounds the entire call, including wait.
+    /// Stream upgrades retain their existing connection behavior.
+    #[must_use]
+    pub fn with_connect_wait(mut self, budget: Duration) -> Self {
+        self.connect_wait = budget;
+        self
+    }
+
+    /// Host services do not inherit an assistant subprocess's identity.
+    #[must_use]
+    pub fn without_voice_origin(mut self) -> Self {
+        self.use_voice_origin = false;
+        self
+    }
+
+    fn apply_voice_origin(&self, request: &mut DaemonRequest, origin: Option<String>) {
+        if !self.use_voice_origin {
+            request
+                .args
+                .remove(cccc_core::voice_notifications::ORIGIN_ARG);
+            return;
+        }
         if matches!(
             request.op.as_str(),
-            "send" | "message_send" | "send_files" | "reply" | "tracked_send" | "send_cross_group"
-        ) && let Ok(origin) = std::env::var(cccc_core::voice_notifications::ORIGIN_ENV)
+            "send"
+                | "message_send"
+                | "send_files"
+                | "reply"
+                | "tracked_send"
+                | "send_cross_group"
+                | "connect_send"
+                | "connect_send_files"
+                | "message_upload_preflight"
+        ) && let Some(origin) = origin
         {
             request.args.insert(
                 cccc_core::voice_notifications::ORIGIN_ARG.into(),
                 serde_json::Value::String(origin),
             );
         }
+    }
+
+    pub async fn call(&self, request: &DaemonRequest) -> Result<DaemonResponse, ClientError> {
+        let mut request = request.clone();
+        let origin = self
+            .use_voice_origin
+            .then(|| std::env::var(cccc_core::voice_notifications::ORIGIN_ENV).ok())
+            .flatten();
+        self.apply_voice_origin(&mut request, origin);
         let exchange_started = AtomicBool::new(false);
         match tokio::time::timeout(
             self.request_timeout(&request.op),
@@ -204,7 +257,10 @@ impl DaemonClient {
         request: &DaemonRequest,
         exchange_started: &AtomicBool,
     ) -> Result<DaemonResponse, CallFailure> {
-        let mut connection = self.connect().await.map_err(CallFailure::Connect)?;
+        let mut connection = self
+            .connect_for_call()
+            .await
+            .map_err(CallFailure::Connect)?;
         exchange_started.store(true, Ordering::Release);
         connection
             .exchange(request)
@@ -217,14 +273,42 @@ impl DaemonClient {
         Connection::connect(&address).await
     }
 
+    async fn connect_for_call(&self) -> Result<Connection, ClientError> {
+        if self.connect_wait.is_zero() {
+            return self.connect().await;
+        }
+        let deadline = tokio::time::Instant::now() + self.connect_wait.min(self.timeout);
+        loop {
+            match tokio::time::timeout_at(deadline, self.connect()).await {
+                Ok(Ok(connection)) => return Ok(connection),
+                Ok(Err(error)) if retryable_connect(&error) => {
+                    self.invalidate_transport().await;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ClientError::Timeout);
+                    }
+                    tokio::time::sleep_until(
+                        deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)),
+                    )
+                    .await;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(ClientError::Timeout),
+            }
+        }
+    }
+
     async fn address(&self) -> Result<DaemonAddress, ClientError> {
         if let Some(address) = self.shared.address.read().await.clone() {
             return Ok(address);
         }
-        let path = self.home.daemon_dir().join("ccccd.addr.json");
-        let raw = tokio::fs::read(&path)
-            .await
-            .map_err(|_| ClientError::AddressUnavailable(path))?;
+        let path = address_path(&self.home);
+        let raw = tokio::fs::read(&path).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ClientError::AddressUnavailable(path)
+            } else {
+                ClientError::Transport(error)
+            }
+        })?;
         let address: DaemonAddress = serde_json::from_slice(&raw)?;
         *self.shared.address.write().await = Some(address.clone());
         Ok(address)
@@ -232,6 +316,17 @@ impl DaemonClient {
 
     async fn invalidate_transport(&self) {
         *self.shared.address.write().await = None;
+    }
+}
+
+fn retryable_connect(error: &ClientError) -> bool {
+    match error {
+        ClientError::AddressUnavailable(_) => true,
+        ClientError::Transport(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        _ => false,
     }
 }
 

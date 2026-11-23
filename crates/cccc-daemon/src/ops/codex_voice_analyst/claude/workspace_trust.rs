@@ -1,6 +1,7 @@
 //! Claude Code refuses background sessions in a workspace whose trust prompt was never
 //! accepted, and a detached `--bg` launch has no terminal to accept it in.
 
+use super::confirmation::ConfirmationLaunch;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,24 +12,21 @@ const REFUSAL: &str = "Workspace not trusted";
 #[derive(Debug)]
 pub(crate) struct WorkspaceUntrusted {
     pub(crate) workspace: PathBuf,
-    executable: String,
-    config_dir: PathBuf,
+    launch: ConfirmationLaunch,
 }
 
 impl WorkspaceUntrusted {
     pub(super) fn from_refusal(
         detail: &str,
         workspace: &Path,
-        executable: &str,
-        config_dir: &Path,
+        launch: ConfirmationLaunch,
     ) -> Option<io::Error> {
         detail.contains(REFUSAL).then(|| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 Self {
                     workspace: workspace.to_path_buf(),
-                    executable: executable.to_owned(),
-                    config_dir: config_dir.to_path_buf(),
+                    launch,
                 },
             )
         })
@@ -39,12 +37,11 @@ impl fmt::Display for WorkspaceUntrusted {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "Claude Code has not trusted the workspace '{}'. Run '{}' once in that directory \
-             with CLAUDE_CONFIG_DIR set to '{}', accept the trust prompt and exit, then start \
-             the Actor again. Trusting a parent folder does not cover a separate Git repository.",
+            "Claude Code has not trusted the workspace '{}'. Open Claude interactively in that workspace, review the trust prompt, and retry when ready. Configured executable: '{}'; resolved settings directory: '{}'. Trusting a parent folder does not cover a separate Git repository.{}",
             self.workspace.display(),
-            self.executable,
-            self.config_dir.display(),
+            self.launch.executable,
+            self.launch.config_dir.display(),
+            self.launch.config_dir_hint()
         )
     }
 }
@@ -56,6 +53,13 @@ pub(crate) fn untrusted_workspace(error: &io::Error) -> Option<&Path> {
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<WorkspaceUntrusted>())
         .map(|untrusted| untrusted.workspace.as_path())
+}
+
+pub(super) fn confirmation_launch(error: &io::Error) -> Option<&ConfirmationLaunch> {
+    error
+        .get_ref()?
+        .downcast_ref::<WorkspaceUntrusted>()
+        .map(|refusal| &refusal.launch)
 }
 
 #[cfg(all(test, unix))]
@@ -96,11 +100,17 @@ mod tests {
             "generation-12345678",
             SessionPurpose::Actor,
             None,
+            false,
         )
         .await;
         let Err(error) = result else {
             panic!("an untrusted workspace must not launch");
         };
+        assert!(
+            error.job_absence_confirmed,
+            "the native prelaunch refusal created no job"
+        );
+        let error = error.error;
         assert_eq!(untrusted_workspace(&error), Some(workspace.as_path()));
         let message = error.to_string();
         assert!(

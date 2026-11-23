@@ -25,6 +25,7 @@ pub const CORE_TOOL_NAMES: &[&str] = &[
     "cccc_context_get",
     "cccc_coordination",
     "cccc_task",
+    "cccc_backlog",
     "cccc_agent_state",
 ];
 
@@ -35,7 +36,6 @@ const WEB_MODEL_EXTRA_TOOL_NAMES: &[&str] = &[
     "cccc_tracked_send",
     "cccc_repo",
     "cccc_presentation",
-    "cccc_memory",
     "cccc_runtime_wait_next_turn",
     "cccc_runtime_complete_turn",
     "cccc_code_exec",
@@ -69,6 +69,9 @@ pub fn actor_base_tool_names(
     CORE_TOOL_NAMES.iter().chain(extra).copied()
 }
 
+/// Discovery and conversation entry point for explicitly enabled native sessions.
+pub const LOCAL_SESSION_TOOL_NAMES: &[&str] = &["cccc_session"];
+
 /// Local user-authority MCP sessions need the Group control plane without
 /// first mutating capability state. Actor sessions keep the smaller core and
 /// opt into these operations through `pack:group-runtime`.
@@ -88,16 +91,9 @@ pub fn all() -> Vec<Capability> {
         skill(
             SELF_EVOLUTION_CAPABILITY_ID,
             "cccc-self-evolution",
-            "Review complete visible CCCC group history and propose confirmed improvements at the prompt, structured-context, workflow, Harness, or optimizer level.",
+            "Review how the team works from the user's words and ledger counts, then propose up to three changes for the user to choose.",
             SELF_EVOLUTION_CAPSULE,
-            &[
-                "self-evolution",
-                "learning",
-                "workflow",
-                "harness",
-                "optimizer",
-                "cccc-glue",
-            ],
+            &["self-evolution", "team-review", "workflow", "cccc-glue"],
         ),
         pack(
             "pack:group-runtime",
@@ -131,13 +127,8 @@ pub fn all() -> Vec<Capability> {
         pack(
             "pack:context-advanced",
             "Extended Context + Delegation",
-            &[
-                "cccc_tracked_send",
-                "cccc_context_sync",
-                "cccc_memory",
-                "cccc_memory_admin",
-            ],
-            &["context", "delegation", "memory"],
+            &["cccc_tracked_send", "cccc_context_sync"],
+            &["context", "delegation"],
         ),
         pack(
             "pack:headless-notify",
@@ -183,8 +174,11 @@ fn skill(id: &str, name: &str, description: &str, capsule_text: &str, tags: &[&s
         capsule_text: capsule_text.trim().into(),
         source: "cccc_builtin".into(),
         source_uri: String::new(),
+        sync_state: String::new(),
         qualification_status: "qualified".into(),
         enable_supported: true,
+        metadata: Default::default(),
+        release_owned: false,
     }
 }
 
@@ -199,7 +193,44 @@ fn pack(id: &str, title: &str, tools: &[&str], tags: &[&str]) -> Capability {
         capsule_text: String::new(),
         source: "cccc_builtin".into(),
         source_uri: String::new(),
+        sync_state: String::new(),
         qualification_status: "qualified".into(),
         enable_supported: true,
+        metadata: Default::default(),
+        release_owned: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The text asks the review to settle what the stand-up handed over and to
+    /// propose retiring a rule only on evidence; the user's pick decides.
+    #[test]
+    fn the_team_review_settles_handed_over_questions_and_retires_rules() {
+        for promise in [
+            concat!(
+                "A peer asked to run it passes the foreman only what the foreman can already ",
+                "read, or what the user authorized and the team's work needs, while honoring ",
+                "confidentiality limits."
+            ),
+            "in a task's title or at the start of a line in its notes",
+            "authorizes no change",
+            "leave it open and say what it waits for",
+            "no `Review:` question in it is still open",
+            "passing the `if_task_rev` you read",
+            "do not remove one only because nothing recurred or the user said nothing",
+            "each change within your authority worth checking later",
+            "the team saw the same failure again",
+            "Do not resend a card the user has not answered.",
+            "say briefly what you read",
+            "Standing rules, their removal and changes to members wait for the user's pick",
+            "share only what the user authorized and the team's work needs",
+            "honor any confidentiality limits",
+            "Do not include its ID unless the user specifically agreed.",
+        ] {
+            assert!(SELF_EVOLUTION_CAPSULE.contains(promise), "{promise}");
+        }
     }
 }

@@ -1,4 +1,6 @@
-use super::delivery_projection::{TurnProjection, agent_message_text, persist_terminal};
+use super::delivery_projection::{
+    TurnProjection, activity_detail, agent_message_text, persist_terminal,
+};
 use super::turn_failure::fail_sent_request;
 use super::turn_timeout::settle_timed_out_request;
 use super::{cancellation_requested, sessions};
@@ -9,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// What became of one delivery attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TurnDelivery {
     /// The turn completed, now or in an earlier attempt.
     Completed,
@@ -23,6 +25,7 @@ pub enum TurnDelivery {
 /// caller records a cursor completion. Anything but `Completed` leaves the
 /// source event unread; permanent deployment/context failures also block
 /// automatic restart until the actor is explicitly started again.
+#[cfg(test)]
 pub fn deliver(
     home: &HomeLayout,
     group: &GroupDoc,
@@ -30,16 +33,80 @@ pub fn deliver(
     event: &Event,
     cancelled: &AtomicBool,
 ) -> TurnDelivery {
-    deliver_with_timeout(
+    deliver_marked(
+        home,
+        group,
+        actor,
+        event,
+        cancelled,
+        &AtomicBool::new(false),
+        None,
+    )
+}
+
+/// As [`deliver`], setting `started` right before the request is handed to
+/// the provider. A started request may have reached DeepSeek even when the
+/// delivery ends incomplete.
+pub(crate) fn deliver_marked(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+    event: &Event,
+    cancelled: &AtomicBool,
+    started: &AtomicBool,
+    target: Option<&crate::session_owner::OwnedTarget>,
+) -> TurnDelivery {
+    #[cfg(not(unix))]
+    let _ = target;
+    #[cfg(unix)]
+    if crate::session_owner::enabled(home) {
+        let Some(text) = crate::ops::actor_delivery_render::render_batch_with_mail_context(
+            home,
+            group,
+            &actor.id,
+            std::slice::from_ref(event),
+        ) else {
+            return TurnDelivery::Incomplete;
+        };
+        return match crate::session_owner::submit(
+            home,
+            group,
+            actor,
+            std::slice::from_ref(event),
+            &text,
+            cancelled,
+            started,
+            target,
+        ) {
+            Ok(result) => {
+                started.store(
+                    result
+                        .get("started")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    Ordering::Release,
+                );
+                result
+                    .get("outcome")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or(TurnDelivery::Incomplete)
+            }
+            Err(_) => TurnDelivery::Incomplete,
+        };
+    }
+    deliver_with_timeout_marked(
         home,
         group,
         actor,
         event,
         cancelled,
         Duration::from_secs(cccc_contracts::DEEPSEEK_TURN_TIMEOUT_SECONDS),
+        started,
     )
 }
 
+#[cfg(test)]
 pub(super) fn deliver_with_timeout(
     home: &HomeLayout,
     group: &GroupDoc,
@@ -48,32 +115,115 @@ pub(super) fn deliver_with_timeout(
     cancelled: &AtomicBool,
     turn_timeout: Duration,
 ) -> TurnDelivery {
+    deliver_with_timeout_marked(
+        home,
+        group,
+        actor,
+        event,
+        cancelled,
+        turn_timeout,
+        &AtomicBool::new(false),
+    )
+}
+
+fn deliver_with_timeout_marked(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+    event: &Event,
+    cancelled: &AtomicBool,
+    turn_timeout: Duration,
+    started: &AtomicBool,
+) -> TurnDelivery {
+    let Some(payload) = crate::ops::actor_delivery_render::render_batch_with_mail_context(
+        home,
+        group,
+        &actor.id,
+        std::slice::from_ref(event),
+    ) else {
+        return TurnDelivery::Incomplete;
+    };
+    deliver_prepared_with_timeout(
+        home,
+        group,
+        actor,
+        None,
+        event,
+        &payload,
+        cancelled,
+        turn_timeout,
+        started,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_prepared(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+    generation: &str,
+    event: &Event,
+    payload: &str,
+    cancelled: &AtomicBool,
+    started: &AtomicBool,
+) -> TurnDelivery {
+    deliver_prepared_with_timeout(
+        home,
+        group,
+        actor,
+        Some(generation),
+        event,
+        payload,
+        cancelled,
+        Duration::from_secs(cccc_contracts::DEEPSEEK_TURN_TIMEOUT_SECONDS),
+        started,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_prepared_with_timeout(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+    generation: Option<&str>,
+    event: &Event,
+    payload: &str,
+    cancelled: &AtomicBool,
+    turn_timeout: Duration,
+    started: &AtomicBool,
+) -> TurnDelivery {
     if cancelled.load(Ordering::Acquire) {
         return TurnDelivery::Incomplete;
     }
     let key = (group.group_id.clone(), actor.id.clone());
-    let holder = sessions()
-        .read()
-        .ok()
-        .and_then(|map| map.get(&key).cloned());
+    let holder = sessions().read().ok().and_then(|map| {
+        map.get(&key)
+            .filter(|entry| generation.is_none_or(|wanted| entry.generation == wanted))
+            .cloned()
+    });
     let Some(holder) = holder else {
         return TurnDelivery::Incomplete;
     };
     if super::recovery::has_completed_event(home, group, actor, &event.id) {
         return TurnDelivery::Completed;
     }
-    let payload = crate::ops::actor_delivery_render::render_batch_with_mail_context(
-        home,
-        group,
-        &actor.id,
-        std::slice::from_ref(event),
-    );
-    let Some(mut payload) = payload else {
-        return TurnDelivery::Incomplete;
-    };
+    let mut payload = payload.to_owned();
     if event.kind == "chat.message" {
         payload.push_str("\n\n[cccc] ");
         payload.push_str(cccc_core::system_prompt::NEW_MESSAGE_MODE_GUIDANCE);
+    }
+    let instruction_notice = holder.workspace.clone().for_actor(actor).and_then(|scope| {
+        crate::ops::instruction_files::check(
+            home,
+            &group.group_id,
+            actor,
+            &format!("deepseek:{}", holder.generation),
+            &scope.path,
+        )
+    });
+    if let Some(notice) = &instruction_notice {
+        payload.push_str("\n\n");
+        payload.push_str(&notice.delivery_line());
     }
     if !holder.running.load(Ordering::Acquire) {
         return TurnDelivery::Incomplete;
@@ -81,9 +231,13 @@ pub(super) fn deliver_with_timeout(
     let Ok(mut supervisor) = holder.supervisor.lock() else {
         return TurnDelivery::Incomplete;
     };
+    if cancelled.load(Ordering::Acquire) || !holder.running.load(Ordering::Acquire) {
+        return TurnDelivery::Incomplete;
+    }
     let Some(session_id) = supervisor.session_id().map(str::to_owned) else {
         return TurnDelivery::Incomplete;
     };
+    started.store(true, Ordering::Release);
     let request_id = match supervisor.enqueue(payload).and_then(|_| {
         supervisor
             .flush_one(&session_id)
@@ -92,7 +246,8 @@ pub(super) fn deliver_with_timeout(
         Ok(id) if id > 0 => id,
         _ => return TurnDelivery::Incomplete,
     };
-    let turn_deadline = Instant::now() + turn_timeout;
+    // The deadline is a silence window: provider progress below moves it.
+    let mut turn_deadline = Instant::now() + turn_timeout;
     macro_rules! fail {
         ($terminal_seen:expr) => {{
             fail_sent_request(
@@ -182,11 +337,11 @@ pub(super) fn deliver_with_timeout(
             if cccc_runtime::deepseek_acp::validate_session_update(&frame, &session_id).is_err() {
                 fail!(false);
             }
-            let update = params.get("update").cloned().unwrap_or(Value::Null);
+            let update = &params["update"];
             let ordinal = update_ordinal;
             update_ordinal = update_ordinal.saturating_add(1);
             let update_key = format!("deepseek.update:{}:{attempt_id}:{ordinal}", event.id);
-            let (kind, data) = if let Some(delta) = agent_message_text(&update) {
+            let (kind, data) = if let Some(delta) = agent_message_text(update) {
                 message_text.push_str(delta);
                 (
                     "headless.message.delta",
@@ -214,7 +369,10 @@ pub(super) fn deliver_with_timeout(
                         ("kind".into(), json!("thinking")),
                         ("status".into(), json!("updated")),
                         ("summary".into(), json!(update_kind)),
-                        ("detail".into(), json!(update.to_string())),
+                        (
+                            "detail".into(),
+                            json!(activity_detail(update, &holder.private_values)),
+                        ),
                         ("raw_item_type".into(), json!(update_kind)),
                     ]),
                 )
@@ -231,6 +389,7 @@ pub(super) fn deliver_with_timeout(
             {
                 fail!(false);
             }
+            turn_deadline = Instant::now() + turn_timeout;
             continue;
         }
         if frame.get("method") == Some(&Value::String("session/request_permission".into())) {
@@ -264,11 +423,18 @@ pub(super) fn deliver_with_timeout(
             {
                 fail!(false);
             }
+            turn_deadline = Instant::now() + turn_timeout;
             continue;
         }
         if frame.get("id") == Some(&json!(request_id)) {
             let projection = projection!();
-            return persist_terminal(&holder, &mut supervisor, &projection, &frame);
+            let outcome = persist_terminal(&holder, &mut supervisor, &projection, &frame);
+            if outcome == TurnDelivery::Completed
+                && let Some(notice) = instruction_notice
+            {
+                notice.delivered();
+            }
+            return outcome;
         }
         // A response for an unknown id is rejected by the strict parser. A
         // notification with an unknown method is ignored only after protocol

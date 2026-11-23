@@ -121,18 +121,15 @@ describe("settings pages on the kit", () => {
     expect(setDefault).toHaveBeenCalledWith("broadcast");
   });
 
-  it("transcript: notification lines follow the include-tail switch", async () => {
-    const setTail = vi.fn();
+  it("transcript: visibility and the tail viewer remain available", async () => {
+    const setVisibility = vi.fn();
     const props = {
       isDark: false,
       busy: false,
       groupId: "g1",
       devActors: [] as Actor[],
       terminalVisibility: "foreman" as const,
-      setTerminalVisibility: vi.fn(),
-      setTerminalNotifyTail: setTail,
-      terminalNotifyLines: 20,
-      setTerminalNotifyLines: vi.fn(),
+      setTerminalVisibility: setVisibility,
       onSaveTranscriptSettings: vi.fn(),
       tailActorId: "",
       setTailActorId: vi.fn(),
@@ -151,18 +148,24 @@ describe("settings pages on the kit", () => {
       onCopyTail: vi.fn(),
       onClearTail: vi.fn(),
     };
-    await render(<TranscriptTab {...props} terminalNotifyTail={false} />);
+    await render(<TranscriptTab {...props} />);
     // Every visible label must point at a real control; the actor picker is named by aria-label.
     for (const label of host.querySelectorAll("label[for]")) {
       expect(document.getElementById(label.getAttribute("for")!)).not.toBeNull();
     }
     expect(host.querySelector('[aria-label="transcript.actor"]')).not.toBeNull();
-    const lines = () => host.querySelector<HTMLInputElement>('input[type="number"][max="80"]')!;
-    expect(lines().disabled).toBe(true);
-    await click(host.querySelector('[role="switch"]')!);
-    expect(setTail).toHaveBeenCalledWith(true);
-    await render(<TranscriptTab {...props} terminalNotifyTail />);
-    expect(lines().disabled).toBe(false);
+    expect(host.textContent).not.toContain("transcript.includeTail");
+    expect(host.textContent).not.toContain("transcript.notificationLines");
+    await click(host.querySelector('[aria-label="transcript.visibilityLabel"]')!);
+    let all: HTMLElement | undefined;
+    await vi.waitFor(() => {
+      all = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(
+        (option) => option.textContent === "transcript.visibilityAll",
+      );
+      expect(all).toBeDefined();
+    });
+    await click(all!);
+    expect(setVisibility).toHaveBeenCalledWith("all");
     // Clearing sits in its own danger card and needs a chosen actor.
     const danger = host.querySelector('[data-settings-card="danger"] button') as HTMLButtonElement;
     expect(danger.disabled).toBe(true);
@@ -173,7 +176,6 @@ describe("settings pages on the kit", () => {
     const renderNav = (globalEnabled: boolean) =>
       render(
         <SettingsNavigation
-          isDark={false}
           groupId="g1"
           groupTitle="cccc"
           scope="group"
@@ -196,9 +198,40 @@ describe("settings pages on the kit", () => {
     expect(host.textContent).toContain("navigation.appliesToGroup");
     await click(buttons()[1]);
     expect(onScope).not.toHaveBeenCalled();
+    // Desktop and phone each put one help key beside the switch, never inside a scope
+    // key, so a tap on it cannot switch scope and a disabled key does not hide it.
+    const switches = [...host.querySelectorAll<HTMLElement>("[data-settings-scope-switch]")];
+    expect(switches).toHaveLength(2);
+    for (const group of switches) {
+      expect(group.querySelector("button button, [data-scope-help-trigger]")).toBeNull();
+      expect(group.parentElement?.querySelectorAll("[data-scope-help-trigger]")).toHaveLength(1);
+    }
+    // The help explains both scopes, including why the instance is locked.
+    await click(host.querySelector<HTMLButtonElement>("[data-scope-help-trigger]")!);
+    const help = document.querySelector<HTMLElement>("[data-scope-help-popup]")!;
+    expect(help.textContent).toContain("navigation.groupScopeContent");
+    expect(help.textContent).toContain("navigation.globalLockedContent");
 
     await renderNav(true);
     await click(buttons()[1]);
     expect(onScope).toHaveBeenCalledWith("global");
+  });
+
+  it("navigation: with no group open, the help says so instead of naming an empty target", async () => {
+    await render(
+      <SettingsNavigation
+        scope="global"
+        scopeRootUrl=""
+        globalEnabled
+        tabs={[{ id: "account", label: "account" }]}
+        activeTab="account"
+        onScopeChange={vi.fn()}
+        onTabChange={vi.fn()}
+      />,
+    );
+    await click(host.querySelector<HTMLButtonElement>("[data-scope-help-trigger]")!);
+    const help = document.querySelector<HTMLElement>("[data-scope-help-popup]")!;
+    expect(help.textContent).toContain("navigation.groupScopeNoGroup");
+    expect(help.textContent).not.toContain("navigation.groupScopeContent");
   });
 });

@@ -16,6 +16,7 @@ vi.mock("react-i18next", () => ({
   }),
 }));
 
+import { MessageReplyQuote } from "./MessageReplyQuote";
 import { MessageReferenceSections } from "./MessageReferenceSections";
 
 describe("MessageReferenceSections", () => {
@@ -81,7 +82,68 @@ describe("MessageReferenceSections", () => {
     const buttons = host.querySelectorAll("button");
     await act(async () => buttons[0]?.click());
     await act(async () => buttons[1]?.click());
-    expect(onOpenPresentationRef).toHaveBeenCalledWith(presentationRef, event);
+    expect(onOpenPresentationRef).toHaveBeenCalledWith(presentationRef, event, 0);
     expect(onOpenTaskRef).toHaveBeenCalledWith(taskRef, event);
+  });
+
+  it("distinguishes repeated presentation references by their position", async () => {
+    const event: LedgerEvent = { id: "event-1", kind: "message" };
+    const ref: PresentationMessageRef = { kind: "presentation_ref", slot_id: "slot-1" };
+    const open = vi.fn();
+    await act(async () =>
+      root.render(
+        <MessageReferenceSections
+          event={event}
+          presentationRefs={[ref, ref]}
+          voiceDocumentRefs={[]}
+          taskRefs={[]}
+          taskById={new Map()}
+          sectionClassName="reference-section"
+          onOpenPresentationRef={open}
+        />,
+      ),
+    );
+    const buttons = host.querySelectorAll("button");
+    await act(async () => buttons[0].click());
+    await act(async () => buttons[1].click());
+    expect(open.mock.calls).toEqual([
+      [ref, event, 0],
+      [ref, event, 1],
+    ]);
+  });
+  it("opens the replied message from the quote itself", async () => {
+    const onOpenReplyTarget = vi.fn();
+    const onBubbleClick = vi.fn();
+    const text = "Quoted context\n".repeat(20);
+    await act(async () =>
+      root.render(
+        <div onClick={onBubbleClick}>
+          <MessageReplyQuote
+            text={text}
+            replyToEventId="source-event"
+            onOpenReplyTarget={onOpenReplyTarget}
+          />
+        </div>,
+      ),
+    );
+    const buttons = host.querySelectorAll<HTMLButtonElement>("button");
+    expect(buttons).toHaveLength(1);
+    const quote = buttons[0];
+    expect(quote.textContent).toBe(`jumpToRepliedMessage: ${text}`);
+    expect(quote.getAttribute("title")).toBe("jumpToRepliedMessage");
+    // The replied message holds the rest.
+    expect(quote.querySelector(".line-clamp-2")).not.toBeNull();
+    await act(async () => quote.click());
+    expect(onOpenReplyTarget).toHaveBeenCalledExactlyOnceWith("source-event");
+    expect(onBubbleClick).not.toHaveBeenCalled();
+  });
+
+  it("shows all of a quote without a known source as plain text", async () => {
+    await act(async () => root.render(<MessageReplyQuote text="Quoted context" />));
+    expect(host.querySelector("button")).toBeNull();
+    const quote = host.querySelector("[data-message-quote]");
+    expect(quote?.textContent).toBe("Quoted context");
+    // Nothing else leads to the rest of it, so none of it is cut off.
+    expect(quote?.querySelector(".line-clamp-2")).toBeNull();
   });
 });

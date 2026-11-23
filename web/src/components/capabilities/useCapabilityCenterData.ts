@@ -2,12 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import * as api from "../../services/api";
 import type {
+  CapabilityDomain,
   CapabilityOverviewItem,
-  CapabilitySourceInstance,
   CapabilitySourceState,
   CapabilityStateResult,
 } from "../../types";
 import {
+  capabilityCenterStateReadable,
   normalizeCapabilityCenterPagination,
   summarizeCapabilityCenter,
   type CapabilityCenterStateFilter,
@@ -23,9 +24,13 @@ interface CapabilityCenterDataOptions {
   failedStateMessage: string;
   groupId: string;
   isOpen: boolean;
+  /** The language release recommendations are read in. */
+  locale: string;
   pageIndex: number;
   pageSize: number;
   query: string;
+  /** Lists one catalog source only, such as the release recommendations. */
+  sourceId?: string;
   stateFilter: CapabilityCenterStateFilter;
   typeFilter: CapabilityCenterTypeFilter;
 }
@@ -37,15 +42,18 @@ export function useCapabilityCenterData(options: CapabilityCenterDataOptions) {
     failedStateMessage,
     groupId,
     isOpen,
+    locale,
     pageIndex,
     pageSize,
     query,
+    sourceId,
     stateFilter,
     typeFilter,
   } = options;
   const [items, setItems] = useState<CapabilityOverviewItem[]>([]);
+  const [matchedQuery, setMatchedQuery] = useState<string | null>(null);
+  const [domains, setDomains] = useState<CapabilityDomain[]>([]);
   const [sources, setSources] = useState<Record<string, CapabilitySourceState>>({});
-  const [sourceInstances, setSourceInstances] = useState<CapabilitySourceInstance[]>([]);
   const [state, setState] = useState<CapabilityStateResult | null>(null);
   const [summaryStats, setSummaryStats] = useState<CapabilityCenterStats | null>(null);
   const [selectedId, setSelectedId] = useState("");
@@ -53,6 +61,9 @@ export function useCapabilityCenterData(options: CapabilityCenterDataOptions) {
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  // A failed state read is kept apart from list and action errors: reloading the list
+  // must not clear it, only a later state read that succeeds.
+  const [stateError, setStateError] = useState("");
   const requestSequence = useRef(0);
   const stateRequestSequence = useRef(0);
 
@@ -77,7 +88,9 @@ export function useCapabilityCenterData(options: CapabilityCenterDataOptions) {
         query: query || undefined,
         kind: typeFilter,
         policy: stateFilter === "blocked" ? "blocked" : "all",
+        sourceId,
         groupId,
+        locale,
       });
       if (sequence !== requestSequence.current) return;
       if (!response.ok) {
@@ -88,16 +101,17 @@ export function useCapabilityCenterData(options: CapabilityCenterDataOptions) {
       const nextStats = summarizeCapabilityCenter(nextItems, null);
       const kindCounts = response.result.kind_counts || {};
       setItems(nextItems);
+      setMatchedQuery(query);
+      setDomains(Array.isArray(response.result.domains) ? response.result.domains : []);
       setTotalCount(Number(response.result.total_count || nextItems.length) || 0);
       setHasMore(Boolean(response.result.has_more));
       setSources(response.result.sources || {});
-      setSourceInstances(response.result.source_instances || []);
       setSummaryStats({
         total: Number(response.result.total_count || nextItems.length) || 0,
         skills: Number(kindCounts.skill || 0),
         mcp: Number(kindCounts.mcp || 0),
         packs: Number(kindCounts.pack || 0),
-        enabled: 0,
+        enabled: Number(response.result.enabled_count || 0),
         slashHidden: nextStats.slashHidden,
         blocked: nextStats.blocked,
         needsSetup: nextStats.needsSetup,
@@ -115,30 +129,38 @@ export function useCapabilityCenterData(options: CapabilityCenterDataOptions) {
     clientPagination,
     failedLoadMessage,
     groupId,
+    locale,
     pageIndex,
     pageSize,
     query,
+    sourceId,
     stateFilter,
     typeFilter,
   ]);
 
-  const loadState = useCallback(async () => {
+  const loadState = useCallback(async (): Promise<CapabilityStateResult | null> => {
     const sequence = ++stateRequestSequence.current;
     if (!groupId) {
       setState(null);
-      return;
+      setStateError("");
+      return null;
     }
     const response = await api.fetchGroupCapabilityState(groupId, "user", { noCache: true });
-    if (sequence !== stateRequestSequence.current) return;
-    if (response.ok) {
+    if (sequence !== stateRequestSequence.current) return null;
+    // A read the center cannot show keeps the last state on screen and reports the failure.
+    if (response.ok && capabilityCenterStateReadable(response.result)) {
       setState(response.result);
-    } else {
-      setError(response.error?.message || failedStateMessage);
+      setStateError("");
+      return response.result;
     }
+    setStateError((!response.ok && response.error?.message) || failedStateMessage);
+    return null;
   }, [failedStateMessage, groupId]);
 
+  // Resolves to the state it loaded, or null when that load failed or a newer one replaced it.
   const refresh = useCallback(async () => {
-    await Promise.all([loadOverview(), loadState()]);
+    const [, nextState] = await Promise.all([loadOverview(), loadState()]);
+    return nextState;
   }, [loadOverview, loadState]);
 
   useEffect(() => {
@@ -150,16 +172,17 @@ export function useCapabilityCenterData(options: CapabilityCenterDataOptions) {
   }, [isOpen, loadState]);
 
   return {
-    error,
+    domains,
+    error: error || stateError,
     hasMore,
     items,
+    matchedQuery,
     loading,
+    loadState,
     refresh,
     selectedId,
     setError,
     setSelectedId,
-    setState,
-    sourceInstances,
     sources,
     state,
     summaryStats,

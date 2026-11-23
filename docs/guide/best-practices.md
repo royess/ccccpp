@@ -12,17 +12,62 @@ Keep it concise and link to longer reference documents when needed. Keep the
 team's current focus, task progress, blockers, and handoffs in CCCC's working
 summary and task board.
 
+Start with the [short AGENTS.md template](./agents-template) and the
+[Builder + Reviewer Pair](./use-cases#use-case-1-builder-reviewer-pair) walkthrough.
+Merge useful rules into the project's existing instructions; do not replace
+them with a generic template. The template covers ownership, independent review,
+evidence, integration and authority boundaries, leaving project-specific rules
+and commands to the project.
+
 The **AGENTS.md** section in Project Context views and edits the file at the
 current workspace root. It does not combine ancestor or nested instruction
 files, change runtime settings, or inject the file into prompts. Each runtime
 controls discovery, precedence, and refresh. For example, Claude Code may prefer
 an existing `CLAUDE.md`; configure its native instruction loading when necessary.
-Saving a file does not prove that running sessions have reloaded it. You can
-optionally notify the team in chat after saving.
+Saving a file does not prove that running sessions have reloaded it; see
+[When instruction files change](#when-instruction-files-change).
 
-Web Model and Dots Actors can read repository files on demand with the existing
-`cccc_file` tool, for example `cccc_file(path="AGENTS.md")`. Local coding runtimes
+Web Model and Dots agents can read repository files on demand with the existing
+`cccc_file` tool, for example `cccc_file(rel_path="AGENTS.md")`. Local coding runtimes
 use their own file and instruction-loading facilities.
+
+### When instruction files change
+
+Runtimes such as Claude Code and Codex read their instruction files when a
+session starts and keep that copy. CCCC watches these files for the agents it
+delivers to: `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md`
+and `.claude/CLAUDE.md`, in the agent's workspace and each directory above it.
+After one of them changes, appears or is removed, the next CCCC message to each
+agent working in that workspace that has room for it carries one line asking it
+to check the current project instructions. A message that carries its full text
+names the changed files; see below for Claude's shorter notification. The line
+names paths only. CCCC does not reload anything itself, include file contents, or
+change which instructions take precedence.
+
+What this does not cover:
+
+- Watching starts before launch for agents CCCC starts; when a connected
+  session joins a Group, when the workspace an agent works in is switched, or
+  when CCCC's daemon starts; otherwise at the agent's first message. A change
+  made before that, or while the daemon was stopped, is not reported.
+- Other files that these import with `@` are not followed, and instruction
+  files in subdirectories and user-level files outside the workspace's
+  directories are not watched.
+- If a watched file cannot be read, for example because of its permissions, the
+  message goes out without the line, and nothing is compared until the file can
+  be read again.
+- A Web Model agent is watched per agent and workspace. Starting a new
+  conversation in the provider's app does not reset it.
+- The line counts as delivered once the runtime accepts the message carrying
+  it. That does not prove the model read it. After a rejected or uncertain
+  delivery, CCCC keeps its earlier record, so a later message carries the line
+  again if the files still differ from that record.
+
+A connected Claude session receives a short form in its notification, which
+names the file when one file with a short path changed and otherwise gives only
+the number of changed files. When the notification has no room even for that,
+or a Codex message would exceed Codex's command-line limit with it, the message
+goes out without the line and the line waits for a later message.
 
 CCCC no longer gives `PROJECT.md` special behavior, and the dedicated
 `cccc_project_info` tool has been removed. Existing repository documents are left
@@ -39,7 +84,7 @@ The help protocol reference is the group-specific CCCC collaboration contract. Y
 CCCC composes help from two layers:
 
 1. **Built-in contract**: the canonical message-delivery section always comes from `resources/cccc-help.md`.
-2. **Group overlay (CCCC_HOME)**: `CCCC_HOME/groups/<group_id>/prompts/CCCC_HELP.md` adds common, role, and actor guidance without replacing that canonical section.
+2. **Group overlay (CCCC_HOME)**: `CCCC_HOME/groups/<group_id>/prompts/CCCC_HELP.md` adds common, role, and agent guidance without replacing that canonical section.
 
 To customize local guidance, edit the group overlay (recommended: Web UI → Settings → Guidance).
 
@@ -74,18 +119,22 @@ You can show different content to different roles using conditional markers:
 **Marker syntax:**
 - `## @role: foreman` - Only foreman sees this section
 - `## @role: peer` - Only peers see this section
-- `## @actor: <actor_id>` - Only the specific actor sees this section
+- `## @actor: <actor_id>` - Only the specific agent sees this section
 - Sections without markers are the shared/common content visible to everyone
 
-In the Web structured Help editor, these untagged sections are surfaced as `Common Notes`, while the tagged blocks are surfaced as role sections and actor notes.
+In the Web structured Help editor, these untagged sections are surfaced as `Common Notes`, while the tagged blocks are surfaced as role sections and agent notes.
 
 #### How Agents Consume Help
 
 Agents access help content through MCP tools:
 
-1. **`cccc_bootstrap`** - Returns the lean recovery packet (`session`, `recovery`, `inbox_preview`, `memory_recall_gate`, `next_calls`)
+1. **`cccc_bootstrap`** - Returns the caller's `session`, `recovery`, `inbox_preview`, `context_hygiene` and `next_calls`.
    Coordination constraints are included as complete entries within the recovery budget. If the packet reports omitted constraints, read the full list with `cccc_context_get` before acting.
 2. **`cccc_help`** - Returns help content on demand
+
+Native sessions pass the explicit `group_id` from a received CCCC message or
+their `cccc_session(action="list")` memberships. Bootstrap previews do not consume Mail;
+use `cccc_inbox_read` to read and consume it.
 
 The on-demand help payload is returned as:
 ```json
@@ -116,17 +165,23 @@ Agents read the markdown and follow the rules semantically. There's no special p
 
 ### Configure Runtimes Properly
 
-Use recommended flags for autonomous operation:
+Choose a managed runtime by name:
 
 ```bash
 # Claude Code
 cccc actor add impl --runtime claude
-# Uses: claude --dangerously-skip-permissions
 
 # Codex
 cccc actor add review --runtime codex
-# Uses: codex --dangerously-bypass-approvals-and-sandbox --search
 ```
+
+These commands register managed members. CCCC prepares their runtime launch
+and MCP integration. The default managed Claude and Codex commands run without
+the runtime's approval prompts (Codex also without its sandbox); review
+[Autonomy defaults](./runtimes#autonomy-defaults) before assigning work.
+See [Supported Runtimes](./runtimes) for confirmation
+prompts and recovery behavior. Connecting an already running
+native session uses the separate [Native sessions](./local-sessions) setup.
 
 ## Effective Communication
 
@@ -178,13 +233,15 @@ For each task, define "done":
 - Documentation updated
 - Code reviewed
 
-### Use the Context Panel
+### Use the Shared Brief and Tasks
 
-- **Vision**: Keep the project goal visible
-- **Sketch**: Document the technical approach
-- **Milestones**: Track major phases
-- **Tasks**: Break down current work
-- **Notes**: Capture learnings
+- **Brief**: Record the objective, current focus and shared constraints.
+- **Tasks**: Track work that needs an owner, completion criteria or a durable
+  handoff; read a task in full before replacing its notes or checklist.
+- **Decisions and handoffs**: Keep the reason, evidence and next owner where
+  other members can recover them.
+- **Agent state**: Keep each member's recovery state current at real transitions.
+  It is not proof that external files or services still have the recorded state.
 
 ## Multi-Agent Coordination
 
@@ -210,34 +267,73 @@ Periodically check:
 - Any blockers?
 - Any conflicting changes?
 
+### Review How the Team Works
+
+`/cccc-self-evolution` asks the foreman for a short review. It reads what you said and how many
+messages, scheduled reminders and open tasks each member has, then sends you at most three proposals,
+each on its own card with its evidence. Standing rules, their removal and changes to members wait
+for your pick; the foreman may still adjust routine work and tell you. When 10 more top-level tasks
+are finished, the foreman's next task update also reminds it to consider a review.
+
+The review text also asks the foreman to check earlier changes recorded as `optimization` tasks:
+whether each was used the next time it applied and what happened. A rule that applied in real cases
+without the intended effect may come back as a proposal to revise or remove it. The stand-up text
+asks the foreman to suggest a review rather than run one, and to mark a question that needs a
+deeper look with `Review:` in a related `optimization` task, or in a new planned one that
+authorizes no change and points to any task or handoff that already holds the work. In a Group with
+few tasks the stand-up may ask you whether to run a review now. When you ask for a review and
+nothing needs your decision, the foreman is asked to say briefly what it read. These are
+instructions to the model, not checks CCCC enforces.
+
+Standing team rules go into **Constraints** in the Context panel. An agent reads them through
+`cccc_bootstrap` when it starts or resumes: up to six as the budget allows, with a note when any are
+left out. A long rule, or one about the project only, belongs in `AGENTS.md`.
+
 ## Troubleshooting Tips
 
 ### Agent Not Responding
 
 1. Check the terminal tab for errors
-2. Verify MCP setup: `cccc setup --runtime <name>`
-3. Try restarting: click Restart in Web UI
-4. Check daemon health + recent events: `cccc daemon status` and `cccc tail -n 100`
+2. Complete any pending runtime confirmation in its confirmation terminal.
+3. Check daemon health and recent events with `cccc daemon status` and
+   `cccc tail -n 100`, then follow the [recovery runbook](./operations).
+   Managed members receive CCCC's MCP configuration at launch; an already
+   running native session follows its runtime's own integration setup.
+4. If a restart is appropriate, use **Restart** on the affected member. For
+   managed Codex and Claude, this can resume the saved conversation rather
+   than clearing its context; use a deliberate new session when that is needed.
 
 ### Messages Not Delivered
 
-1. Ensure agent is started (green indicator)
-2. Check inbox: `cccc inbox --actor-id <id>`
-3. Verify the `to` field is correct
+1. Verify the recipient and delivery mode. Mail waits in Inbox rather than
+   prompting immediately.
+2. In a POSIX shell, summarize all Mail still waiting as of the current time:
+
+   ```bash
+   cccc inbox-summary --cutoff "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+   ```
+
+   The summary does not consume Mail. `cccc inbox` reads and consumes a member's
+   Mail, so use the summary for this diagnostic.
+3. Check the member's terminal and delivery status. A stored message or a
+   running process is not proof that the agent received or read the message.
 
 ### Context Getting Stale
 
 If an agent seems confused:
-1. Restart to clear context
-2. Re-state the current goal
-3. Reference relevant files explicitly
+1. Recover the current brief, task and recent relevant messages.
+2. Check the actual files, checkout and external facts before continuing.
+3. Correct the shared state when it is stale. A process restart can resume the
+   saved conversation; it is not a request to clear its context or history.
 
 ### Stuck in a Loop
 
 If an agent keeps repeating:
-1. Stop the agent
-2. Clear the task
-3. Restart with clearer instructions
+1. Preserve the current work and identify the repeated action and its cause.
+2. Interrupt the affected member if needed and within your authority, then give
+   a smaller, concrete next step.
+3. Choose recovery or a deliberate new session as appropriate for the runtime;
+   do not erase tasks or session stores as a substitute for diagnosis.
 
 ## Security Best Practices
 

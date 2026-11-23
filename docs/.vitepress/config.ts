@@ -75,7 +75,6 @@ export default defineConfig({
   srcExclude: [
     '_archive_local/**',
     'ITERATION_PLAN.md',
-    'guide/agent-framework-coevolution-prd.md',
     'plan/**',
     'review/**',
     'superpowers/**',
@@ -133,12 +132,14 @@ export default defineConfig({
             { text: 'Operations Runbook', link: '/guide/operations' },
             { text: 'Web UI', link: '/guide/web-ui' },
             { text: 'Supported Runtimes', link: '/guide/runtimes' },
+            { text: 'Native sessions', link: '/guide/local-sessions' },
             { text: 'CCCC Connect', link: '/guide/connect' },
             { text: 'ChatGPT Web Model Runtime', link: '/guide/web-model-runtime' },
             { text: 'Grok Bot Web Model', link: '/guide/grok-web-model-runtime' },
             { text: 'Group Space + NotebookLM', link: '/guide/group-space-notebooklm' },
             { text: 'Capability Allowlist', link: '/guide/capability-allowlist' },
             { text: 'Best Practices', link: '/guide/best-practices' },
+            { text: 'AGENTS.md Template', link: '/guide/agents-template' },
             { text: 'FAQ', link: '/guide/faq' }
           ]
         },
@@ -175,7 +176,8 @@ export default defineConfig({
             { text: 'Overview', link: '/standards/' },
             { text: 'CCCS v1', link: '/standards/CCCS_V1' },
             { text: 'Daemon IPC v1', link: '/standards/CCCC_DAEMON_IPC_V1' },
-            { text: 'Context Ops v1', link: '/standards/CCCC_CONTEXT_OPS_V1' }
+            { text: 'Context Ops v1', link: '/standards/CCCC_CONTEXT_OPS_V1' },
+            { text: 'Connect v1', link: '/standards/CCCC_CONNECT_V1' }
           ]
         }
       ],

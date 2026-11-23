@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useEffect, useRef, type CSSProperties, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 
@@ -7,6 +7,7 @@ import { classNames } from "../../utils/classNames";
 import { RECIPIENT_POPOVER_GAP_PX, type RecipientPopoverTarget } from "./useRecipientPopover";
 
 interface RecipientPopoverProps {
+  anchorRef: RefObject<HTMLElement | null>;
   isDark: boolean;
   target: RecipientPopoverTarget | null;
   style: CSSProperties | null;
@@ -17,6 +18,7 @@ interface RecipientPopoverProps {
 }
 
 export function RecipientPopover({
+  anchorRef,
   isDark,
   target,
   style,
@@ -26,10 +28,41 @@ export function RecipientPopover({
   onHide,
 }: RecipientPopoverProps) {
   const { t } = useTranslation("chat");
+  const panelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!target) return;
+    const outside = (event: PointerEvent) => {
+      const node = event.target;
+      if (
+        node instanceof Node &&
+        !panelRef.current?.contains(node) &&
+        !anchorRef.current?.contains(node)
+      ) {
+        onHide();
+      }
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (panelRef.current?.contains(document.activeElement)) {
+        // Focus can show the hint again; hide afterwards so Escape wins.
+        anchorRef.current?.focus({ preventScroll: true });
+      }
+      onHide();
+    };
+    document.addEventListener("pointerdown", outside, true);
+    document.addEventListener("keydown", escape, true);
+    return () => {
+      document.removeEventListener("pointerdown", outside, true);
+      document.removeEventListener("keydown", escape, true);
+    };
+  }, [anchorRef, onHide, target]);
   if (typeof document === "undefined" || !target || !style) return null;
 
   return createPortal(
     <div
+      ref={panelRef}
       className="fixed pointer-events-auto z-[1000]"
       style={style}
       role="dialog"
@@ -54,6 +87,7 @@ export function RecipientPopover({
             ? "border-white/12 bg-[rgb(24,25,27)] text-slate-100"
             : "border-black/10 bg-white text-gray-900",
         )}
+        data-recipient-card
       >
         <div className="flex min-w-0 items-center gap-2">
           <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -73,6 +107,7 @@ export function RecipientPopover({
                     ? "border-white/12 bg-white/[0.06] text-slate-300"
                     : "border-black/10 bg-gray-50 text-gray-600",
                 )}
+                data-recipient-badge
               >
                 {target.badgeLabel}
               </span>
@@ -102,6 +137,7 @@ export function RecipientPopover({
               "mt-2 truncate rounded-md px-2 py-1 font-mono text-xs",
               isDark ? "bg-white/[0.08] text-slate-200" : "bg-gray-100 text-gray-800",
             )}
+            data-recipient-id
           >
             {target.idValue}
           </div>

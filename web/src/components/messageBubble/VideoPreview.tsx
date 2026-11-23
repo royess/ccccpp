@@ -1,22 +1,27 @@
-import { useEffect, useRef, useState, type SyntheticEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AuthenticatedDownloadLink } from "../AuthenticatedDownloadLink";
 import { DownloadIcon, FileIcon, PlayIcon } from "../Icons";
-import { MediaLightbox } from "./MediaLightbox";
+import {
+  openAttachmentResource,
+  type MessageAttachmentSource,
+} from "../resourcePanel/openAttachmentResource";
 
 /**
  * A video attachment shown as its first frame. The frame loads only once the
- * message is on screen; playback happens in a dialog opened by a click, where
- * the player fetches in byte ranges. Starting one video pauses the others, and
+ * message is on screen; playback happens in the resource panel when clicked, where
+ * the player fetches in byte ranges. Starting one pauses other message media, and
  * a format the browser cannot decode falls back to the download chip.
  */
 export function VideoPreview({
+  resource,
   href,
   downloadHref,
   downloadName,
   label,
   downloadTitle,
 }: {
+  resource: MessageAttachmentSource;
   href: string;
   downloadHref: string;
   downloadName: string;
@@ -24,7 +29,6 @@ export function VideoPreview({
   downloadTitle: string;
 }) {
   const { t } = useTranslation("chat");
-  const [open, setOpen] = useState(false);
   // Failure belongs to one URL: a pending upload's local preview is replaced
   // by the stored blob, which must get its own chance to play.
   const [failedHref, setFailedHref] = useState("");
@@ -48,7 +52,6 @@ export function VideoPreview({
     return () => observer.disconnect();
   }, [visible]);
   const fail = () => {
-    setOpen(false);
     setFailedHref(href);
   };
 
@@ -76,7 +79,7 @@ export function VideoPreview({
       <button
         ref={frame}
         type="button"
-        onClick={() => setOpen(true)}
+        onClick={() => openAttachmentResource(resource, "video", label)}
         aria-label={t("playVideo", { name: label })}
         className="group relative block w-full bg-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-border-focus)]"
       >
@@ -111,37 +114,6 @@ export function VideoPreview({
           <DownloadIcon size={13} />
         </AuthenticatedDownloadLink>
       </figcaption>
-      <MediaLightbox
-        open={open}
-        onClose={() => setOpen(false)}
-        dialogLabel={t("videoPreviewDialog")}
-        title={label}
-        downloadHref={downloadHref}
-        downloadName={downloadName}
-      >
-        <video
-          src={href}
-          controls
-          autoPlay
-          playsInline
-          preload="auto"
-          data-message-video
-          onPlay={pauseOtherVideos}
-          aria-label={label}
-          className="h-full w-full bg-black object-contain"
-          onError={fail}
-        />
-      </MediaLightbox>
     </figure>
   );
-}
-
-/** One message video plays at a time. */
-function pauseOtherVideos(event: SyntheticEvent<HTMLVideoElement>) {
-  const current = event.currentTarget;
-  for (const video of current.ownerDocument.querySelectorAll<HTMLVideoElement>(
-    "video[data-message-video]",
-  )) {
-    if (video !== current && !video.paused) video.pause();
-  }
 }

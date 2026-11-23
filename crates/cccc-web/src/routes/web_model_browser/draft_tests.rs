@@ -13,7 +13,9 @@ async fn preview_and_saved_alignment_preserve_attachment_only_drafts() {
     if crate::system_browser_path().is_none() || !Path::new("/usr/bin/Xvfb").is_file() {
         return;
     }
-    let _chrome = crate::browser_surface::chrome_test_guard().await;
+    let Some(_chrome) = crate::browser_surface::chrome_test_guard().await else {
+        return;
+    };
     let temp = tempfile::tempdir().expect("temp");
     let home = cccc_core::HomeLayout::from_path(temp.path().join("home")).expect("home");
     let groups = GroupStore::new(home.clone()).expect("groups");
@@ -69,6 +71,7 @@ async fn preview_and_saved_alignment_preserve_attachment_only_drafts() {
             &local,
             (800, 600),
             &crate::browser_surface::actor_identity(&group.actors[0]),
+            "",
         )
         .await
         .expect("open");
@@ -129,6 +132,13 @@ async fn preview_and_saved_alignment_preserve_attachment_only_drafts() {
         .expect("readiness");
     assert_eq!(inspected["composer_chars"], 0);
     assert_eq!(inspected["running"], false);
+    // This page is not the saved chat, and its box holds a file. Choosing a
+    // conversation is refused while the draft is there, so health names it first.
+    let health =
+        payload(&state, gid, "a", true).await.expect("health").0["result"]["health_snapshot"]
+            .clone();
+    assert_eq!(health["target"]["state"], "unavailable");
+    assert_eq!(health["next_action"]["recommended"], "clear_composer");
     ensure_open_for_actor(&state, gid, "a", 800, 600)
         .await
         .expect("open viewer");

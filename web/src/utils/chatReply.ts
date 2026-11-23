@@ -1,6 +1,7 @@
 import type { Actor, ChatMessageData, GroupSettings, LedgerEvent, ReplyTarget } from "../types";
 import { isConnectMessage, isCrossInstanceInboundMessage } from "./crossInstanceMessages";
 import { projectCrossGroupRecipients } from "./crossGroupRecipients";
+import { CHET_NAME, CHET_PRINCIPAL, isChetAnswer, isChetMessage } from "./chetIdentity";
 
 type ReplyComposerState = { destGroupId: string; toText: string; replyTarget: ReplyTarget };
 
@@ -45,6 +46,8 @@ export function buildReplyComposerState(
   selectedGroupId: string,
   actors: Actor[],
   groupSettings: GroupSettings | null | undefined,
+  /** The selected Group's generation, which a message Chet wrote in it carries. */
+  groupGeneration = "",
 ): ReplyComposerState | null {
   const replyEventId = getReplyEventId(event);
   if (!replyEventId) return null;
@@ -71,27 +74,40 @@ export function buildReplyComposerState(
   }
   const authorIsActor =
     by && by !== "user" && actors.some((actor) => String(actor.id || "") === by);
+  // Keep a departed sender as an explicit, unavailable recipient. Falling
+  // back to the original audience could send a reply to someone else.
+  const authorIsUnavailableActor =
+    by && by !== "user" && by !== "system" && !by.startsWith("svc:") && !authorIsActor;
   const originalTo = Array.isArray(data?.to)
     ? data.to.map((token: string) => String(token || "").trim()).filter(Boolean)
     : [];
   const remoteDstGroupId =
     typeof data?.dst_group_id === "string" ? String(data.dst_group_id || "").trim() : "";
   const remoteDstTo = remoteDstGroupId ? projectCrossGroupRecipients(data) : [];
-  const remoteReplyToEventId =
-    (typeof data?.dst_event_id === "string" ? String(data.dst_event_id || "").trim() : "") ||
-    (typeof data?.remote_event_id === "string" ? String(data.remote_event_id || "").trim() : "");
   const policy = groupSettings?.default_send_to || "foreman";
+  // Replies to an ordinary Chet message use the daemon's service route. The
+  // user can correct a delegated answer in the same thread with its requester.
+  const currentChet = isChetMessage(event, groupGeneration);
+  const correctsAnswer = currentChet && isChetAnswer(event);
   const defaultTo = remoteDstGroupId
     ? remoteDstTo
-    : authorIsActor
-      ? [by]
-      : originalTo.length > 0
-        ? originalTo
-        : policy === "foreman"
-          ? ["@foreman"]
-          : [];
-  const replyBy =
-    by === "user" && defaultTo.length > 0 ? defaultTo.join(", ") : String(event.by || "unknown");
+    : correctsAnswer
+      ? originalTo
+      : by === CHET_PRINCIPAL
+        ? []
+        : authorIsActor || authorIsUnavailableActor
+          ? [by]
+          : originalTo.length > 0
+            ? originalTo
+            : policy === "foreman"
+              ? ["@foreman"]
+              : [];
+  // Named Chet only where the message row names it; otherwise the bare principal shows.
+  const replyBy = currentChet
+    ? CHET_NAME
+    : by === "user" && defaultTo.length > 0
+      ? defaultTo.join(", ")
+      : String(event.by || "unknown");
 
   return {
     destGroupId: remoteDstGroupId || String(selectedGroupId || "").trim(),
@@ -100,13 +116,8 @@ export function buildReplyComposerState(
       eventId: replyEventId,
       by: replyBy,
       text: text.slice(0, 100) + (text.length > 100 ? "..." : ""),
-      ...(remoteDstGroupId
-        ? {
-            remoteDstGroupId,
-            remoteDstTo: defaultTo,
-            ...(remoteReplyToEventId ? { remoteReplyToEventId } : {}),
-          }
-        : {}),
+      ...(by === CHET_PRINCIPAL && !correctsAnswer ? { toChet: true } : {}),
+      ...(remoteDstGroupId ? { remoteDstGroupId, remoteDstTo: defaultTo } : {}),
     },
   };
 }

@@ -34,7 +34,28 @@ pub(crate) fn settle_stranded(home: &HomeLayout) -> Result<(), OpError> {
         let Ok(group) = store.load(&meta.group_id) else {
             continue;
         };
+        for actor in group
+            .actors
+            .iter()
+            .filter(|actor| !actor.external_session_id.is_empty())
+        {
+            super::local_sessions::record_instruction_baseline(home, &group, actor);
+        }
+        // Web-hosted conversations can outlive the daemon. Establish the new
+        // in-memory baseline before IPC becomes available, just as for native
+        // sessions; changes while the daemon was down are not observable.
+        if group.running && group.state != GroupState::Stopped {
+            for actor in group
+                .actors
+                .iter()
+                .filter(|actor| actor.enabled && actor.runtime.is_web_model())
+            {
+                super::runtime_state::record_web_instruction_baseline(home, &group, actor);
+            }
+        }
         let settled = crate::ops::runtime_delivery::settle_stranded_claims(home, &group)?;
+        // After stranded claims are settled, so a handoff notice lists them.
+        super::actor_switch::complete_stranded(home, &group);
         if settled > 0 {
             tracing::warn!(
                 group_id = %meta.group_id,
@@ -99,6 +120,14 @@ fn restore_group(home: &HomeLayout, store: &GroupStore, group_id: &str) -> Resul
                 }
                 actor_delivery::dispatch_unread(home, &group, &actor.id);
             }
+            // Held for the user's own start, as a Group start holds it.
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    actor_runtime::RUNTIME_CONFIRMATION_PAUSED
+                        | actor_runtime::CLAUDE_RESUME_FAILED
+                        | actor_runtime::RUNTIME_RESUME_FAILED
+                ) => {}
             Err(error) => {
                 tracing::warn!(
                     group_id = %group.group_id,
@@ -106,6 +135,7 @@ fn restore_group(home: &HomeLayout, store: &GroupStore, group_id: &str) -> Resul
                     message = %error.message,
                     "failed to restore actor runtime"
                 );
+                actor_delivery::record_member_catchup(&group, &actor);
             }
         }
     }
@@ -262,6 +292,25 @@ mod tests {
     }
 
     #[test]
+    fn startup_records_running_web_session_before_first_delivery() {
+        let (temp, home, _store, group) = restore_fixture(ActorRuntime::WebModel);
+        let workspace = temp.path().join("workspace");
+        let instructions = workspace.join("AGENTS.md");
+        std::fs::write(&instructions, "before daemon start").expect("instructions");
+        super::settle_stranded(&home).expect("startup sweep");
+        std::fs::write(instructions, "after daemon start").expect("changed instructions");
+        let root = workspace.canonicalize().expect("root");
+        let notice = crate::ops::instruction_files::check(
+            &home,
+            &group.group_id,
+            &group.actors[0],
+            &format!("web:{}", root.display()),
+            &root,
+        );
+        assert!(notice.is_some_and(|notice| notice.delivery_line().contains("AGENTS.md changed")));
+    }
+
+    #[test]
     fn structured_restore_without_a_local_owner_does_not_record_a_respawn() {
         for runtime in [ActorRuntime::WebModel, ActorRuntime::ChatgptDots] {
             let (_temp, home, store, group) = restore_fixture(runtime);
@@ -278,6 +327,7 @@ mod tests {
     #[cfg(unix)]
     impl Drop for OwnedRuntime {
         fn drop(&mut self) {
+            super::actor_delivery::shutdown_group(&self.0);
             let _ = cccc_runtime::stop(&self.0, "peer1");
         }
     }
@@ -315,6 +365,34 @@ mod tests {
         restore_group(&home, &store, &group.group_id).expect("failed actor restore is nonfatal");
         assert!(!actor_runtime::actor_is_running(&group, &group.actors[0]));
         assert!(respawn_events(&store, &group).is_empty());
+        assert!(
+            super::actor_delivery::pending_group_ids().contains(&group.group_id),
+            "non-pause restore failure must schedule delivery catch-up"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmation_paused_restore_does_not_schedule_member_catchup() {
+        let (_temp, home, store, mut group) = restore_fixture(ActorRuntime::Claude);
+        let _cleanup = OwnedRuntime(group.group_id.clone());
+        group.actors[0].runner = RunnerKind::Pty;
+        store.save(&group).expect("save claude actor");
+        crate::ops::local_headless::pause_confirmation(&group.group_id, "peer1")
+            .expect("pause confirmation");
+        struct PauseGuard(String);
+        impl Drop for PauseGuard {
+            fn drop(&mut self) {
+                let _ = crate::ops::local_headless::retry_confirmation(&self.0, "peer1");
+            }
+        }
+        let _pause = PauseGuard(group.group_id.clone());
+
+        restore_group(&home, &store, &group.group_id).expect("paused restore is nonfatal");
+        assert!(
+            !super::actor_delivery::pending_group_ids().contains(&group.group_id),
+            "confirmation-paused restore must not schedule automatic catch-up"
+        );
     }
 }
 

@@ -1,21 +1,34 @@
 use crate::RuntimeError;
 use crate::output::HistoryPage;
 use crate::output_reader::OutputReader;
-use crate::process_tree::OwnedProcessTree;
+use crate::process_tree::{CommandError, OwnedProcessTree};
 use crate::pty_input::SharedPtyWriter;
 use crate::session_history::SessionHistory;
 use crate::terminal_attach::{
     AttachmentRegistry, TerminalAttachMode, TerminalAttachOptions, TerminalAttachment,
 };
 use crate::transcript_archive::HistoryConfig;
-use cccc_contracts::{RunnerKind, utc_now};
+use cccc_contracts::{ActorRuntime, ActorSubmit, RunnerKind, utc_now};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone)]
+pub(crate) fn native_pty_spawn_error(error: impl std::fmt::Display) -> CommandError {
+    let error = std::io::Error::other(error.to_string());
+    // This is specific to the locked portable-pty 0.8.1 Unix native backend:
+    // it registers a pre_exec hook, forcing std's fork/exec path, and does no
+    // fallible work after spawn. Its Err is therefore before target exec. An
+    // Ok is not proof of exec, and a panic is not an Err. Recheck this when
+    // portable-pty or the spawning implementation changes.
+    #[cfg(unix)]
+    return CommandError::NotStarted(error);
+    #[cfg(windows)]
+    CommandError::Started(error)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchSpec {
     pub group_id: String,
     pub actor_id: String,
@@ -27,13 +40,30 @@ pub struct LaunchSpec {
     pub rows: u16,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// What the daemon launched an Actor's primary PTY as. Delivery to this process
+/// follows it, not the saved configuration, which applies from the next launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorLaunch {
+    pub runtime: ActorRuntime,
+    pub submit: ActorSubmit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStatus {
     pub group_id: String,
     pub actor_id: String,
     pub runner: RunnerKind,
     pub running: bool,
     pub pid: Option<u32>,
+    /// Immutable canonical launch directory; saved Actor configuration does not
+    /// change the workspace of this registered process.
+    pub cwd: PathBuf,
+    /// Daemon-owned launch attribution, captured before child environment is
+    /// consumed. Generic non-Actor sessions leave these fields empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub actor_generation: String,
     pub started_at: String,
     pub exit_code: Option<u32>,
     /// How the process ended, as `portable_pty::ExitStatus` renders it
@@ -41,6 +71,14 @@ pub struct SessionStatus {
     /// also reports `exit_code` 1. The diagnostic is platform dependent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_detail: Option<String>,
+    /// Set only on an Actor's primary PTY; confirmation, viewer and other generic
+    /// terminals have none. Only the daemon reads it.
+    #[serde(skip)]
+    pub launch: Option<ActorLaunch>,
+    /// Automatic input has not yet observed this primary PTY's chat input.
+    /// The owning Session retains this fact across daemon reconnections.
+    #[serde(default)]
+    pub startup_input_pending: bool,
 }
 
 pub struct Session {
@@ -53,6 +91,7 @@ pub struct Session {
     attachments: AttachmentRegistry,
     history: SessionHistory,
     reader: Option<OutputReader>,
+    exit_collected: bool,
 }
 
 impl Session {
@@ -61,10 +100,32 @@ impl Session {
         history_config: Option<HistoryConfig>,
         history_cursor_floor: u64,
     ) -> Result<Self, RuntimeError> {
+        Self::start_with_environment(spec, history_config, history_cursor_floor, false)
+    }
+
+    pub(crate) fn start_with_environment(
+        spec: LaunchSpec,
+        history_config: Option<HistoryConfig>,
+        history_cursor_floor: u64,
+        clear_environment: bool,
+    ) -> Result<Self, RuntimeError> {
+        let cwd = spec.cwd.canonicalize()?;
+        let scope_key = spec.env.get("CCCC_SCOPE_KEY").cloned().unwrap_or_default();
+        let actor_generation = spec
+            .env
+            .get("CCCC_ACTOR_GENERATION")
+            .cloned()
+            .unwrap_or_default();
         let prepared_command = crate::prepare_pty_command(&spec.command, &spec.env);
         let (program, args) = prepared_command
             .split_first()
             .ok_or(RuntimeError::EmptyCommand)?;
+        let working_directory = crate::compatible_path(&cwd);
+        if crate::executable::runs_cmd_in_prefixed_directory(&prepared_command, working_directory) {
+            return Err(RuntimeError::CmdInPrefixedDirectory(
+                spec.cwd.display().to_string(),
+            ));
+        }
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: spec.rows.max(1),
@@ -74,8 +135,11 @@ impl Session {
             })
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let mut command = CommandBuilder::new(program);
+        if clear_environment {
+            command.env_clear();
+        }
         command.args(args);
-        command.cwd(spec.cwd);
+        command.cwd(working_directory);
         for (key, value) in spec.env {
             command.env(key, value);
         }
@@ -86,7 +150,7 @@ impl Session {
         let (child, process_tree) = OwnedProcessTree::spawn_pty(|| {
             pair.slave
                 .spawn_command(command)
-                .map_err(|e| std::io::Error::other(e.to_string()))
+                .map_err(native_pty_spawn_error)
         })?;
         let pid = child.process_id();
         #[cfg(target_os = "linux")]
@@ -131,9 +195,14 @@ impl Session {
                 runner: spec.runner,
                 running: true,
                 pid,
+                cwd,
+                scope_key,
+                actor_generation,
                 started_at: utc_now(),
                 exit_code: None,
                 exit_detail: None,
+                launch: None,
+                startup_input_pending: false,
             },
             master: Some(pair.master),
             child,
@@ -143,7 +212,41 @@ impl Session {
             attachments: AttachmentRegistry::default(),
             history,
             reader: Some(reader),
+            exit_collected: false,
         })
+    }
+
+    pub(crate) fn attribute_launch(&mut self, launch: ActorLaunch) {
+        self.status.launch = Some(launch);
+        self.status.startup_input_pending =
+            self.status.runner == RunnerKind::Pty && crate::startup_input::required(launch.runtime);
+    }
+
+    pub(crate) fn startup_input_ready(&mut self) -> Result<bool, RuntimeError> {
+        if !self.status.startup_input_pending {
+            return Ok(true);
+        }
+        let Some(launch) = self.status.launch else {
+            return Ok(false);
+        };
+        if self.history.startup_input_ready(launch.runtime)? {
+            self.status.startup_input_pending = false;
+        }
+        Ok(!self.status.startup_input_pending)
+    }
+
+    pub(crate) fn release_startup_input(&mut self, generation: &str) -> bool {
+        if self.status().running
+            && self.status.started_at == generation
+            && self
+                .status
+                .launch
+                .is_some_and(|launch| crate::startup_input::required(launch.runtime))
+        {
+            self.status.startup_input_pending = false;
+            return true;
+        }
+        false
     }
 
     pub fn status(&mut self) -> SessionStatus {
@@ -155,7 +258,19 @@ impl Session {
             self.status.exit_detail = Some(exit.to_string());
             let _ = self.process_tree.terminate();
         }
-        self.status.clone()
+        let mut observed = self.status.clone();
+        if observed.running
+            && observed.startup_input_pending
+            && let Some(launch) = observed.launch
+        {
+            // A status read observes readiness without granting a later write.
+            // Submission checks the current input region again under its gate.
+            observed.startup_input_pending = !self
+                .history
+                .startup_input_ready(launch.runtime)
+                .unwrap_or(false);
+        }
+        observed
     }
 
     pub fn stop(&mut self) -> Result<SessionStatus, RuntimeError> {
@@ -295,12 +410,25 @@ impl Session {
             // an in-flight input operation still pins the stopped Session.
             self.master.take();
         }
-        if let Some(reader) = self.reader.take() {
-            if !reader.finish()? {
-                self.history.seal_output()?;
-            }
+        if let Some(reader) = self.reader.take()
+            && !reader.finish()?
+        {
+            self.history.seal_output()?;
         }
         self.history.flush()
+    }
+
+    pub(crate) fn prepare_reap(&mut self) -> Result<Option<SessionStatus>, RuntimeError> {
+        let status = self.status();
+        if status.running || self.exit_collected {
+            return Ok(None);
+        }
+        self.finish_output()?;
+        Ok(Some(status))
+    }
+
+    pub(crate) fn report_retained_exit(&mut self) -> bool {
+        !std::mem::replace(&mut self.exit_collected, true)
     }
 }
 

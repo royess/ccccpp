@@ -34,6 +34,7 @@ pub enum RuntimeStateSource {
     Terminal,
     #[serde(rename = "managed_session", alias = "app_server")]
     ManagedSession,
+    ExternalSession,
 }
 
 /// Provider-supported execution path. Default preserves each Runtime's
@@ -90,6 +91,35 @@ pub enum ActorRuntime {
 }
 
 impl ActorRuntime {
+    /// The wire name: the same string serde uses for this runtime.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Amp => "amp",
+            Self::Antigravity => "antigravity",
+            Self::Auggie => "auggie",
+            Self::Claude => "claude",
+            Self::Cline => "cline",
+            Self::Codex => "codex",
+            Self::Deepseek => "deepseek",
+            Self::Copilot => "copilot",
+            Self::Cursor => "cursor",
+            Self::Devin => "devin",
+            Self::Kiro => "kiro",
+            Self::Kilo => "kilo",
+            Self::Droid => "droid",
+            Self::Grok => "grok",
+            Self::Hermes => "hermes",
+            Self::Kimi => "kimi",
+            Self::Opencode => "opencode",
+            Self::Pi => "pi",
+            Self::WebModel => "web_model",
+            Self::ChatgptDots => "chatgpt_dots",
+            Self::GrokWebModel => "grok_web_model",
+            Self::Custom => "custom",
+        }
+    }
+
     #[must_use]
     pub const fn supports_acp_mode(self) -> bool {
         matches!(
@@ -162,13 +192,18 @@ impl ActorRuntime {
     }
 
     /// Runtime state authority is derived from the Runtime adapter. It is not
-    /// a user-selectable execution mode.
+    /// a user-selectable execution mode. Hermes's terminal is a viewer of the
+    /// member's ACP session, which CCCC drives.
     #[must_use]
     pub const fn state_source(self) -> RuntimeStateSource {
         match self {
-            Self::Claude | Self::Codex | Self::Grok | Self::Opencode | Self::Kilo | Self::Pi => {
-                RuntimeStateSource::ManagedSession
-            }
+            Self::Claude
+            | Self::Codex
+            | Self::Grok
+            | Self::Opencode
+            | Self::Kilo
+            | Self::Pi
+            | Self::Hermes => RuntimeStateSource::ManagedSession,
             _ => RuntimeStateSource::Terminal,
         }
     }
@@ -193,6 +228,10 @@ pub struct Actor {
     pub role: Option<ActorRole>,
     #[serde(default)]
     pub title: String,
+    /// Optional operator-maintained model declaration, not a launch setting
+    /// or a verified serving model. Empty means undeclared.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_label: String,
     #[serde(default)]
     pub command: Vec<String>,
     #[serde(default)]
@@ -215,6 +254,9 @@ pub struct Actor {
     pub runtime_mode: RuntimeMode,
     #[serde(default)]
     pub runtime_state_source: RuntimeStateSource,
+    /// User-owned native receiver; CCCC must never launch or stop its runtime.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub external_session_id: String,
     #[serde(default)]
     pub internal_kind: Option<String>,
     #[serde(default)]
@@ -245,6 +287,7 @@ impl Actor {
             id: id.into(),
             role: None,
             title: String::new(),
+            model_label: String::new(),
             command: Vec::new(),
             env: BTreeMap::new(),
             default_scope_key: String::new(),
@@ -256,6 +299,7 @@ impl Actor {
             runtime: ActorRuntime::default(),
             runtime_mode: RuntimeMode::default(),
             runtime_state_source: RuntimeStateSource::default(),
+            external_session_id: String::new(),
             internal_kind: None,
             avatar_asset_path: String::new(),
             profile_id: String::new(),
@@ -269,6 +313,12 @@ impl Actor {
     }
 
     pub fn normalize_runtime_constraints(&mut self) {
+        if !self.external_session_id.is_empty() {
+            self.runner = RunnerKind::Headless;
+            self.runtime_state_source = RuntimeStateSource::ExternalSession;
+            self.command.clear();
+            return;
+        }
         self.runner = self.runtime.runner_for(self.runtime_mode);
         self.runtime_state_source = self.runtime.state_source_for(self.runtime_mode);
         if self.runtime.is_web_model() {
@@ -311,6 +361,41 @@ mod tests {
         assert_eq!(actor.runner, RunnerKind::Headless);
         assert!(actor.command.is_empty());
         assert!(ActorRuntime::WebModel.is_browser_web_model());
+    }
+
+    const ALL_RUNTIMES: [ActorRuntime; 22] = [
+        ActorRuntime::Amp,
+        ActorRuntime::Antigravity,
+        ActorRuntime::Auggie,
+        ActorRuntime::Claude,
+        ActorRuntime::Cline,
+        ActorRuntime::Codex,
+        ActorRuntime::Deepseek,
+        ActorRuntime::Copilot,
+        ActorRuntime::Cursor,
+        ActorRuntime::Devin,
+        ActorRuntime::Kiro,
+        ActorRuntime::Kilo,
+        ActorRuntime::Droid,
+        ActorRuntime::Grok,
+        ActorRuntime::Hermes,
+        ActorRuntime::Kimi,
+        ActorRuntime::Opencode,
+        ActorRuntime::Pi,
+        ActorRuntime::WebModel,
+        ActorRuntime::ChatgptDots,
+        ActorRuntime::GrokWebModel,
+        ActorRuntime::Custom,
+    ];
+
+    #[test]
+    fn wire_name_matches_serde_for_every_runtime() {
+        for runtime in ALL_RUNTIMES {
+            let wire = serde_json::to_value(runtime).expect("serialize");
+            assert_eq!(wire.as_str(), Some(runtime.wire_name()), "{runtime:?}");
+            let parsed: ActorRuntime = serde_json::from_value(wire).expect("deserialize");
+            assert_eq!(parsed, runtime);
+        }
     }
 
     #[test]
@@ -418,7 +503,12 @@ mod tests {
             assert_eq!(runtime.runner_for(RuntimeMode::Default), RunnerKind::Pty);
             assert_eq!(
                 runtime.state_source_for(RuntimeMode::Default),
-                RuntimeStateSource::Terminal
+                if runtime == ActorRuntime::Hermes {
+                    // The terminal views the member's ACP session.
+                    RuntimeStateSource::ManagedSession
+                } else {
+                    RuntimeStateSource::Terminal
+                }
             );
             assert!(RuntimeMode::Acp.validate(runtime).is_ok());
             assert_eq!(runtime.runner_for(RuntimeMode::Acp), RunnerKind::Headless);

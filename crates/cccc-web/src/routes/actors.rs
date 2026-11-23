@@ -1,10 +1,11 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Map, Value, json};
 
 use crate::AppState;
-use crate::api::{ApiResult, body_object, call, object};
+use crate::api::{ApiError, ApiResult, body_object, call, object};
+use crate::auth::Principal;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -26,8 +27,20 @@ pub fn routes() -> Router<AppState> {
             post(restart),
         )
         .route(
+            "/api/v1/groups/{group_id}/actors/{actor_id}/runtime_switch",
+            post(runtime_switch),
+        )
+        .route(
+            "/api/v1/groups/{group_id}/actors/{actor_id}/runtime_switch/complete",
+            post(runtime_switch_complete),
+        )
+        .route(
             "/api/v1/groups/{group_id}/actors/{actor_id}/new_session",
             post(new_session),
+        )
+        .route(
+            "/api/v1/groups/{group_id}/actors/{actor_id}/terminal_ready",
+            post(terminal_ready),
         )
         .merge(super::actor_assets::routes())
         .merge(super::actor_profiles::routes())
@@ -60,16 +73,23 @@ async fn list(
 }
 async fn create(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(group_id): Path<String>,
     Json(body): Json<Value>,
 ) -> ApiResult {
     let mut args = body_object(body)?;
     normalize_command(&mut args)?;
     args.insert("group_id".into(), Value::String(group_id));
-    call(&state, "actor_add", args).await
+    call(
+        &state,
+        "actor_add",
+        super::actor_profiles::auth_args(&principal, args),
+    )
+    .await
 }
 async fn update(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((group_id, actor_id)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> ApiResult {
@@ -77,7 +97,12 @@ async fn update(
     normalize_command(&mut args)?;
     args.insert("group_id".into(), Value::String(group_id));
     args.insert("actor_id".into(), Value::String(actor_id));
-    call(&state, "actor_update", args).await
+    call(
+        &state,
+        "actor_update",
+        super::actor_profiles::auth_args(&principal, args),
+    )
+    .await
 }
 async fn remove(
     State(state): State<AppState>,
@@ -108,6 +133,99 @@ async fn restart(
 ) -> ApiResult {
     lifecycle(&state, &group_id, &actor_id, "actor_restart").await
 }
+
+/// The user's explicit release of the exact terminal the page showed waiting.
+/// Only its generation comes from the body; the daemon presses no native key.
+async fn terminal_ready(
+    State(state): State<AppState>,
+    Path((group_id, actor_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let args = terminal_ready_args(group_id, actor_id, &body)?;
+    call(&state, "actor_terminal_ready", args).await
+}
+
+fn terminal_ready_args(
+    group_id: String,
+    actor_id: String,
+    body: &Value,
+) -> Result<Map<String, Value>, ApiError> {
+    let generation = body
+        .get("generation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| ApiError::bad("generation is required"))?;
+    Ok(object(json!({
+        "group_id": group_id,
+        "actor_id": actor_id,
+        "by": "user",
+        "generation": generation,
+    })))
+}
+
+fn require_runtime_switch_admin(state: &AppState, principal: &Principal) -> Result<(), ApiError> {
+    if state.web_mode.is_read_only() || !principal.current_admin(&state.home).unwrap_or(false) {
+        return Err(ApiError::forbidden(
+            "Runtime switching is available only to this instance's administrator",
+        ));
+    }
+    Ok(())
+}
+
+async fn runtime_switch(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((group_id, actor_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    require_runtime_switch_admin(&state, &principal)?;
+    let args = runtime_switch_args(&principal, group_id, actor_id, body)?;
+    call(&state, "actor_runtime_switch", args).await
+}
+
+async fn runtime_switch_complete(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((group_id, actor_id)): Path<(String, String)>,
+) -> ApiResult {
+    require_runtime_switch_admin(&state, &principal)?;
+    call(
+        &state,
+        "actor_runtime_switch_complete",
+        super::actor_profiles::auth_args(
+            &principal,
+            object(json!({"group_id":group_id,"actor_id":actor_id})),
+        ),
+    )
+    .await
+}
+
+fn runtime_switch_args(
+    principal: &Principal,
+    group_id: String,
+    actor_id: String,
+    body: Value,
+) -> Result<Map<String, Value>, ApiError> {
+    let mut args = body_object(body)?;
+    args.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "expected_actor_generation"
+                | "expected_actor_updated_at"
+                | "expected_source_id"
+                | "target"
+        )
+    });
+    if let Some(Value::Object(target)) = args.get_mut("target")
+        && let Some(Value::Object(patch)) = target.get_mut("patch")
+    {
+        normalize_command(patch)?;
+    }
+    args.insert("group_id".into(), Value::String(group_id));
+    args.insert("actor_id".into(), Value::String(actor_id));
+    Ok(super::actor_profiles::auth_args(principal, args))
+}
 async fn new_session(
     State(state): State<AppState>,
     Path((group_id, actor_id)): Path<(String, String)>,
@@ -131,4 +249,80 @@ fn normalize_command(args: &mut Map<String, Value>) -> Result<(), crate::api::Ap
         args.insert("command".into(), json!(command));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{runtime_switch_args, terminal_ready_args};
+    use crate::auth::Principal;
+    use serde_json::json;
+
+    #[test]
+    fn runtime_switch_binds_actor_and_authority_to_the_route_and_principal() {
+        let principal = Principal {
+            user_id: "admin".into(),
+            allowed_groups: vec!["g_actual".into()],
+            is_admin: true,
+            raw_token: String::new(),
+        };
+        let args = runtime_switch_args(
+            &principal,
+            "g_actual".into(),
+            "real-actor".into(),
+            json!({
+                "group_id":"g_other",
+                "actor_id":"other",
+                "by":"other",
+                "caller_id":"forged",
+                "is_admin":false,
+                "allowed_groups":["g_other"],
+                "expected_actor_generation":"generation-1",
+                "expected_actor_updated_at":"2026-01-01T00:00:00Z",
+                "expected_source_id":"codex:old",
+                "target":{"kind":"managed","patch":{"runtime":"custom","command":"tool --model 'a b'"}}
+            }),
+        )
+        .expect("object body");
+        assert_eq!(args["group_id"], "g_actual");
+        assert_eq!(args["actor_id"], "real-actor");
+        assert_eq!(args["by"], "user");
+        assert_eq!(args["caller_id"], "admin");
+        assert_eq!(args["is_admin"], true);
+        assert_eq!(args["allowed_groups"], json!(["g_actual"]));
+        assert_eq!(
+            args["target"]["patch"]["command"],
+            json!(["tool", "--model", "a b"])
+        );
+    }
+
+    #[test]
+    fn terminal_ready_takes_only_the_generation_from_the_body() {
+        let args = terminal_ready_args(
+            "g_actual".into(),
+            "real-actor".into(),
+            &json!({
+                "generation": " 2026-11-18T00:00:00Z ",
+                "group_id": "g_other",
+                "actor_id": "other",
+                "by": "agent",
+            }),
+        )
+        .expect("generation");
+        assert_eq!(
+            serde_json::Value::Object(args),
+            json!({
+                "group_id": "g_actual",
+                "actor_id": "real-actor",
+                "by": "user",
+                "generation": "2026-11-18T00:00:00Z",
+            })
+        );
+        for body in [
+            json!({}),
+            json!({"generation": "  "}),
+            json!({"generation": 1}),
+        ] {
+            assert!(terminal_ready_args("g".into(), "a".into(), &body).is_err());
+        }
+    }
 }

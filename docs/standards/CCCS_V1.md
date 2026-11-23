@@ -65,6 +65,18 @@ Actors are identities within a group. CCCS v1 standardizes only:
 - `actor_id`: stable string identifier
 - `role`: `"foreman"` or `"peer"` (optional; the collaboration semantics do not require a role)
 
+A user-owned native session MAY participate through ordinary Group Actors. Source discovery MUST NOT manufacture collaboration history. An administrator MAY explicitly admit a new native source to an existing Group as a new Actor; this MUST NOT silently replace an earlier identity, transfer its role, or inherit its pending work. In-flight native requests MUST remain bound to their captured source, Actor generation and native lifecycle revision; reusing a textual Actor ID MUST NOT transfer that authority. Transport acceptance, model execution and explicit read/reply receipts remain distinct; a receiver failure MUST NOT indefinitely block later messages or unrelated recipients. Native session ownership and local adapter operations are defined in the daemon IPC contract.
+
+Resuming the same admitted native conversation after its former host exits is
+distinct from admitting another conversation. At the receive-attachment boundary,
+the daemon MAY restore that conversation's existing Actor binding only with the
+exact conversation/configuration and exited-host evidence defined in the IPC
+contract. This MUST retain Actor generation, role and access, preserve Group
+pause/stop, and audit the changed source. It MUST NOT revive disabled integration,
+choose among conflicting memberships, or replay submitted or uncertain work.
+
+Copying or importing a Group MUST NOT implicitly activate its native memberships, even within the same local instance. Imported native Actors retain their source references and history with collaboration access disabled until an explicit user action; the source Group is unchanged. A native source reference is not a portable credential or a grant of live receiver authority.
+
 ## 4. Event Envelope (Normative)
 
 All events MUST use the envelope below. Field semantics are fixed.
@@ -127,11 +139,45 @@ When a send request omits recipients or supplies an empty list, the daemon MUST 
 - `@peers`: all visible peer actors
 - `@foreman`: foreman actor(s)
 - `@user`: the human user (UI recipient)
+- `@chet`: the instance-wide Chet service, subject to the ambiguity rule below
 
 Internal assistant Actors are not members of `@all`, `@peers`, or `@foreman`.
-The global Voice Secretary and Voice Analyst are services, not chat recipients or
-Group Actors. Their dedicated operations define their inputs; confirmed Secretary
-handoffs use `by="user"` and retain the original Group/scope through normal peer delivery.
+The global Voice Secretary remains a service, not a chat recipient or Group
+Actor; confirmed Secretary handoffs use `by="user"` and retain the original
+Group/scope through normal peer delivery. Chet, the global Voice Analyst, is a
+service principal, not a Group Actor or a member of those broadcast selectors.
+An explicitly addressed `@chet` is stored as `svc:chet`. If a visible Group
+Actor's ID or title equals `chet`, ignoring ASCII case, the selector MUST fail
+as ambiguous rather than silently redirect that Actor's existing address. A
+bare Actor ID retains its existing meaning. A stored service identity is not,
+by itself, proof of a service-authored message under local-trust IPC (§5.4).
+
+For a local Chet-authored chat message, the host writes
+`data._cccc_chet_group_generation` with the current Group generation. This
+field is read-only to clients: message and raw-event write operations MUST
+reject a caller-supplied value. A local service identity is recognized only
+when `by` is `svc:chet`, the host field matches the current Group generation,
+and the event is present in that Group's ledger. Copies and imports retain
+their old field value, which does not attest the new Group's service identity.
+
+When a recipient replies to a host-verified Chet message without an explicit
+recipient, the daemon routes to the service identity as an internal target; it
+MUST NOT resolve the service principal as an Actor title. An explicit different
+recipient retains its ordinary routing. If an event claims that service author
+but cannot be verified in the current Group, the default reply MUST fail with
+an actionable error; it MUST NOT fall back to resolving the author as a name.
+When a member replies to a verified Chet answer on behalf of the user (§6.4),
+its default recipient is `user`.
+Cross-instance service addressing is not implied by the local selector.
+
+Before Chet sends a reply that addresses the source Actor, the daemon MUST
+verify that the source event belongs to this Group generation and that the
+current Actor is the registration that sent it. If either cannot be
+established, the reply MUST be refused before waking a recipient or appending
+the reply, with guidance to ask the user to relay it. A previously accepted
+idempotent retry still returns its existing event. A reply explicitly addressed
+only to other recipients retains ordinary routing. Older Group ledgers without
+the Actor registration fact may not establish the source identity.
 
 Selector membership describes the logical audience, not permission to start a runtime.
 A user broadcast to `@all` or `@peers` MUST NOT re-enable disabled actors. Explicitly
@@ -148,11 +194,11 @@ Every new `chat.message` MUST address exactly one audience domain:
 - **Human**: the sole normalized recipient is `user` / `@user`.
 - **Agents**: every recipient is an actor ID or an actor selector
   (`@all`, `@peers`, or `@foreman`). Multiple agent recipients are allowed.
+- **Chet**: the sole normalized recipient is `svc:chet`.
 
-A recipient list that mixes the human user with any actor ID or actor selector
-MUST be rejected before the event is appended. Callers that need distinct human
-and agent actions MUST send separate messages so delivery and reply obligations
-remain independently attributable.
+A recipient list that mixes these domains MUST be rejected before the event is
+appended. Callers that need distinct actions MUST send separate messages so
+delivery and reply obligations remain independently attributable.
 
 **Multi-user note**
 - CCCS v1 assumes a single human principal per group, identified as `user`.
@@ -210,6 +256,10 @@ data: {
   attachments?: AttachmentRefV1[]
   refs?: ReferenceV1[]
 
+  // A choice put to the user, and the user's answer to it (see §6.4)
+  question?: ReplyQuestionV1
+  answer?: ReplyAnswerV1 | ReplyAnswerV2
+
   // Reserved for future threading
   thread?: string
 
@@ -229,8 +279,8 @@ data: {
 - `message_mode="mail"` persists the message in the recipient Inbox without
   immediately invoking, waking, steering, or writing to the recipient runtime.
 - `message_mode="mail"` is valid only for the agent audience domain. The human
-  user has no Mail Inbox in CCCS v1; callers MUST use `send` or `request_reply`
-  when addressing `user` / `@user`.
+  user and Chet do not have Mail Inboxes in CCCS v1; callers MUST use `send` or
+  `request_reply` when addressing either. A reply to Chet MUST use `send`.
 - A message with `reply_to` fulfills the addressed reply obligation regardless
   of whether that reply uses `message_mode="send"` or `message_mode="mail"`.
   Reply operations MUST NOT use `message_mode="request_reply"`; a reply cannot
@@ -292,7 +342,8 @@ data: {
   `message_mode="request_reply"` in the same group.
 - Only the original sender or the human user may cancel the request.
 - A reply from a recipient closes only that recipient's obligation. A
-  cancellation closes every still-open recipient obligation.
+  cancellation closes every still-open recipient obligation. A recorded Chet
+  answer on behalf of the user closes the user's obligation (§6.4).
 - Append order is authoritative. If a recipient replied before cancellation,
   that recipient is `replied`; otherwise the cancellation state is
   `cancelled`. Later replies remain visible but do not change `cancelled` back
@@ -313,7 +364,94 @@ A cancellation for an original absent after its delivery deadline may record
 `source_event_id:null, not_delivered:true`; it changes no obligation.
 See [CCCC_CONNECT_V1.md](CCCC_CONNECT_V1.md) for authority and recovery.
 
-### 6.4 `runtime.delivery`
+### 6.4 Questions to the user
+
+A `request_reply` message to the user alone MAY carry a structured `question`,
+so the user chooses an answer instead of composing one.
+
+```ts
+type ReplyQuestionV1 = {
+  v: 1
+  context?: string          // the sender's text; at most 4000 characters
+  prompt: string            // at most 500 characters
+  options?: {               // none (a free answer), or two to four
+    id: "A" | "B" | "C" | "D" // in this order
+    label: string           // one line, at most 80 characters
+    consequence?: string    // one line, at most 240 characters
+  }[]
+  recommended?: { option_id: string; reason: string } // reason: one line, at most 240
+}
+
+type ReplyAnswerV1 =
+  | { v: 1; option_id: string }
+  | { v: 1; text: string }  // at most 4000 characters; kept exactly as written
+
+type ReplyAnswerV2 = {
+  v: 2
+  option_id: string
+  note: string              // nonempty, at most 4000 characters; kept exactly as written
+}
+```
+
+**Rules**
+- Limits count Unicode scalar values. A value over a limit is rejected, never
+  truncated.
+- The structure is authoritative and `text` is generated from it: context,
+  prompt, one line per option, the recommendation, and a closing line naming
+  the option ids. A client that reads only `text` therefore sees the complete
+  question. A reader MUST accept a stored question only when its structure is
+  valid and regenerating the text reproduces the stored `text`; otherwise it
+  shows the text and treats the question as unavailable. Written records,
+  imports and appended events are all read under this rule.
+- `question` is valid only on a new message with `message_mode="request_reply"`
+  addressed to `user` alone by a sender other than `user`, so that every
+  stored question is one the user's open requests include. Replies,
+  cross-group and Connect messages cannot carry one.
+- The recommendation is advice. A client MUST NOT preselect it or treat it as
+  the user's choice.
+- `answer` appears only on a reply to a question from the daemon's answer
+  operation. It validates the caller's structured answer before writing it.
+  V1 keeps its two mutually exclusive forms. V2 is used only for a selected
+  option with a nonempty note; it does not change the question's V1 shape.
+  The message `text` is generated for the requester: `Selected <id>: <label>`
+  for a choice; for V2, that line followed by a blank line and `Note: <note>`;
+  the user's words prefixed with `Other: ` when the question offered options;
+  and the user's words alone when it did not. The note is preserved exactly.
+- The user's obligation follows §6.3. The first reply by the user, recorded
+  Chet answer on behalf of the user, or cancellation after the request closes
+  it. `user` is the Group's shared human
+  audience; one person's answer closes the request for everyone with access to
+  the Group.
+- An answer is accepted only while the request is open, for an
+  offered option, and only when the ledger proves the requester is still the
+  same Actor registration: its latest `actor.add` precedes the request and
+  records the identity the Group holds now. A removed, re-added or unproven
+  requester is reported as such, never resolved to an Actor that shares its
+  ID. Requests relayed from another Group or instance are answered with an
+  ordinary reply.
+- During unattended mode, an authenticated Chet session can submit an answer
+  to an eligible new request from a member to the user. The daemon checks the
+  current mode and the source under the Group's write permit. It records the
+  answer as `by="svc:chet"` with the existing Group provenance and the
+  host-owned field `data._cccc_chet_on_behalf_of="user"`. The field is reserved
+  for this writer. Readers treat the recorded answer as the user's closure,
+  including when viewing copied history. Normal Chet replies keep their
+  ordinary reply semantics. For a reply to an answer Chet wrote in the current
+  Group, the user defaults to the original requester and a member defaults to
+  the user.
+- Closing the request and recording the answer do not mean the requester has
+  received it; delivery is reported separately (§6.5). Answering never
+  resumes a paused or stopped Group or re-enables an Actor; the answer waits
+  for delivery until the user does.
+- Deciding whether a request is open requires every stored record of the
+  Group's ledger to read as a complete event. A record that does not (a damaged
+  line or a cut tail) could be the reply or cancellation that closed it, so
+  that Group's requests are reported as unknown and in-place answers are
+  refused until the ledger is repaired. The same holds when a request's id is
+  used by more than one record (§4) or a reply or cancellation is stored
+  before the request it names. Ordinary replies stay available.
+
+### 6.5 `runtime.delivery`
 
 Daemon-authored evidence that one source message was handed to one recipient
 runtime transport.
@@ -325,7 +463,9 @@ data: {
   delivery_id: string
   state: "claimed" | "accepted" | "failed" | "ambiguous" | "withdrawn"
   transport: string
+  delivery_evidence?: "terminal_written" | "channel_accepted"
   reason?: string | null
+  retryable?: boolean
 }
 ```
 
@@ -345,7 +485,33 @@ data: {
 - `accepted` means the runtime adapter accepted the payload (queue, PTY,
   headless API, or browser submission boundary). It does not claim that the
   model read, understood, or acted on it.
-- `failed` means the adapter established that handoff did not occur.
+- An accepted record MAY include `delivery_evidence` from the handoff itself.
+  `terminal_written` confirms that CCCC wrote the terminal input.
+  `channel_accepted` confirms the runtime's delivery path accepted the input.
+  Neither value establishes model execution. Receipts without recognized
+  evidence retain generic acceptance. Readers MUST NOT infer evidence from
+  `transport`, current Actor settings or later runtime observations.
+- `failed` means the adapter established that handoff did not occur, or that
+  the runtime ran the turn and it failed after its retries. It does not prove
+  that the model never saw the input.
+- A failed attempt MAY carry `retryable=true` only when the daemon established
+  that it stopped before runtime submission (for example, a paused worker or
+  a full daemon queue). This work remains pending for normal recovery. For
+  `transport="local_session"`, a native rejection or a legacy failed receipt
+  without that evidence MUST NOT automatically retry. This flag never permits
+  replay after `accepted`, `ambiguous` or `withdrawn`.
+- A daemon-managed runtime that retries a failed turn on its own MAY record the
+  final failure with `retryable=false` once that bounded retry budget is spent.
+  Automatic delivery MUST NOT start that delivery again, including after an
+  Actor or daemon restart; an explicit delivery request MAY still retry it. A
+  failed record without the flag keeps its existing recovery.
+- Eligible native pending work MUST remain recoverable beyond an in-memory
+  queue or startup query page. The delivery owner MUST continue bounded ledger
+  refill as capacity becomes available, without requiring another message,
+  manual Actor Start or a receive-status refresh for each Group. Refill MUST
+  preserve membership, Actor generation, source binding, pause/stop and terminal
+  receipt boundaries. Status/discovery reads MUST NOT initiate refill or scan
+  native history.
 - `ambiguous` means external side effects may have occurred but cannot be
   proven. Automatic retry MUST NOT follow `accepted` or `ambiguous`.
 - `withdrawn` means the source became obsolete before handoff, and the owner
@@ -355,8 +521,18 @@ data: {
 - A normal `mail` append creates no `runtime.delivery`. An explicit manual
   delivery of that existing message may create one without appending a second
   `chat.message`.
+- A Group message addressed to Chet MAY carry one `runtime.delivery` with
+  `actor_id="svc:chet"` and `transport="chet_group"`. It records only that the
+  host never handed the request to Chet: `state="failed"`,
+  `reason="chet_wait_expired"`, `retryable=false`, with no preceding `claimed`,
+  because no external submission was attempted. The daemon appends it at most
+  once per source event, derives `delivery_id` from the source event, the
+  service principal and the Group generation, and appends it only after Chet's
+  private history durably records that the input will never be submitted.
+  Clients show it on the source message as "not sent to Chet and not run; send
+  it again if still needed". It reveals nothing about Chet's other work.
 
-### 6.5 `chat.reaction` (Optional)
+### 6.6 `chat.reaction` (Optional)
 
 ```ts
 data: {
@@ -374,7 +550,7 @@ System notifications are separated from chat to avoid polluting conversations.
 
 ```ts
 data: {
-  kind: "nudge" | "keepalive" | "help_nudge" | "actor_idle" | "silence_check" | "automation" | "status_change" | "error" | "info" | string
+  kind: "nudge" | "automation" | "status_change" | "error" | "info" | string
   priority?: "low" | "normal" | "high" | "urgent"   // default "normal"
   title?: string
   message?: string
@@ -389,6 +565,8 @@ data: {
 - Clients MUST ignore unknown `data.kind` values within `system.notify` (open enum).
 - Implementations MAY enforce an allowlist of `data.kind` values, but should not assume clients understand new kinds.
 - External IM bridges MUST fail closed: a `system.notify` is eligible for IM delivery only when `im_visibility="public"`. Missing, invalid, or `internal` values stay inside CCCC. Actor-targeted notifications remain internal even if a malformed producer also marks them public.
+- Routing: CCCC's own `mail_notice` and `reply_notice` prompts go only to their `target_actor_id` and are not Inbox items. For every other notification, the sender (`by`) never receives its own notification. A non-empty `target_actor_id` addresses exactly that Actor, so a notification that targets its sender reaches no one rather than everyone. Implementations also read a non-empty `data.actor_id` as the target when `target_actor_id` is absent. Without a target, `to` lists Actor IDs or the selectors `@all`, `@peers` and `@foreman`; names and titles are not resolved as they are for `chat.message`. Internal Actors receive a notification only when `to` names them; other Actors receive it when `to` is empty (a broadcast) or selects them.
+- `by` is the producer. A port that acts for a caller MUST NOT copy the caller's identity into `data` (for example, an MCP tool's `actor_id`); producers address recipients only with `target_actor_id` or `to`.
 
 `system.notify` has no generic acknowledgement protocol. Domain workflows use
 their own durable lifecycle events, while reply obligations belong only to
@@ -622,6 +800,11 @@ role assignment; consumers derive current roles from the Group's Actor list.
 
 ### 13.3 Context Profile (optional)
 - `context.sync` (implementation-defined ops)
+
+Repository-backlog operations may use this event with a `backlog` file snapshot
+reference and `backlog.*` changes. They do not invent a Context version or embed
+the Markdown content; see the daemon IPC backlog contract. A Context-only refresh
+does not reload this external file.
 
 ## 14. Examples
 

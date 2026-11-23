@@ -1,3 +1,4 @@
+use crate::session_owner::runtime as cccc_runtime;
 use cccc_contracts::{Actor, ActorRuntime, RunnerKind};
 use cccc_core::{GroupDoc, GroupStore, HomeLayout};
 use cccc_runtime::{LaunchSpec, SessionStatus};
@@ -7,21 +8,41 @@ use crate::dispatch::OpError;
 use crate::ops::actor_profile_runtime;
 
 mod attributed_reap;
+mod confirmation;
 mod environment;
+mod owner;
 mod persistence;
 mod reconcile;
 pub(crate) mod terminal_history;
 #[cfg(test)]
 mod untrusted_workspace_tests;
+mod workspace;
 pub(crate) use attributed_reap::reap_group;
+#[cfg(test)]
+pub(super) use confirmation::require_restored_managed_actor;
+pub(super) use confirmation::{
+    AUTOMATIC_LIFECYCLE, actor_response, confirmation_pause_applies, confirmation_required,
+    hermes_setup_open, restore_runtime, user_confirmation_retry,
+};
+pub(crate) use owner::{
+    OwnerIdentity, OwnerState, RegisteredOwner, as_launched, delivery_owner, hold_browser_work,
+    hold_group_browser_work, registered_owner,
+};
 pub use persistence::persist_lifecycle;
+pub(super) use persistence::persist_target_stop;
+#[cfg(test)]
+pub use reconcile::reap_exited;
+pub use reconcile::reconcile_exited;
 pub(crate) use reconcile::record_process_exit;
-pub use reconcile::{reap_exited, reconcile_exited};
+pub(crate) use reconcile::{reap_local_exits, reconcile_observed_exits};
+pub(crate) use workspace::LaunchWorkspace;
+pub(super) use workspace::{caller_scope, displayed_scope, effective_scope, session_prompt};
 
 /// Claude Code refused the Actor's workspace; only the operator can accept its trust prompt.
 pub(crate) const CLAUDE_WORKSPACE_UNTRUSTED: &str = "claude_workspace_untrusted";
 pub(crate) const CLAUDE_RESUME_FAILED: &str = "claude_resume_failed";
 pub(crate) const RUNTIME_RESUME_FAILED: &str = "runtime_resume_failed";
+pub(crate) const RUNTIME_CONFIRMATION_PAUSED: &str = "runtime_confirmation_paused";
 
 pub fn apply(
     home: &HomeLayout,
@@ -29,11 +50,24 @@ pub fn apply(
     actor_id: &str,
     kind: &str,
 ) -> Result<Option<SessionStatus>, OpError> {
+    apply_with_stop_target(home, group, actor_id, kind, None)
+}
+
+pub(super) fn apply_with_stop_target(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor_id: &str,
+    kind: &str,
+    target: Option<&crate::session_owner::OwnedTarget>,
+) -> Result<Option<SessionStatus>, OpError> {
     let stored_actor = group
         .actors
         .iter()
         .find(|actor| actor.id == actor_id)
         .ok_or_else(|| OpError::new("not_found", format!("actor not found: {actor_id}")))?;
+    if !stored_actor.external_session_id.is_empty() {
+        return apply_resolved(home, group, stored_actor, kind);
+    }
     // Configuration may already name a different backend. Lifecycle ownership
     // comes from the registries, not from the next launch configuration.
     if matches!(kind, "actor.stop" | "actor.restart" | "actor.new_session") {
@@ -52,10 +86,26 @@ pub fn apply(
         .map_err(OpError::io)?;
     }
     if kind == "actor.stop" {
+        if let Some(target) = target {
+            return target.stop().map_err(OpError::io);
+        }
         return stop_registered(group, actor_id);
     }
     let actor = actor_profile_runtime::resolve(home, stored_actor)?;
     apply_resolved(home, group, &actor, kind)
+}
+
+pub(super) fn require_owner_observation(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+) -> Result<(), OpError> {
+    #[cfg(unix)]
+    if actor.external_session_id.is_empty() && crate::session_owner::enabled(home) {
+        crate::session_owner::snapshot(&group.group_id, &actor.id).map_err(OpError::io)?;
+    }
+    let _ = (home, group, actor);
+    Ok(())
 }
 
 /// Restore policy and startup must use the same effective Profile snapshot.
@@ -65,11 +115,27 @@ pub(super) fn apply_resolved(
     actor: &Actor,
     kind: &str,
 ) -> Result<Option<SessionStatus>, OpError> {
+    if !actor.external_session_id.is_empty() {
+        let result = external_lifecycle(kind)?;
+        if matches!(kind, "actor.start" | "actor.restore") {
+            super::capabilities::apply_native_foreman_startup_baseline(home, group, actor);
+        }
+        return Ok(result);
+    }
     let actor_id = &actor.id;
+    // Recheck at execution in case an owner became unavailable after the caller's preflight.
+    require_owner_observation(home, group, actor)?;
     if actor_id == "voice-secretary" || actor.internal_kind.as_deref() == Some("voice_secretary") {
         return Err(OpError::new(
             "global_secretary_owner",
             "This Group's secretary is managed by the global Voice Secretary; it is not an Actor runtime",
+        ));
+    }
+    if kind != "actor.stop" && cccc_core::runtime_switches::has_pending(group, actor_id) {
+        // Its handoff is not written yet; the replacement must not run first.
+        return Err(OpError::new(
+            "actor_switch_pending",
+            "This member's last runtime switch has not finished; it starts once the switch completes",
         ));
     }
     if !matches!(kind, "actor.restart" | "actor.new_session") && actor_is_running(group, actor) {
@@ -87,8 +153,37 @@ pub(super) fn apply_resolved(
             },
         );
     }
+    #[cfg(all(test, unix))]
+    start_interleaving::run(&group.group_id, actor_id);
+    // A closed confirmation PTY can still belong to its watcher until the next poll,
+    // and an open one outlives a daemon restart in its session owner. Neither an
+    // automatic delivery nor the restart's restore may cancel it and reopen the prompt,
+    // nor replace the session it connected since the check above. The watcher connects
+    // the member before it releases its recovery, so pending is read first.
+    if matches!(kind, "actor.start" | "actor.restore")
+        && (super::local_headless::confirmation_pending_active(&group.group_id, actor_id)
+            .map_err(OpError::io)?
+            || super::local_headless::running(&group.group_id, actor_id))
+    {
+        return Ok(None);
+    }
+    // A confirmation that ends before connecting pauses only this member.
+    // Check it before teardown, startup baselines or provider configuration.
+    if startup_input_paused(&group.group_id, actor_id) {
+        return Err(OpError::new(
+            RUNTIME_CONFIRMATION_PAUSED,
+            "The terminal exited before startup input was ready; ask the user to start this member again",
+        ));
+    }
+    if super::local_headless::pauses_after_confirmation(actor.runtime)
+        && super::local_headless::supports(actor)
+    {
+        super::local_headless::ensure_confirmation_allowed(&group.group_id, actor_id)
+            .map_err(launch_error)?;
+    }
     // Also retire a disconnected registration whose previous cleanup failed.
     stop_registered(group, actor_id)?;
+    persistence::adopt_profile_launch(home, group, actor)?;
     if kind == "actor.new_session" {
         // Pending trust recovery holds the start guard until its launch is
         // attached or discarded. Retire its ownership before removing the
@@ -105,9 +200,20 @@ pub(super) fn apply_resolved(
         return Ok(None);
     }
     if is_structured(actor) {
+        super::runtime_state::record_web_instruction_baseline(home, group, actor);
         return Ok(None);
     }
     start(home, group, actor).map(Some)
+}
+
+fn external_lifecycle(kind: &str) -> Result<Option<SessionStatus>, OpError> {
+    if matches!(kind, "actor.restart" | "actor.new_session") {
+        return Err(OpError::new(
+            "external_session_owned",
+            "Continue or reset this session in its original runtime; CCCC only controls its collaboration access",
+        ));
+    }
+    Ok(None)
 }
 
 fn start_local_headless(home: &HomeLayout, group: &GroupDoc, actor: &Actor) -> Result<(), OpError> {
@@ -117,13 +223,30 @@ fn start_local_headless(home: &HomeLayout, group: &GroupDoc, actor: &Actor) -> R
     if super::local_headless::uses_managed_provider_cli(&actor) {
         super::runtime_mcp::prepare(home, actor.runtime, &actor.command, &cwd, &mut env)?;
     }
+    if actor.runtime == ActorRuntime::Hermes {
+        // Only this launch's copy names the profile; the saved command stays.
+        actor.command =
+            super::hermes_runtime::prepare_member_start(home, &actor.command, &cwd, &env)?;
+    }
+    // The managed launcher adds the CLI directory to its child's PATH. Keep an
+    // explicit member or Profile PATH intact in the snapshot used for redaction.
+    if let Some(path) = actor.env.remove("PATH") {
+        env.insert("PATH".into(), path);
+    }
     actor.env = env;
     let _start_permit = crate::runtime_start_gate::permit(home)
         .map_err(|message| OpError::new("runtime_shutting_down", message))?;
+    #[cfg(unix)]
+    if crate::session_owner::enabled(home) {
+        return crate::session_owner::launch_managed(home, group, &actor).map_err(launch_error);
+    }
     super::local_headless::start(home, group, &actor).map_err(launch_error)
 }
 
 fn launch_error(error: std::io::Error) -> OpError {
+    if super::local_headless::is_confirmation_paused_error(&error) {
+        return OpError::new(RUNTIME_CONFIRMATION_PAUSED, error.to_string());
+    }
     if super::runtime_session::resume_failure::is_blocked(&error) {
         return OpError::new(RUNTIME_RESUME_FAILED, error.to_string());
     }
@@ -158,28 +281,76 @@ fn start(home: &HomeLayout, group: &GroupDoc, actor: &Actor) -> Result<SessionSt
     let cwd = working_directory(group, &actor)?;
     let mut env = environment::launch_env(home, group, &actor);
     super::runtime_mcp::prepare(home, actor.runtime, &command, &cwd, &mut env)?;
+    // Only the PTY registry reads these host-owned attribution fields. Managed
+    // providers capture their workspace directly; changing their environment
+    // would invalidate otherwise compatible persisted conversation receipts.
+    env.insert(
+        "CCCC_SCOPE_KEY".into(),
+        cccc_core::group_scope::effective_scope(group, Some(&actor))
+            .map(|scope| scope.scope_key.clone())
+            .unwrap_or_default(),
+    );
+    env.insert(
+        "CCCC_ACTOR_GENERATION".into(),
+        cccc_core::actors::generation_identity(&actor),
+    );
     let _start_permit = crate::runtime_start_gate::permit(home)
         .map_err(|message| OpError::new("runtime_shutting_down", message))?;
     let command = cccc_runtime::resolve_command_executable(&command, &env);
     let history =
         terminal_history::config(home, &group.group_id, &actor.id).map_err(OpError::io)?;
-    cccc_runtime::start_with_history(
-        LaunchSpec {
-            group_id: group.group_id.clone(),
-            actor_id: actor.id.clone(),
-            runner: RunnerKind::Pty,
-            command,
-            cwd,
-            env,
-            cols: 120,
-            rows: 40,
-        },
-        history,
-    )
-    .map_err(runtime_error)
+    // Read before the launch: a change made while the runtime starts is then
+    // reported instead of being taken as what it loaded.
+    let instructions = super::instruction_files::Snapshot::read(&cwd);
+    let spec = LaunchSpec {
+        group_id: group.group_id.clone(),
+        actor_id: actor.id.clone(),
+        runner: RunnerKind::Pty,
+        command,
+        cwd,
+        env,
+        cols: 120,
+        rows: 40,
+    };
+    let launch = cccc_runtime::ActorLaunch {
+        runtime: actor.runtime,
+        submit: actor.submit,
+    };
+    #[cfg(unix)]
+    let status = if crate::session_owner::enabled(home) {
+        crate::session_owner::launch_pty(home, group, &actor, spec, history, launch)
+            .map_err(OpError::io)?
+    } else {
+        cccc_runtime::start_actor_with_history(spec, history, launch).map_err(runtime_error)?
+    };
+    #[cfg(not(unix))]
+    let status =
+        cccc_runtime::start_actor_with_history(spec, history, launch).map_err(runtime_error)?;
+    if let Some(snapshot) = instructions {
+        super::instruction_files::record(
+            home,
+            &group.group_id,
+            &actor,
+            &pty_instruction_session(&status),
+            snapshot,
+        );
+    }
+    Ok(status)
+}
+
+/// The instruction-file session of a PTY launch; the delivery worker uses the
+/// same key.
+pub(super) fn pty_instruction_session(status: &SessionStatus) -> String {
+    format!("pty:{}", status.started_at)
 }
 
 pub(super) fn stop(group: &GroupDoc, actor_id: &str) -> Result<Option<SessionStatus>, OpError> {
+    #[cfg(unix)]
+    if let Some(stopped) =
+        crate::session_owner::stop_actor(&group.group_id, actor_id).map_err(OpError::io)?
+    {
+        return Ok(stopped);
+    }
     match cccc_runtime::stop(&group.group_id, actor_id) {
         Ok(status) => Ok(Some(status)),
         Err(cccc_runtime::RuntimeError::NotFound(_, _)) => Ok(None),
@@ -188,6 +359,12 @@ pub(super) fn stop(group: &GroupDoc, actor_id: &str) -> Result<Option<SessionSta
 }
 
 fn stop_registered(group: &GroupDoc, actor_id: &str) -> Result<Option<SessionStatus>, OpError> {
+    #[cfg(unix)]
+    if let Some(stopped) =
+        crate::session_owner::stop_actor(&group.group_id, actor_id).map_err(OpError::io)?
+    {
+        return Ok(stopped);
+    }
     let result = (|| {
         super::local_headless::stop(&group.group_id, actor_id).map_err(OpError::io)?;
         super::deepseek_runtime::stop(&group.group_id, actor_id);
@@ -201,8 +378,62 @@ fn stop_registered(group: &GroupDoc, actor_id: &str) -> Result<Option<SessionSta
     })
 }
 
+/// Stop every managed owner registered for the Actor, whatever its saved
+/// configuration names, and confirm each stopped. Returns whether one was
+/// running. Used when the runtime owner is replaced: an owner that cannot be
+/// confirmed stopped must keep the Actor.
+pub(super) fn stop_owner_confirmed(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor_id: &str,
+) -> Result<bool, OpError> {
+    // A Web Model has no process to stop: its authority is what ends. Old
+    // credentials stop working here; cloud work already running does not.
+    super::dots_events::invalidate(home, group, actor_id)?;
+    super::grok_webhook::invalidate(home, group, actor_id)?;
+    cccc_core::web_model_connectors::interrupt_automatic_pairings(
+        home,
+        &group.group_id,
+        Some(actor_id),
+    )
+    .map_err(OpError::io)?;
+    #[cfg(unix)]
+    if let Some(snapshot) =
+        crate::session_owner::snapshot(&group.group_id, actor_id).map_err(OpError::io)?
+    {
+        let running = snapshot
+            .owner
+            .is_some_and(|owner| owner.state == OwnerState::Running);
+        crate::session_owner::stop_actor(&group.group_id, actor_id).map_err(OpError::io)?;
+        return Ok(running);
+    }
+    let was_running = super::local_headless::running(&group.group_id, actor_id)
+        || super::deepseek_runtime::running(&group.group_id, actor_id)
+        || cccc_runtime::status(&group.group_id, actor_id).is_ok_and(|status| status.running);
+    super::local_headless::stop(&group.group_id, actor_id).map_err(OpError::io)?;
+    super::deepseek_runtime::stop_confirmed(&group.group_id, actor_id).map_err(OpError::io)?;
+    stop(group, actor_id)?;
+    Ok(was_running)
+}
+
 pub fn status(group_id: &str, actor_id: &str) -> Option<SessionStatus> {
+    #[cfg(unix)]
+    match crate::session_owner::snapshot(group_id, actor_id) {
+        Ok(Some(snapshot)) => return snapshot.terminal,
+        Err(_) => return None,
+        Ok(None) => {}
+    }
     cccc_runtime::status(group_id, actor_id).ok()
+}
+
+pub(super) fn startup_input_paused(group_id: &str, actor_id: &str) -> bool {
+    status(group_id, actor_id).is_some_and(|status| !status.running && status.startup_input_pending)
+}
+
+/// Whether the Actor's own primary PTY is registered, running or kept after it
+/// exited. A saved runner of another kind applies only from the next launch.
+pub fn has_primary_pty(group_id: &str, actor_id: &str) -> bool {
+    status(group_id, actor_id).is_some_and(|status| status.launch.is_some())
 }
 
 #[must_use]
@@ -215,6 +446,11 @@ pub fn start_group(home: &HomeLayout, group: &GroupDoc) -> Result<Vec<SessionSta
     let mut statuses = Vec::new();
     let mut started_actor_ids = Vec::new();
     for actor in group.actors.iter().filter(|actor| actor.enabled) {
+        // Held until its own retry. Skipped before anything of it is read, so
+        // nothing about this member can stop the rest of the Group.
+        if cccc_core::runtime_switches::has_pending(group, &actor.id) {
+            continue;
+        }
         let was_running = actor_is_running(group, actor);
         match apply(home, group, &actor.id, "actor.start") {
             Ok(status) => {
@@ -225,6 +461,7 @@ pub fn start_group(home: &HomeLayout, group: &GroupDoc) -> Result<Vec<SessionSta
                     statuses.push(status);
                 }
             }
+            Err(error) if error.code == RUNTIME_CONFIRMATION_PAUSED => continue,
             Err(error) => {
                 let mut rollback_failures = Vec::new();
                 for actor_id in started_actor_ids.iter().rev() {
@@ -277,7 +514,7 @@ pub fn stop_group(home: &HomeLayout, group: &GroupDoc) -> Result<Vec<SessionStat
 }
 
 pub(super) fn working_directory(group: &GroupDoc, actor: &Actor) -> Result<PathBuf, OpError> {
-    let wanted = if actor.default_scope_key.is_empty() {
+    let wanted = if actor.default_scope_key.trim().is_empty() {
         &group.active_scope_key
     } else {
         &actor.default_scope_key
@@ -288,7 +525,7 @@ pub(super) fn working_directory(group: &GroupDoc, actor: &Actor) -> Result<PathB
             "missing project root for group (no active scope)",
         ));
     }
-    let scope = cccc_core::group_scope::resolve_attached_scope(group, wanted).ok_or_else(|| {
+    let scope = cccc_core::group_scope::effective_scope(group, Some(actor)).ok_or_else(|| {
         OpError::new(
             "scope_not_attached",
             format!("scope not attached: {wanted}"),
@@ -301,9 +538,42 @@ pub(super) fn working_directory(group: &GroupDoc, actor: &Actor) -> Result<PathB
             format!("project root path does not exist: {}", path.display()),
         ));
     }
-    Ok(path)
+    path.canonicalize()
+        .map_err(|error| OpError::new("invalid_project_root", error.to_string()))
 }
 
 fn runtime_error(error: cccc_runtime::RuntimeError) -> OpError {
     OpError::new("runtime_error", error.to_string())
+}
+
+/// Code a test runs once inside one member's start, between its running check
+/// and its recovery check, to replay a recovery that connects the member there.
+#[cfg(all(test, unix))]
+pub(crate) mod start_interleaving {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: Mutex<BTreeMap<(String, String), Hook>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn after_running_check(
+        group_id: &str,
+        actor_id: &str,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        HOOKS
+            .lock()
+            .expect("start hooks")
+            .insert((group_id.to_owned(), actor_id.to_owned()), Box::new(hook));
+    }
+
+    pub(super) fn run(group_id: &str, actor_id: &str) {
+        let hook = HOOKS
+            .lock()
+            .expect("start hooks")
+            .remove(&(group_id.to_owned(), actor_id.to_owned()));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }

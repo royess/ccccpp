@@ -20,6 +20,7 @@ export const RECIPIENT_POPOVER_GAP_PX = 6;
 export function useRecipientPopover({ isSmallScreen }: { isSmallScreen: boolean }) {
   const { t } = useTranslation("chat");
   const copyWithFeedback = useCopyFeedback();
+  const anchorRef = useRef<HTMLElement>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [target, setTarget] = useState<RecipientPopoverTarget | null>(null);
   const [style, setStyle] = useState<CSSProperties | null>(null);
@@ -35,9 +36,11 @@ export function useRecipientPopover({ isSmallScreen }: { isSmallScreen: boolean 
   const show = useCallback(
     (nextTarget: RecipientPopoverTarget, node: HTMLElement) => {
       cancelHide();
+      anchorRef.current = node;
       const rect = node.getBoundingClientRect();
       const viewportWidth = typeof window === "undefined" ? 1024 : window.innerWidth;
-      const tooltipWidth = Math.min(196, Math.max(176, viewportWidth - 16));
+      // More room for the kind label beside the foreman badge and the copy button.
+      const tooltipWidth = Math.min(256, Math.max(176, viewportWidth - 16));
       const top = rect.top;
       const transform = `translateY(calc(-100% - ${RECIPIENT_POPOVER_GAP_PX}px))`;
       if (isSmallScreen) {
@@ -102,7 +105,7 @@ export function useRecipientPopover({ isSmallScreen }: { isSmallScreen: boolean 
       return {
         key: `actor:${id || label}`,
         label,
-        kindLabel: t("recipientActorDetail", { defaultValue: "Local actor" }),
+        kindLabel: t("recipientActorDetail", { defaultValue: "Local agent" }),
         badgeLabel: role || undefined,
         identifier: formatRecipientIdentifier({ kind: "actor", label, id, role }),
         idValue: id,
@@ -112,6 +115,7 @@ export function useRecipientPopover({ isSmallScreen }: { isSmallScreen: boolean 
   );
 
   return {
+    anchorRef,
     visibleTarget: target,
     style,
     show,

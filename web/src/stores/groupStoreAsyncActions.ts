@@ -53,6 +53,7 @@ import type {
 import { useComposerStore } from "./useComposerStore";
 import { mergeOlderLedgerEvents } from "./groupHistoryMerge";
 import { getGroupWarmupRead, startGroupWarmupRead } from "./groupWarmupRead";
+import { recordMessageJumpFailure } from "../features/pushNotifications/messageJumpTrace";
 
 function splitFetchedActors(actors: Actor[]): { actors: Actor[]; internalRuntimeActors: Actor[] } {
   const visibleActors: Actor[] = [];
@@ -120,6 +121,10 @@ export function createGroupStoreAsyncActions(
   set: GroupStoreSet,
   get: GroupStoreGet,
 ): GroupStoreAsyncActions {
+  // The actors a Group shows now: the selected Group's from the store, another's from its cache.
+  const shownActors = (gid: string): Actor[] =>
+    get().selectedGroupId === gid ? get().actors : getCachedGroupView(gid)?.actors || [];
+
   return {
     refreshGroups: async () => {
       if (refreshGroupsInFlight) {
@@ -182,12 +187,15 @@ export function createGroupStoreAsyncActions(
                 patch.title = meta.title;
               if (typeof meta.topic === "string" && meta.topic !== doc.topic)
                 patch.topic = meta.topic;
-              if (typeof meta.running === "boolean" && meta.running !== doc.running)
+              if (meta.runtime_status?.available === false) {
+                if (doc.running !== undefined) patch.running = undefined;
+              } else if (typeof meta.running === "boolean" && meta.running !== doc.running)
                 patch.running = meta.running;
               if (meta.runtime_status) {
                 const curRT = doc.runtime_status;
                 if (
                   !curRT ||
+                  curRT.available !== meta.runtime_status.available ||
                   curRT.lifecycle_state !== meta.runtime_status.lifecycle_state ||
                   curRT.runtime_running !== meta.runtime_status.runtime_running ||
                   curRT.running_actor_count !== meta.runtime_status.running_actor_count
@@ -230,8 +238,7 @@ export function createGroupStoreAsyncActions(
         });
         if (resp.ok) {
           const split = splitFetchedActors(resp.result.actors || []);
-          const prevActors =
-            get().selectedGroupId === gid ? get().actors : getCachedGroupView(gid)?.actors || [];
+          const prevActors = shownActors(gid);
           const prevInternalActors = get().internalRuntimeActorsByGroup[gid] || [];
           const nextActors = includeUnread
             ? reuseEqualActors(split.actors, prevActors)
@@ -344,19 +351,21 @@ export function createGroupStoreAsyncActions(
 
     refreshPresentation: async (groupId?: string) => {
       const gid = String(groupId || get().selectedGroupId || "").trim();
-      if (!gid) return;
+      if (!gid) return false;
       const epoch = beginGroupRequestEpoch(presentationRequestEpochByGroup, gid);
       try {
         const resp = await api.fetchPresentation(gid);
-        if (!resp.ok) return;
-        if (!isLatestGroupRequestEpoch(presentationRequestEpochByGroup, gid, epoch)) return;
+        if (!resp.ok) return false;
+        if (!isLatestGroupRequestEpoch(presentationRequestEpochByGroup, gid, epoch)) return false;
         const nextPresentation = resp.result.presentation || null;
         saveGroupView(gid, { groupPresentation: nextPresentation });
         if (String(get().selectedGroupId || "").trim() === gid) {
           set({ groupPresentation: nextPresentation });
         }
+        return true;
       } catch (error) {
         console.error(`Failed to refresh presentation for group=${gid}:`, error);
+        return false;
       }
     },
 
@@ -516,12 +525,17 @@ export function createGroupStoreAsyncActions(
         .then((actorsResp) => {
           if (!actorsResp.ok) return;
           const split = splitFetchedActors(actorsResp.result.actors || []);
-          commitViewPatch({ actors: split.actors });
+          // This read has no unread counts. Keep the ones shown until the deferred unread
+          // refresh answers, as refreshActors does, so mail marks do not vanish and return.
+          commitViewPatch({ actors: mergeActorUnreadCounts(split.actors, shownActors(gid)) });
           if (isLatestSelection()) {
             set((state) => ({
               internalRuntimeActorsByGroup: {
                 ...state.internalRuntimeActorsByGroup,
-                [gid]: split.internalRuntimeActors,
+                [gid]: mergeActorUnreadCounts(
+                  split.internalRuntimeActors,
+                  state.internalRuntimeActorsByGroup[gid] || [],
+                ),
               },
               selectedGroupActorsHydrating: false,
               selectedGroupActorStatusProvisional: false,
@@ -641,14 +655,14 @@ export function createGroupStoreAsyncActions(
 
     loadMoreHistory: async (groupId?: string) => {
       const gid = String(groupId || get().selectedGroupId || "").trim();
-      if (!gid) return;
+      if (!gid) return false;
 
       const bucket = getGroupChatBucket(get().chatByGroup, gid);
-      if (bucket.isLoadingHistory || !bucket.hasMoreHistory) return;
+      if (bucket.isLoadingHistory || !bucket.hasMoreHistory) return false;
 
       const chatMessages = bucket.events.filter((event) => event.kind === "chat.message");
       const firstEvent = chatMessages[0];
-      if (!firstEvent?.id) return;
+      if (!firstEvent?.id) return false;
 
       set((state) => buildChatBucketPatch(state, gid, { isLoadingHistory: true }) ?? state);
       try {
@@ -681,7 +695,7 @@ export function createGroupStoreAsyncActions(
     openChatWindow: async (groupId: string, centerEventId: string) => {
       const gid = String(groupId || "").trim();
       const eid = String(centerEventId || "").trim();
-      if (!gid || !eid) return;
+      if (!gid || !eid) return false;
       useUIStore.getState().setGroupWorkView(gid, "messages");
       const epoch = beginGroupRequestEpoch(chatWindowRequestEpochByGroup, gid);
 
@@ -701,10 +715,12 @@ export function createGroupStoreAsyncActions(
       );
       try {
         const resp = await api.fetchMessageWindow(gid, eid, { before: 30, after: 30 });
-        if (!isLatestGroupRequestEpoch(chatWindowRequestEpochByGroup, gid, epoch)) return;
+        // A newer request took over; what it shows is not this one's failure.
+        if (!isLatestGroupRequestEpoch(chatWindowRequestEpochByGroup, gid, epoch)) return true;
         if (!resp.ok) {
+          recordMessageJumpFailure(gid, eid, resp.error.httpStatus, resp.error.code);
           set((state) => buildChatBucketPatch(state, gid, { chatWindow: null }) ?? state);
-          return;
+          return false;
         }
 
         const events = projectFetchedChatEvents(resp.result.events || []);
@@ -721,10 +737,87 @@ export function createGroupStoreAsyncActions(
               },
             }) ?? state,
         );
+        return true;
       } finally {
         if (isLatestGroupRequestEpoch(chatWindowRequestEpochByGroup, gid, epoch)) {
           set((state) => buildChatBucketPatch(state, gid, { isChatWindowLoading: false }) ?? state);
         }
+      }
+    },
+
+    loadMoreChatWindowAfter: async (groupId: string) => {
+      const gid = String(groupId || "").trim();
+      const original = get().chatByGroup[gid]?.chatWindow;
+      const tailId = String(original?.events.at(-1)?.id || "").trim();
+      if (!gid || !original || !original.hasMoreAfter || original.isLoadingAfter || !tailId) return;
+      const centerId = original.centerEventId;
+      const epoch = beginGroupRequestEpoch(chatWindowRequestEpochByGroup, gid);
+      const currentWindow = (state: GroupState) => {
+        const current = state.chatByGroup[gid]?.chatWindow;
+        return isLatestGroupRequestEpoch(chatWindowRequestEpochByGroup, gid, epoch) &&
+          current?.centerEventId === centerId &&
+          current.events.at(-1)?.id === tailId
+          ? current
+          : null;
+      };
+      set((state) => {
+        const current = currentWindow(state);
+        return current
+          ? (buildChatBucketPatch(state, gid, {
+              chatWindow: { ...current, isLoadingAfter: true, afterError: false },
+            }) ?? state)
+          : state;
+      });
+      try {
+        const response = await api.fetchMessageWindow(gid, tailId, { before: 0, after: 50 });
+        if (
+          !response.ok ||
+          response.result.center_id !== tailId ||
+          typeof response.result.has_more_after !== "boolean" ||
+          !Array.isArray(response.result.events)
+        )
+          throw new Error("invalid context page");
+        const events = projectFetchedChatEvents(response.result.events);
+        if (events[0]?.id !== tailId || (response.result.has_more_after && events.length <= 1))
+          throw new Error("invalid context page");
+        set((state) => {
+          const current = currentWindow(state);
+          if (!current) return state;
+          const ids = new Set(current.events.map((event) => event.id));
+          const newer = events.slice(1);
+          const duplicate = newer.some((event) => {
+            if (!event.id || ids.has(event.id)) return true;
+            ids.add(event.id);
+            return false;
+          });
+          if (duplicate) {
+            return (
+              buildChatBucketPatch(state, gid, {
+                chatWindow: { ...current, isLoadingAfter: false, afterError: true },
+              }) ?? state
+            );
+          }
+          return (
+            buildChatBucketPatch(state, gid, {
+              chatWindow: {
+                ...current,
+                events: [...current.events, ...newer],
+                hasMoreAfter: response.result.has_more_after,
+                isLoadingAfter: false,
+                afterError: false,
+              },
+            }) ?? state
+          );
+        });
+      } catch {
+        set((state) => {
+          const current = currentWindow(state);
+          return current
+            ? (buildChatBucketPatch(state, gid, {
+                chatWindow: { ...current, isLoadingAfter: false, afterError: true },
+              }) ?? state)
+            : state;
+        });
       }
     },
 

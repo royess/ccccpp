@@ -1,7 +1,10 @@
 import { requestWorkspaceNavigation } from "../stores/workspaceNavigation";
+import { useGroupResourcePanel, useResourcePanelStore } from "../stores/useResourcePanelStore";
 // AppModals renders all modal components in one place.
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { LcdSpinner } from "./LcdSpinner";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { SearchModal } from "./SearchModal";
 import { MobileMenuSheet } from "./layout/MobileMenuSheet";
 import { CreateGroupModal } from "./modals/CreateGroupModal";
@@ -11,6 +14,7 @@ import { useAppModalActorActions } from "./modals/useAppModalActorActions";
 import { GroupEditModal } from "./modals/GroupEditModal";
 import { InboxModal } from "./modals/InboxModal";
 import { PresentationPinModal } from "./presentation/PresentationPinModal";
+import { BatchRelayMessageModal } from "./modals/BatchRelayMessageModal";
 import { RelayMessageModal } from "./modals/RelayMessageModal";
 import { RecipientsModal } from "./modals/RecipientsModal";
 import {
@@ -21,7 +25,13 @@ import {
 import { findPresentationSlot } from "../utils/presentation";
 import { buildPresentationRefForSlot } from "../utils/presentationRefs";
 import { formatGroupSettingsUpdateError } from "../utils/groupSettingsErrors";
+import { appendQuotedOriginalPerspective, getMessageInsight } from "../utils/messagePerspective";
+import { installedRuntimeFor } from "../utils/installedRuntime";
+import { sameActorConfiguration } from "../utils/actorIdentity";
 import { projectCrossGroupRecipients, projectMessageMode } from "../utils/crossGroupRecipients";
+import { CHET_NAME, CHET_PRINCIPAL } from "../utils/chetIdentity";
+import { hasPendingActorSwitch } from "../features/runtimeSwitch/runtimeSwitchState";
+import { keepLiveReceipts } from "../utils/mergeLedgerEvents";
 import {
   useGroupStore,
   useUIStore,
@@ -32,13 +42,14 @@ import {
   selectChatBucketState,
 } from "../stores";
 import { getRecipientActorIdsForEvent } from "../hooks/useSSE";
-import { getChatSession } from "../stores/useUIStore";
 import * as api from "../services/api";
 import {
   LedgerEvent,
+  LedgerEventStatusPayload,
   GroupSettings,
   ChatMessageData,
   PresentationMessageRef,
+  type SupportedRuntime,
   TextScale,
   Theme,
 } from "../types";
@@ -55,6 +66,11 @@ const PresentationViewerModal = lazy(() =>
     default: module.PresentationViewerModal,
   })),
 );
+const CapabilityCenterWorkspace = lazy(() =>
+  import("./capabilities/CapabilityCenterWorkspace").then((module) => ({
+    default: module.CapabilityCenterWorkspace,
+  })),
+);
 
 interface AppModalsProps {
   codexVoice: import("../features/codexVoice/useCodexVoiceShell").CodexVoiceShellState;
@@ -62,6 +78,7 @@ interface AppModalsProps {
   theme: Theme;
   textScale: TextScale;
   readOnly?: boolean;
+  notificationsAllowed?: boolean;
   ccccHome: string;
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   onStartReply: (ev: LedgerEvent) => void;
@@ -71,7 +88,10 @@ interface AppModalsProps {
   fetchContext: ContextModalFetch;
   canManageGroups: boolean;
   accountLabel?: string | null;
-  onDotsActorCreated?: (visit: import("../hooks/useAppTabState").CreatedDotsNavigation) => void;
+  onSelectGroup?: (groupId: string) => void;
+  onNativeActorCreated?: (
+    visit: import("../hooks/useAppTabState").CreatedNativeActorNavigation,
+  ) => void;
 }
 
 function sortPresentationSlotIds(slotIds: string[]): string[] {
@@ -82,17 +102,28 @@ function sortPresentationSlotIds(slotIds: string[]): string[] {
   });
 }
 
-function LazyModalFallback({ isDark: _ }: { isDark?: boolean }) {
+function LazyModalFallback() {
+  const { t } = useTranslation("common");
   return (
-    <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/40 backdrop-blur-[2px]">
-      <div className="rounded-2xl px-5 py-4 text-sm shadow-xl glass-modal min-w-[120px] flex items-center justify-center font-medium text-[var(--color-text-secondary)]">
-        <span className="flex items-center gap-2">
-          <span className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--color-text-muted)] border-t-transparent" />
-          <span>Loading...</span>
-        </span>
+    <div className="fixed inset-0 z-[90] flex items-center justify-center glass-overlay">
+      <div className="flex min-w-[120px] items-center justify-center gap-2 px-5 py-4 text-sm font-medium text-[var(--color-text-secondary)] glass-modal">
+        <LcdSpinner className="h-4 w-4" />
+        <span>{t("loading")}</span>
       </div>
     </div>
   );
+}
+
+function findChatMessageInLists(
+  lists: ReadonlyArray<LedgerEvent[] | undefined>,
+  eventId: string,
+): LedgerEvent | null {
+  if (!eventId) return null;
+  for (const list of lists) {
+    const hit = list?.find((x) => x.kind === "chat.message" && String(x.id || "") === eventId);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 export function AppModals({
@@ -101,16 +132,18 @@ export function AppModals({
   theme,
   textScale,
   readOnly,
+  notificationsAllowed,
   ccccHome,
   composerRef,
   onStartReply,
   onThemeChange,
   onTextScaleChange,
   onDeleteGroup,
-  onDotsActorCreated,
+  onNativeActorCreated,
   fetchContext,
   canManageGroups,
   accountLabel,
+  onSelectGroup,
 }: AppModalsProps) {
   const { t } = useTranslation(["actors", "chat", "modals"]);
   // Stores
@@ -171,29 +204,25 @@ export function AppModals({
     busy,
     webReadOnly,
     isSmallScreen,
-    chatSessions,
     setBusy,
     showError,
     showNotice,
     setActiveTab,
     setChatMobileSurface,
-    setChatPresentationDockOpen,
-    setChatPresentationDisplayMode,
   } = useUIStore(
     useShallow((s) => ({
       busy: s.busy,
       webReadOnly: s.webReadOnly,
       isSmallScreen: s.isSmallScreen,
-      chatSessions: s.chatSessions,
       setBusy: s.setBusy,
       showError: s.showError,
       showNotice: s.showNotice,
       setActiveTab: s.setActiveTab,
       setChatMobileSurface: s.setChatMobileSurface,
-      setChatPresentationDockOpen: s.setChatPresentationDockOpen,
-      setChatPresentationDisplayMode: s.setChatPresentationDisplayMode,
     })),
   );
+  const resourcePanel = useGroupResourcePanel(selectedGroupId);
+  const lastClosedResources = resourcePanel.closed[0];
 
   const {
     modals,
@@ -235,6 +264,17 @@ export function AppModals({
   const editingActorSection = useModalStore((state) => state.editingActorSection);
   const openSettingsTarget = useModalStore((state) => state.openSettingsTarget);
   const contextTaskId = useModalStore((state) => state.contextTaskId);
+  const capabilityCenterGroupId = useModalStore((state) => state.capabilityCenterGroupId);
+  const setCapabilityCenter = useModalStore((state) => state.setCapabilityCenter);
+  // The capability center acts on the Group it opened for; another Group closes it.
+  useEffect(() => {
+    if (
+      capabilityCenterGroupId !== null &&
+      capabilityCenterGroupId !== String(selectedGroupId || "").trim()
+    ) {
+      setCapabilityCenter(null);
+    }
+  }, [capabilityCenterGroupId, selectedGroupId, setCapabilityCenter]);
 
   const { inboxTarget, inboxMessages, setInboxMessages, clearInbox } = useInboxStore(
     useShallow((s) => ({
@@ -253,13 +293,6 @@ export function AppModals({
   const setQuotedPresentationRef = useComposerStore((state) => state.setQuotedPresentationRef);
   const setComposerDestGroupId = useComposerStore((state) => state.setDestGroupId);
   const [messageActionBusy, setMessageActionBusy] = useState("");
-
-  const preferredPresentationSurface = selectedGroupId
-    ? !isSmallScreen &&
-      getChatSession(selectedGroupId, chatSessions).presentationDisplayMode === "split"
-      ? "split"
-      : "modal"
-    : "modal";
 
   const {
     editGroupTitle,
@@ -362,6 +395,24 @@ export function AppModals({
   );
 
   const directoryBrowser = useCreateGroupDirectoryBrowser();
+  const handleActorScopeAttached = useCallback(
+    (groupId: string, scope: api.AttachScopeResult["scope"]) => {
+      useGroupStore.setState((state) => {
+        const doc = state.groupDoc;
+        if (state.selectedGroupId !== groupId || doc?.group_id !== groupId) return state;
+        const scopes = doc.scopes || [];
+        return {
+          groupDoc: {
+            ...doc,
+            scopes: scopes.some((item) => item.scope_key === scope.scope_key)
+              ? scopes.map((item) => (item.scope_key === scope.scope_key ? scope : item))
+              : [...scopes, scope],
+          },
+        };
+      });
+    },
+    [],
+  );
   const [presentationViewerCacheByGroup, setPresentationViewerCacheByGroup] = useState<
     Record<string, string[]>
   >({});
@@ -369,10 +420,13 @@ export function AppModals({
     actorProfiles,
     actorProfilesBusy,
     editActorNotesBusy,
+    editActorNotesError,
     savedActorNotes,
+    retryEditActorNotes,
     loadActorProfiles,
     handleSaveEditActorOnly,
     handleSaveEditActorAndRestart,
+    handleSaveEditActorBasics,
     handleSaveEditActorAsProfile,
     handleAddActor,
     handleSaveNewActorAsProfile,
@@ -395,7 +449,7 @@ export function AppModals({
     setEditingActor,
     closeModal,
     refreshActors,
-    onDotsActorCreated,
+    onNativeActorCreated,
     editActorRuntime,
     editActorCommand,
     editActorTitle,
@@ -416,6 +470,43 @@ export function AppModals({
     resetAddActorForm,
     t,
   });
+
+  // The form opens on Codex. When Codex is not installed but another command-line runtime is, as
+  // for someone with only Claude Code, show that one instead of a disabled Add. Detection can finish
+  // after the reader has started, so leave the runtime alone once they have picked one themselves
+  // (the same one included), or while they use their own command or a Runtime Profile.
+  const newActorRuntimePickedRef = useRef(false);
+  useEffect(() => {
+    if (modals.addActor) newActorRuntimePickedRef.current = false;
+  }, [modals.addActor]);
+  useEffect(() => {
+    if (!modals.addActor || runtimeDetectionStatus !== "ready") return;
+    if (newActorRuntimePickedRef.current || !newActorUseDefaultCommand || newActorUseProfile)
+      return;
+    const installed = installedRuntimeFor(newActorRuntime, runtimes);
+    if (!installed || installed === newActorRuntime) return;
+    // As when the reader switches: a command typed for the old runtime must not come back with it.
+    setNewActorRuntime(installed);
+    setNewActorCommand(
+      String(runtimes.find((item) => item.name === installed)?.recommended_command || "").trim(),
+    );
+  }, [
+    modals.addActor,
+    newActorRuntime,
+    newActorUseDefaultCommand,
+    newActorUseProfile,
+    runtimeDetectionStatus,
+    runtimes,
+    setNewActorCommand,
+    setNewActorRuntime,
+  ]);
+  const pickNewActorRuntime = useCallback(
+    (runtime: SupportedRuntime) => {
+      newActorRuntimePickedRef.current = true;
+      setNewActorRuntime(runtime);
+    },
+    [setNewActorRuntime],
+  );
 
   const rememberPresentationViewerSlot = useCallback((groupId: string, slotId: string) => {
     const normalizedGroupId = String(groupId || "").trim();
@@ -491,28 +582,18 @@ export function AppModals({
   }, [groupPresentation, presentationViewer, presentationViewerCacheByGroup, selectedGroupId]);
 
   // Computed
-  const selectedGroupRunning = useGroupStore(
-    (s) => s.groups.find((g) => String(g.group_id || "") === s.selectedGroupId)?.running ?? false,
-  );
+  const selectedGroupRunning = useGroupStore((s) => {
+    const group = s.groups.find((g) => String(g.group_id || "") === s.selectedGroupId);
+    return group?.runtime_status?.available === false ? null : (group?.running ?? false);
+  });
   const hasForeman = actors.some((a) => a.role === "foreman");
 
   // Compute messageMeta for RecipientsModal (moved from App.tsx)
   const messageMetaEvent = useMemo(() => {
     if (!_recipientsEventId) return null;
-    const liveHit = events.find(
-      (x) => x.kind === "chat.message" && String(x.id || "") === _recipientsEventId,
-    );
-    if (liveHit) return liveHit;
-    const windowEvents = Array.isArray(chatWindow?.events) ? chatWindow.events : [];
-    const windowHit = windowEvents.find(
-      (x) => x.kind === "chat.message" && String(x.id || "") === _recipientsEventId,
-    );
-    if (windowHit) return windowHit;
-    const filteredEvents = Array.isArray(senderHistoryEvents) ? senderHistoryEvents : [];
-    return (
-      filteredEvents.find(
-        (x) => x.kind === "chat.message" && String(x.id || "") === _recipientsEventId,
-      ) || null
+    return findChatMessageInLists(
+      [events, chatWindow?.events, senderHistoryEvents],
+      _recipientsEventId,
     );
   }, [chatWindow?.events, events, senderHistoryEvents, _recipientsEventId]);
 
@@ -525,7 +606,10 @@ export function AppModals({
       : (Array.isArray(metaData?.to) ? metaData.to : [])
           .map((x) => String(x || "").trim())
           .filter((s) => s.length > 0);
-    const toLabel = toTokensList.length > 0 ? toTokensList.join(", ") : "@all";
+    const toLabel =
+      toTokensList.length > 0
+        ? toTokensList.map((token) => (token === CHET_PRINCIPAL ? CHET_NAME : token)).join(", ")
+        : "@all";
     const messageMode = projectMessageMode(metaData) || "send";
     const rs =
       messageMetaEvent._read_status && typeof messageMetaEvent._read_status === "object"
@@ -582,6 +666,9 @@ export function AppModals({
                     ? !!os[id]?.replied || !!os[id]?.cancelled
                     : ["accepted", "ambiguous"].includes(deliveryState),
               deliveryState,
+              deliveryReason: String(os[id]?.delivery_reason || ""),
+              deliveryEvidence: String(os[id]?.delivery_evidence || "") || undefined,
+              waitingReason: String(os[id]?.waiting_reason || "") || undefined,
               read: !!rs?.[id],
               replied: !!os[id]?.replied,
               replyRequested: !!os[id]?.reply_requested,
@@ -604,10 +691,28 @@ export function AppModals({
               cancelled: !!os["user"]?.cancelled,
             }
           : null,
+        // Chet takes a message in its own panel, which this Group's ledger does not
+        // record, so only a request's reply or cancellation is shown for it.
+        os[CHET_PRINCIPAL]?.reply_requested
+          ? {
+              id: CHET_PRINCIPAL,
+              label: CHET_NAME,
+              cleared: !!os[CHET_PRINCIPAL]?.replied || !!os[CHET_PRINCIPAL]?.cancelled,
+              deliveryState: "",
+              read: false,
+              replied: !!os[CHET_PRINCIPAL]?.replied,
+              replyRequested: true,
+              cancelled: !!os[CHET_PRINCIPAL]?.cancelled,
+            }
+          : null,
       ].filter(Boolean) as Array<{
         id: string;
+        label?: string;
         cleared: boolean;
         deliveryState: string;
+        deliveryReason?: string;
+        deliveryEvidence?: string;
+        waitingReason?: string;
         read: boolean;
         replied: boolean;
         replyRequested: boolean;
@@ -662,17 +767,78 @@ export function AppModals({
     };
   }, [actors, messageMetaEvent]);
 
+  const recipientsStatusRefreshRef = useRef<{ seq: number; controller: AbortController | null }>({
+    seq: 0,
+    controller: null,
+  });
+
+  const cancelMessageStatusRefresh = useCallback(() => {
+    recipientsStatusRefreshRef.current.seq += 1;
+    recipientsStatusRefreshRef.current.controller?.abort();
+    recipientsStatusRefreshRef.current.controller = null;
+  }, []);
+
   const refreshMessageStatus = useCallback(
-    async (eventId: string) => {
-      if (!selectedGroupId || !eventId) return;
-      const statusResp = await api.fetchLedgerStatuses(selectedGroupId, [eventId], {
-        noCache: true,
-      });
-      if (statusResp.ok) {
-        mergeEventStatuses(statusResp.result.statuses || {}, selectedGroupId);
+    async (eventId: string, options?: { groupId?: string; requireOpen?: boolean }) => {
+      const targetGroupId = String(options?.groupId ?? selectedGroupId ?? "").trim();
+      const targetEventId = String(eventId || "").trim();
+      if (!targetGroupId || !targetEventId) return;
+      cancelMessageStatusRefresh();
+      const seq = recipientsStatusRefreshRef.current.seq;
+      const controller = new AbortController();
+      recipientsStatusRefreshRef.current.controller = controller;
+      const beforeBucket = useGroupStore.getState().chatByGroup[targetGroupId];
+      const beforeEvent = findChatMessageInLists(
+        [
+          beforeBucket?.events,
+          beforeBucket?.chatWindow?.events,
+          beforeBucket?.senderHistory?.events,
+        ],
+        targetEventId,
+      );
+      try {
+        const statusResp = await api.fetchLedgerStatuses(targetGroupId, [targetEventId], {
+          noCache: true,
+          signal: controller.signal,
+        });
+        if (recipientsStatusRefreshRef.current.seq === seq) {
+          recipientsStatusRefreshRef.current.controller = null;
+        }
+        if (
+          !statusResp.ok ||
+          controller.signal.aborted ||
+          recipientsStatusRefreshRef.current.seq !== seq
+        ) {
+          return;
+        }
+        if (
+          options?.requireOpen &&
+          (useGroupStore.getState().selectedGroupId !== targetGroupId ||
+            useModalStore.getState().recipientsEventId !== targetEventId)
+        ) {
+          return;
+        }
+        const statuses: Record<string, LedgerEventStatusPayload> | undefined =
+          statusResp.result.statuses;
+        const rawStatus = statuses?.[targetEventId];
+        if (!rawStatus) return;
+        const liveBucket = useGroupStore.getState().chatByGroup[targetGroupId];
+        const liveEvent = findChatMessageInLists(
+          [liveBucket?.events, liveBucket?.chatWindow?.events, liveBucket?.senderHistory?.events],
+          targetEventId,
+        );
+        const nextStatus =
+          beforeEvent && liveEvent
+            ? keepLiveReceipts(rawStatus, beforeEvent, liveEvent)
+            : rawStatus;
+        mergeEventStatuses({ [targetEventId]: nextStatus }, targetGroupId);
+      } catch {
+        if (recipientsStatusRefreshRef.current.seq === seq) {
+          recipientsStatusRefreshRef.current.controller = null;
+        }
       }
     },
-    [mergeEventStatuses, selectedGroupId],
+    [cancelMessageStatusRefresh, mergeEventStatuses, selectedGroupId],
   );
 
   const handleDeliverMessage = useCallback(
@@ -680,6 +846,7 @@ export function AppModals({
       const targetGroupId = String(selectedGroupId || "").trim();
       const eventId = String(messageMeta?.sourceEventId || "").trim();
       if (!targetGroupId || !eventId || !actorId) return;
+      cancelMessageStatusRefresh();
       setMessageActionBusy(`deliver:${actorId}`);
       try {
         const resp = await api.deliverMessage(targetGroupId, eventId, [actorId], forceAmbiguous);
@@ -689,18 +856,30 @@ export function AppModals({
           }
           return;
         }
-        await refreshMessageStatus(eventId);
+        if (
+          useGroupStore.getState().selectedGroupId === targetGroupId &&
+          useModalStore.getState().recipientsEventId === eventId
+        ) {
+          await refreshMessageStatus(eventId, { groupId: targetGroupId, requireOpen: true });
+        }
       } finally {
         setMessageActionBusy("");
       }
     },
-    [messageMeta?.sourceEventId, refreshMessageStatus, selectedGroupId, showError],
+    [
+      cancelMessageStatusRefresh,
+      messageMeta?.sourceEventId,
+      refreshMessageStatus,
+      selectedGroupId,
+      showError,
+    ],
   );
 
   const handleCancelReplyRequest = useCallback(async () => {
     const targetGroupId = String(selectedGroupId || "").trim();
     const eventId = String(messageMeta?.sourceEventId || "").trim();
     if (!targetGroupId || !eventId) return;
+    cancelMessageStatusRefresh();
     setMessageActionBusy("cancel-reply");
     try {
       const resp = await api.cancelReplyRequest(targetGroupId, eventId);
@@ -710,11 +889,64 @@ export function AppModals({
         }
         return;
       }
-      await refreshMessageStatus(eventId);
+      if (
+        useGroupStore.getState().selectedGroupId === targetGroupId &&
+        useModalStore.getState().recipientsEventId === eventId
+      ) {
+        await refreshMessageStatus(eventId, { groupId: targetGroupId, requireOpen: true });
+      }
     } finally {
       setMessageActionBusy("");
     }
-  }, [messageMeta?.sourceEventId, refreshMessageStatus, selectedGroupId, showError]);
+  }, [
+    cancelMessageStatusRefresh,
+    messageMeta?.sourceEventId,
+    refreshMessageStatus,
+    selectedGroupId,
+    showError,
+  ]);
+
+  const recipientsSourceEventId = String(messageMeta?.sourceEventId || "").trim();
+  const recipientsLifecycleKey = useMemo(() => {
+    if (!selectedGroupId || !recipientsSourceEventId || !messageMeta) return "";
+    const selectedGroupMeta =
+      groups.find((g) => String(g.group_id || "") === selectedGroupId) || null;
+    const groupState = String(
+      (groupDoc?.group_id === selectedGroupId ? groupDoc.state : undefined) ??
+        selectedGroupMeta?.state ??
+        "",
+    );
+    const actorById = new Map(actors.map((actor) => [String(actor.id || ""), actor]));
+    const recipientStates = messageMeta.entries
+      .filter((entry) => entry.id !== "user" && entry.id !== CHET_PRINCIPAL)
+      .map((entry) => {
+        const actor = actorById.get(entry.id);
+        if (!actor) return `${entry.id}:missing`;
+        const enabled = actor.enabled === false ? "0" : "1";
+        const switching = hasPendingActorSwitch(groupDoc, actor, selectedGroupId) ? "1" : "0";
+        return `${entry.id}:${enabled}:${switching}`;
+      })
+      .sort()
+      .join("|");
+    return `${groupState}#${recipientStates}`;
+  }, [actors, groupDoc, groups, messageMeta, recipientsSourceEventId, selectedGroupId]);
+
+  useEffect(() => {
+    if (!selectedGroupId || !recipientsSourceEventId) return;
+    void refreshMessageStatus(recipientsSourceEventId, {
+      groupId: selectedGroupId,
+      requireOpen: true,
+    });
+    return () => {
+      cancelMessageStatusRefresh();
+    };
+  }, [
+    cancelMessageStatusRefresh,
+    recipientsLifecycleKey,
+    recipientsSourceEventId,
+    refreshMessageStatus,
+    selectedGroupId,
+  ]);
 
   // Handlers
   const handleUpdateSettings = async (settings: Partial<GroupSettings>): Promise<boolean> => {
@@ -794,7 +1026,11 @@ export function AppModals({
     try {
       const resp = await api.resetGroup(oldGroupId);
       if (!resp.ok) {
-        showError(`${resp.error.code}: ${resp.error.message}`);
+        showError(
+          resp.error.code === "actor_browser_busy"
+            ? t("runtimeSwitch.browserBusy")
+            : `${resp.error.code}: ${resp.error.message}`,
+        );
         return;
       }
       const result = resp.result || {};
@@ -891,6 +1127,52 @@ export function AppModals({
     );
   }, [presentationReferenceEvents, presentationViewer, selectedGroupId]);
 
+  const handleRelayMessage = async (dstGroupId: string, toTokens: string[], note: string) => {
+    const src = relaySourceEvent;
+    const srcGroupId = relaySourceGroupId;
+    const dstGroup = String(dstGroupId || "").trim();
+    const srcEventId = src?.id ? String(src.id) : "";
+    if (!src || !srcGroupId || !srcEventId) return;
+    if (!dstGroup) return;
+    if (dstGroup === srcGroupId) {
+      showError(t("destGroupDifferent"));
+      return;
+    }
+
+    const d = src.data as ChatMessageData | undefined;
+    const srcText = typeof d?.text === "string" ? d.text : "";
+    const srcInsight = getMessageInsight(d);
+    const srcQuoteText = typeof d?.quote_text === "string" ? d.quote_text.trim() : "";
+    const noteText = String(note || "").trim();
+    const relayBody = [noteText, String(srcText || "").trim()].filter(Boolean).join("\n\n");
+    const relayText = appendQuotedOriginalPerspective(relayBody, srcInsight, src.by || "sender");
+    if (!relayText.trim()) {
+      showError(t("relayTextEmpty"));
+      return;
+    }
+
+    const to = (toTokens || []).map((t) => String(t || "").trim()).filter((t) => t);
+
+    setBusy("relay");
+    try {
+      const resp = await api.relayMessage(
+        dstGroup,
+        relayText,
+        to,
+        { groupId: srcGroupId, eventId: srcEventId },
+        srcQuoteText,
+      );
+      if (!resp.ok) {
+        showError(`${resp.error.code}: ${resp.error.message}`);
+        return;
+      }
+      setRelayModal(null);
+      await refreshGroups();
+    } finally {
+      setBusy("");
+    }
+  };
+
   const handlePresentationPublishUrl = useCallback(
     async (payload: { slotId: string; url: string; title: string; summary: string }) => {
       const gid = String(selectedGroupId || "").trim();
@@ -904,23 +1186,18 @@ export function AppModals({
         }
         setGroupPresentation(resp.result.presentation);
         setPresentationPin(null);
-        if (preferredPresentationSurface === "split") {
-          setChatPresentationDockOpen(gid, true);
-        }
         setPresentationViewer({
           groupId: gid,
           slotId: resp.result.slot_id || payload.slotId,
-          surface: preferredPresentationSurface,
+          surface: "split",
         });
       } finally {
         setBusy("");
       }
     },
     [
-      preferredPresentationSurface,
       selectedGroupId,
       setBusy,
-      setChatPresentationDockOpen,
       setGroupPresentation,
       setPresentationPin,
       setPresentationViewer,
@@ -941,23 +1218,18 @@ export function AppModals({
         }
         setGroupPresentation(resp.result.presentation);
         setPresentationPin(null);
-        if (preferredPresentationSurface === "split") {
-          setChatPresentationDockOpen(gid, true);
-        }
         setPresentationViewer({
           groupId: gid,
           slotId: resp.result.slot_id || payload.slotId,
-          surface: preferredPresentationSurface,
+          surface: "split",
         });
       } finally {
         setBusy("");
       }
     },
     [
-      preferredPresentationSurface,
       selectedGroupId,
       setBusy,
-      setChatPresentationDockOpen,
       setGroupPresentation,
       setPresentationPin,
       setPresentationViewer,
@@ -978,23 +1250,18 @@ export function AppModals({
         }
         setGroupPresentation(resp.result.presentation);
         setPresentationPin(null);
-        if (preferredPresentationSurface === "split") {
-          setChatPresentationDockOpen(gid, true);
-        }
         setPresentationViewer({
           groupId: gid,
           slotId: resp.result.slot_id || payload.slotId,
-          surface: preferredPresentationSurface,
+          surface: "split",
         });
       } finally {
         setBusy("");
       }
     },
     [
-      preferredPresentationSurface,
       selectedGroupId,
       setBusy,
-      setChatPresentationDockOpen,
       setGroupPresentation,
       setPresentationPin,
       setPresentationViewer,
@@ -1128,6 +1395,19 @@ export function AppModals({
             ? () => setChatMobileSurface(selectedGroupId, "files")
             : undefined
         }
+        resources={
+          isSmallScreen && selectedGroupId && (resourcePanel.tabs.length || lastClosedResources)
+            ? {
+                open: resourcePanel.tabs.length,
+                onOpen: () => {
+                  const store = useResourcePanelStore.getState();
+                  if (resourcePanel.tabs.length) store.setOpen(selectedGroupId, true);
+                  else if (lastClosedResources)
+                    store.restore(selectedGroupId, lastClosedResources.id);
+                },
+              }
+            : undefined
+        }
         onThemeChange={onThemeChange}
         onTextScaleChange={onTextScaleChange}
         onOpenSearch={() => openModal("search")}
@@ -1152,20 +1432,33 @@ export function AppModals({
       />
 
       {modals.relay && relayEventId ? (
-        <RelayMessageModal
-          key={`${relaySourceGroupId}:${relayEventId}`}
-          isOpen={true}
-          srcGroupId={relaySourceGroupId}
-          srcEvent={relaySourceEvent}
-          srcEvents={relaySource?.events}
-          groups={groups}
-          onCancel={() => setRelayModal(null)}
-          onComplete={async () => {
-            relaySource?.onComplete?.();
-            setRelayModal(null);
-            await refreshGroups();
-          }}
-        />
+        relaySource?.events?.length ? (
+          <BatchRelayMessageModal
+            key={`${relaySourceGroupId}:${relayEventId}`}
+            isOpen={true}
+            srcGroupId={relaySourceGroupId}
+            srcEvent={relaySourceEvent}
+            srcEvents={relaySource?.events}
+            groups={groups}
+            onCancel={() => setRelayModal(null)}
+            onComplete={async () => {
+              relaySource?.onComplete?.();
+              setRelayModal(null);
+              await refreshGroups();
+            }}
+          />
+        ) : (
+          <RelayMessageModal
+            key={`${selectedGroupId}:${relayEventId}`}
+            isOpen={true}
+            busy={busy === "relay"}
+            srcGroupId={relaySourceGroupId}
+            srcEvent={relaySourceEvent}
+            groups={groups}
+            onCancel={() => setRelayModal(null)}
+            onSubmit={(dstGroupId, to, note) => void handleRelayMessage(dstGroupId, to, note)}
+          />
+        )
       ) : null}
 
       <SearchModal
@@ -1222,112 +1515,137 @@ export function AppModals({
       />
 
       {presentationViewerSlotIds.length > 0 ? (
-        <Suspense fallback={<LazyModalFallback isDark={isDark} />}>
-          {presentationViewerSlotIds.map((slotId) => {
-            const slot = findPresentationSlot(groupPresentation, slotId);
-            const version = String(slot?.card?.published_at || "empty").trim() || "empty";
-            return (
-              <PresentationViewerModal
-                key={`${selectedGroupId}:${slotId}:${version}`}
-                isOpen={
-                  !!presentationViewer &&
-                  presentationViewer.surface !== "split" &&
-                  presentationViewer.groupId === selectedGroupId &&
-                  presentationViewer.slotId === slotId
-                }
-                isDark={isDark}
-                readOnly={readOnly}
-                groupId={selectedGroupId}
-                slotId={slotId}
-                presentation={groupPresentation}
-                focusRef={
-                  presentationViewer?.groupId === selectedGroupId &&
-                  presentationViewer.slotId === slotId
-                    ? presentationViewer.focusRef || null
-                    : null
-                }
-                focusEventId={
-                  presentationViewer?.groupId === selectedGroupId &&
-                  presentationViewer.slotId === slotId
-                    ? presentationViewer.focusEventId || null
-                    : null
-                }
-                sourceEvent={
-                  presentationViewer?.groupId === selectedGroupId &&
-                  presentationViewer.slotId === slotId
-                    ? presentationViewerSourceEvent
-                    : null
-                }
-                onSelectSlot={(nextSlotId) =>
-                  setPresentationViewer({
-                    groupId: selectedGroupId,
-                    slotId: nextSlotId,
-                    surface: "modal",
-                  })
-                }
-                onPinSlot={(nextSlotId) => {
-                  setPresentationViewer(null);
-                  setPresentationPin({ groupId: selectedGroupId, slotId: nextSlotId });
-                }}
-                onQuoteInChat={handleQuotePresentationReference}
-                onOpenMessageContext={(eventId) =>
-                  void handleOpenPresentationMessageContext(eventId)
-                }
-                onReplyToMessage={(event) => void handleReplyToPresentationMessage(event)}
-                onReplaceSlot={(nextSlotId) => {
-                  const gid = String(selectedGroupId || "").trim();
-                  if (!gid || !nextSlotId) return;
-                  setPresentationViewer(null);
-                  setPresentationPin({ groupId: gid, slotId: nextSlotId });
-                }}
-                onClearSlot={(nextSlotId) => void handlePresentationClear(nextSlotId)}
-                supportsSplit={!isSmallScreen}
-                onOpenSplit={() => {
-                  const gid = String(selectedGroupId || "").trim();
-                  if (!gid || !presentationViewer) return;
-                  setChatPresentationDisplayMode(gid, "split");
-                  setChatPresentationDockOpen(gid, true);
-                  setPresentationViewer({ ...presentationViewer, surface: "split" });
-                }}
-                onClose={() => setPresentationViewer(null)}
-              />
-            );
-          })}
-        </Suspense>
+        <ErrorBoundary overlay>
+          <Suspense fallback={<LazyModalFallback />}>
+            {presentationViewerSlotIds.map((slotId) => {
+              const slot = findPresentationSlot(groupPresentation, slotId);
+              const version = String(slot?.card?.published_at || "empty").trim() || "empty";
+              return (
+                <PresentationViewerModal
+                  key={`${selectedGroupId}:${slotId}:${version}`}
+                  isOpen={
+                    !!presentationViewer &&
+                    presentationViewer.surface !== "split" &&
+                    presentationViewer.groupId === selectedGroupId &&
+                    presentationViewer.slotId === slotId
+                  }
+                  isDark={isDark}
+                  readOnly={readOnly}
+                  groupId={selectedGroupId}
+                  slotId={slotId}
+                  presentation={groupPresentation}
+                  reuseExistingSession={
+                    presentationViewer?.groupId === selectedGroupId &&
+                    presentationViewer.slotId === slotId &&
+                    presentationViewer.reuseExistingSession === true
+                  }
+                  focusRef={
+                    presentationViewer?.groupId === selectedGroupId &&
+                    presentationViewer.slotId === slotId
+                      ? presentationViewer.focusRef || null
+                      : null
+                  }
+                  focusEventId={
+                    presentationViewer?.groupId === selectedGroupId &&
+                    presentationViewer.slotId === slotId
+                      ? presentationViewer.focusEventId || null
+                      : null
+                  }
+                  sourceEvent={
+                    presentationViewer?.groupId === selectedGroupId &&
+                    presentationViewer.slotId === slotId
+                      ? presentationViewerSourceEvent
+                      : null
+                  }
+                  onSelectSlot={(nextSlotId) =>
+                    setPresentationViewer({
+                      groupId: selectedGroupId,
+                      slotId: nextSlotId,
+                      surface: "modal",
+                      reuseExistingSession: presentationViewer?.reuseExistingSession,
+                    })
+                  }
+                  onPinSlot={(nextSlotId) => {
+                    setPresentationViewer(null);
+                    setPresentationPin({ groupId: selectedGroupId, slotId: nextSlotId });
+                  }}
+                  onQuoteInChat={handleQuotePresentationReference}
+                  onOpenMessageContext={(eventId) =>
+                    void handleOpenPresentationMessageContext(eventId)
+                  }
+                  onReplyToMessage={(event) => void handleReplyToPresentationMessage(event)}
+                  onReplaceSlot={(nextSlotId) => {
+                    const gid = String(selectedGroupId || "").trim();
+                    if (!gid || !nextSlotId) return;
+                    setPresentationViewer(null);
+                    setPresentationPin({ groupId: gid, slotId: nextSlotId });
+                  }}
+                  onClearSlot={(nextSlotId) => void handlePresentationClear(nextSlotId)}
+                  supportsSplit={!isSmallScreen}
+                  onOpenSplit={() => {
+                    const gid = String(selectedGroupId || "").trim();
+                    if (!gid || !presentationViewer) return;
+                    setPresentationViewer({ ...presentationViewer, surface: "split" });
+                  }}
+                  onClose={() => setPresentationViewer(null)}
+                />
+              );
+            })}
+          </Suspense>
+        </ErrorBoundary>
       ) : null}
 
       {modals.context ? (
-        <Suspense fallback={<LazyModalFallback isDark={isDark} />}>
-          <ContextModal
-            isOpen={modals.context}
-            onClose={() => closeModal("context")}
-            groupId={selectedGroupId}
-            groupTitle={groupDoc?.group_id === selectedGroupId ? groupDoc.title : undefined}
-            context={groupContext}
-            initialTaskId={contextTaskId}
-            onInitialTaskHandled={clearContextTask}
-            onOpenContext={() => openContextModalData(fetchContext, selectedGroupId)}
-            onSyncContext={() => syncContextModalData(fetchContext, selectedGroupId)}
-            isDark={isDark}
-          />
-        </Suspense>
+        <ErrorBoundary overlay>
+          <Suspense fallback={<LazyModalFallback />}>
+            <ContextModal
+              isOpen={modals.context}
+              onClose={() => closeModal("context")}
+              groupId={selectedGroupId}
+              groupTitle={groupDoc?.group_id === selectedGroupId ? groupDoc.title : undefined}
+              context={groupContext}
+              initialTaskId={contextTaskId}
+              onInitialTaskHandled={clearContextTask}
+              onOpenContext={() => openContextModalData(fetchContext, selectedGroupId)}
+              onSyncContext={() => syncContextModalData(fetchContext, selectedGroupId)}
+              isDark={isDark}
+            />
+          </Suspense>
+        </ErrorBoundary>
       ) : null}
 
       {modals.settings ? (
-        <Suspense fallback={<LazyModalFallback isDark={isDark} />}>
-          <SettingsModal
-            codexVoice={codexVoice}
-            isOpen={modals.settings}
-            onClose={() => closeModal("settings")}
-            settings={groupSettings}
-            onUpdateSettings={handleUpdateSettings}
-            onRegistryChanged={refreshGroups}
-            busy={busy.startsWith("settings")}
-            isDark={isDark}
-            groupId={selectedGroupId}
-            groupDoc={groupDoc}
-          />
-        </Suspense>
+        <ErrorBoundary overlay>
+          <Suspense fallback={<LazyModalFallback />}>
+            <SettingsModal
+              codexVoice={codexVoice}
+              isOpen={modals.settings}
+              onClose={() => closeModal("settings")}
+              settings={groupSettings}
+              onUpdateSettings={handleUpdateSettings}
+              onRegistryChanged={refreshGroups}
+              busy={busy.startsWith("settings")}
+              isDark={isDark}
+              groupId={selectedGroupId}
+              groupDoc={groupDoc}
+              notificationsAllowed={notificationsAllowed === true}
+            />
+          </Suspense>
+        </ErrorBoundary>
+      ) : null}
+
+      {/* Opens over the panel it came from; closing it returns there. */}
+      {capabilityCenterGroupId !== null ? (
+        <ErrorBoundary overlay>
+          <Suspense fallback={<LazyModalFallback />}>
+            <CapabilityCenterWorkspace
+              isOpen
+              onClose={() => setCapabilityCenter(null)}
+              groupId={capabilityCenterGroupId}
+              isDark={isDark}
+            />
+          </Suspense>
+        </ErrorBoundary>
       ) : null}
 
       <RecipientsModal
@@ -1398,6 +1716,13 @@ export function AppModals({
         isDark={isDark}
         busy={busy}
         groupId={selectedGroupId || groupDoc?.group_id || ""}
+        scopes={groupDoc?.group_id === selectedGroupId ? groupDoc.scopes : undefined}
+        activeScopeKey={
+          groupDoc?.group_id === selectedGroupId ? groupDoc.active_scope_key : undefined
+        }
+        onScopeAttached={
+          groupDoc?.group_id === selectedGroupId ? handleActorScopeAttached : undefined
+        }
         actorId={editingActor?.id || ""}
         groupRole={editingActor?.role || "peer"}
         avatarUrl={editingActor?.avatar_url || undefined}
@@ -1416,10 +1741,13 @@ export function AppModals({
         actorNotes={editActorNotes}
         onChangeActorNotes={setEditActorNotes}
         actorNotesBusy={editActorNotesBusy}
+        actorNotesError={editActorNotesError}
+        onRetryActorNotes={retryEditActorNotes}
         capabilityAutoloadText={editActorCapabilityAutoloadText}
         onChangeCapabilityAutoloadText={setEditActorCapabilityAutoloadText}
         onSave={handleSaveEditActorOnly}
         onSaveAndRestart={handleSaveEditActorAndRestart}
+        onSaveBasics={handleSaveEditActorBasics}
         linkedProfileId={String(editingActor?.profile_id || "") || undefined}
         linkedProfileScope={
           (String(editingActor?.profile_scope || "global").trim() || "global") as "global" | "user"
@@ -1429,7 +1757,30 @@ export function AppModals({
         actorProfilesBusy={actorProfilesBusy}
         onRequestActorProfiles={loadActorProfiles}
         onSaveAsProfile={handleSaveEditActorAsProfile}
-        onAvatarChanged={refreshActors}
+        onAvatarChanged={async (updated, previous) => {
+          const current = useModalStore.getState().editingActor;
+          const sameVisit =
+            useGroupStore.getState().selectedGroupId === selectedGroupId &&
+            current &&
+            previous &&
+            current.updated_at === previous.updated_at &&
+            sameActorConfiguration(current, previous) &&
+            // Listing computes the effective role from Group order, while an
+            // actor_update response can contain the absent stored role.
+            sameActorConfiguration(previous, { ...updated, role: previous.role }) &&
+            typeof updated.updated_at === "string";
+          if (sameVisit) {
+            setEditingActor(
+              api.actorWithAvatar(selectedGroupId || "", {
+                ...current,
+                updated_at: updated.updated_at,
+                avatar_asset_path: updated.avatar_asset_path,
+              }),
+            );
+          }
+          await refreshActors(selectedGroupId || undefined);
+          return Boolean(sameVisit);
+        }}
         onCancel={handleCancelEditActor}
       />
 
@@ -1447,6 +1798,13 @@ export function AppModals({
         createGroupName={createGroupName}
         setCreateGroupName={setCreateGroupName}
         dirBrowseError={directoryBrowser.error}
+        dirCreateError={directoryBrowser.createError}
+        onClearDirCreateError={directoryBrowser.clearCreateError}
+        onRetryDir={
+          directoryBrowser.retryPath
+            ? () => void directoryBrowser.retryCreatedDirectory()
+            : undefined
+        }
         creatingDirectory={directoryBrowser.creating}
         onFetchDirContents={directoryBrowser.fetchContents}
         onCreateDirectory={directoryBrowser.createDirectory}
@@ -1456,11 +1814,22 @@ export function AppModals({
           closeModal("createGroup");
           resetCreateGroupForm();
           directoryBrowser.setError("");
+          directoryBrowser.clearCreateError();
         }}
       />
 
       <ActorConfigModal
+        key={`create-actor-${selectedGroupId}`}
         mode="create"
+        onSelectGroup={onSelectGroup}
+        groupId={selectedGroupId || groupDoc?.group_id || ""}
+        scopes={groupDoc?.group_id === selectedGroupId ? groupDoc.scopes : undefined}
+        activeScopeKey={
+          groupDoc?.group_id === selectedGroupId ? groupDoc.active_scope_key : undefined
+        }
+        onScopeAttached={
+          groupDoc?.group_id === selectedGroupId ? handleActorScopeAttached : undefined
+        }
         isOpen={modals.addActor}
         isDark={isDark}
         busy={busy}
@@ -1479,7 +1848,7 @@ export function AppModals({
         actorProfilesBusy={actorProfilesBusy}
         onRequestActorProfiles={loadActorProfiles}
         runtime={newActorRuntime}
-        onChangeRuntime={setNewActorRuntime}
+        onChangeRuntime={pickNewActorRuntime}
         command={newActorCommand}
         onChangeCommand={setNewActorCommand}
         useDefaultCommand={newActorUseDefaultCommand}

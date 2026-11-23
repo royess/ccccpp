@@ -61,33 +61,37 @@ async fn declared_context_tools_preserve_authority_recovery_and_query_semantics(
                 "missing {name}"
             );
         }
-        for (action, field) in [
-            ("add_decision", "recent_decisions"),
-            ("add_handoff", "recent_handoffs"),
-        ] {
-            payload(
-                &tool(
-                    &home,
-                    id,
-                    "peer",
-                    "cccc_coordination",
-                    json!({"action":action,"summary":"reviewed fixture"}),
-                )
-                .await,
-            );
-            let response = tool(
+        // Coordination notes were removed: the old actions fail as unsupported instead of
+        // turning into another operation, and `get` no longer carries note lists.
+        for action in ["add_decision", "add_handoff"] {
+            let removed = tool(
                 &home,
                 id,
                 "peer",
                 "cccc_coordination",
-                json!({"action":"get"}),
+                json!({"action":action,"summary":"reviewed fixture"}),
             )
             .await;
+            assert_eq!(removed["result"]["isError"], true, "{action}: {removed}");
             assert_eq!(
-                payload(&response)["coordination"][field][0]["summary"],
-                "reviewed fixture"
+                removed["result"]["structuredContent"]["error"]["message"],
+                format!("unsupported coordination action: {action}")
             );
         }
+        let response = tool(
+            &home,
+            id,
+            "peer",
+            "cccc_coordination",
+            json!({"action":"get"}),
+        )
+        .await;
+        let coordination = &payload(&response)["coordination"];
+        assert!(
+            coordination.get("recent_decisions").is_none()
+                && coordination.get("recent_handoffs").is_none(),
+            "{coordination}"
+        );
         payload(
             &tool(
                 &home,
@@ -200,6 +204,55 @@ async fn declared_context_tools_preserve_authority_recovery_and_query_semantics(
         .await;
         assert_eq!(payload(&state)["agent_state"]["hot"]["focus"], "fixture");
         assert!(payload(&state)["agent_state"].get("warm").is_none());
+        // A bound member reads another member's state by naming it; writes stay its own.
+        payload(
+            &tool(
+                &home,
+                id,
+                "lead",
+                "cccc_agent_state",
+                json!({"action":"update","focus":"lead fixture"}),
+            )
+            .await,
+        );
+        let other = tool(
+            &home,
+            id,
+            "peer",
+            "cccc_agent_state",
+            json!({"action":"get","actor_id":"lead","include_warm":false}),
+        )
+        .await;
+        assert_eq!(payload(&other)["agent_state"]["id"], "lead");
+        assert_eq!(payload(&other)["agent_state"]["hot"]["focus"], "lead fixture");
+        payload(
+            &tool(
+                &home,
+                id,
+                "peer",
+                "cccc_agent_state",
+                json!({"action":"update","actor_id":"lead","focus":"peer again"}),
+            )
+            .await,
+        );
+        let lead = tool(
+            &home,
+            id,
+            "lead",
+            "cccc_agent_state",
+            json!({"action":"get","include_warm":false}),
+        )
+        .await;
+        assert_eq!(payload(&lead)["agent_state"]["hot"]["focus"], "lead fixture");
+        let own = tool(
+            &home,
+            id,
+            "peer",
+            "cccc_agent_state",
+            json!({"action":"get","include_warm":false}),
+        )
+        .await;
+        assert_eq!(payload(&own)["agent_state"]["hot"]["focus"], "peer again");
         let path = groups
             .group_dir(id)
             .expect("group dir")
@@ -242,7 +295,8 @@ async fn declared_context_tools_preserve_authority_recovery_and_query_semantics(
 }
 
 /// A slice of one of our real boards, anonymized: a run of consecutive tasks
-/// with the board's brief, recent decisions and all its Actor states. Every
+/// with the board's brief, its stored decision notes (a removed feature, kept
+/// in the file and never returned) and all its Actor states. Every
 /// letter and digit of free text is replaced (`x`, `X`, `0`), Actor and task
 /// ids are renumbered, and the clock is shifted to start on 2000-01-01;
 /// statuses, fields, checklists, line breaks, punctuation, the byte length of
@@ -303,7 +357,15 @@ async fn context_get_pages_a_captured_board_within_its_byte_bound() {
     let home = HomeLayout::from_path(temp.path()).expect("home");
     let groups = GroupStore::new(home.clone()).expect("groups");
     let mut group = groups.create("captured context", "").expect("group");
-    for id in ["lead", "peer"] {
+    // The Actors whose states the board captured are in the Group: a read returns
+    // states only for current members.
+    let captured: Value = serde_json::from_str(CAPTURED_CONTEXT).expect("captured context");
+    let members = captured["agent_states"]
+        .as_array()
+        .expect("captured states")
+        .iter()
+        .map(|state| state["actor_id"].as_str().expect("state owner"));
+    for id in ["lead", "peer"].into_iter().chain(members) {
         cccc_core::actors::add(&mut group, cccc_contracts::Actor::new(id)).expect("actor");
     }
     groups.save(&group).expect("save group");
@@ -503,4 +565,355 @@ async fn context_get_pages_a_captured_board_within_its_byte_bound() {
     daemon_task.abort();
     let _ = daemon_task.await;
     outcome.expect("bounded context assertions");
+}
+
+/// The ids of a list of task rows, in order.
+fn row_ids(rows: &Value) -> Vec<&str> {
+    rows.as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["id"].as_str().expect("id"))
+        .collect()
+}
+
+/// Task rows through the real daemon: it filters by text and attention and returns its task
+/// version with the unpaged list, the MCP pages the rows, and `task_id` reads a task in full.
+#[tokio::test]
+async fn task_rows_filter_page_and_keep_the_task_version_through_the_daemon() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path()).expect("home");
+    let groups = GroupStore::new(home.clone()).expect("groups");
+    let mut group = groups.create("task rows", "").expect("group");
+    cccc_core::actors::add(&mut group, cccc_contracts::Actor::new("lead")).expect("actor");
+    groups.save(&group).expect("save group");
+    let daemon_home = home.clone();
+    let daemon_task = tokio::spawn(async move { cccc_daemon::run(daemon_home).await });
+    let client = cccc_client::DaemonClient::new(home.clone());
+    for _ in 0..100 {
+        let ping = cccc_contracts::DaemonRequest {
+            v: 1,
+            op: "ping".into(),
+            args: Default::default(),
+        };
+        if client.call(&ping).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let outcome = tokio::spawn(async move {
+        let id = group.group_id.as_str();
+        // T001 to T006: title, further fields, and the status each moves to.
+        let board = [
+            (
+                "parser: ship v1",
+                json!({"notes":"Full notes stay behind task_id."}),
+                Some("done"),
+            ),
+            ("guide: first draft", json!({"waiting_on":"user"}), None),
+            ("cache: tune eviction", json!({}), Some("active")),
+            (
+                "parser: review",
+                json!({"blocked_by":["T003"],"notes":"Review after the cache work."}),
+                None,
+            ),
+            ("parser: old idea", json!({}), Some("archived")),
+            (
+                "parser: fix the crash",
+                json!({"checklist":[{"text":"reproduce","status":"done"},{"text":"patch"}]}),
+                Some("active"),
+            ),
+        ];
+        for (index, (title, fields, status)) in board.into_iter().enumerate() {
+            let task_id = format!("T{:03}", index + 1);
+            let mut create = json!({"action":"create","title":title});
+            create
+                .as_object_mut()
+                .expect("create")
+                .extend(fields.as_object().expect("fields").clone());
+            let created = tool(&home, id, "lead", "cccc_task", create).await;
+            assert_eq!(payload(&created)["changes"][0]["task_id"], task_id);
+            if let Some(status) = status {
+                payload(
+                    &tool(
+                        &home,
+                        id,
+                        "lead",
+                        "cccc_task",
+                        json!({"action":"move","task_id":task_id,"status":status}),
+                    )
+                    .await,
+                );
+            }
+        }
+
+        // By default: open tasks as rows, every status counted.
+        let list = tool(&home, id, "lead", "cccc_task", json!({"action":"list"})).await;
+        let list = payload(&list).clone();
+        let mut open = row_ids(&list["tasks"]);
+        open.sort_unstable();
+        assert_eq!(open, ["T002", "T003", "T004", "T006"]);
+        assert_eq!(list["statuses"], json!(["planned", "active"]));
+        assert_eq!(
+            list["counts"],
+            json!({"planned":2,"active":2,"done":1,"archived":1})
+        );
+        assert_eq!(list["has_more"], false);
+        let version = list["tasks_version"]
+            .as_str()
+            .expect("tasks_version")
+            .to_owned();
+        let rows = list["tasks"].as_array().expect("rows");
+        assert!(rows.iter().all(|row| row.get("notes").is_none()), "{list}");
+        let row = |task_id: &str| {
+            rows.iter()
+                .find(|row| row["id"] == task_id)
+                .expect("row")
+                .clone()
+        };
+        assert_eq!(row("T002")["waiting_on"], "user");
+        assert_eq!(row("T004")["blocked_by"], json!(["T003"]));
+        assert_eq!(row("T006")["checklist"], "1/2");
+
+        // A query reaches the daemon and also finds done work; archived work is only counted.
+        // The MCP pages what the daemon matched.
+        let first = tool(
+            &home,
+            id,
+            "lead",
+            "cccc_task",
+            json!({"action":"list","query":"parser","limit":2}),
+        )
+        .await;
+        let first = payload(&first).clone();
+        let second = tool(
+            &home,
+            id,
+            "lead",
+            "cccc_task",
+            json!({"action":"list","query":"parser","limit":2,"offset":2}),
+        )
+        .await;
+        let second = payload(&second).clone();
+        assert_eq!(first["statuses"], json!(["planned", "active", "done"]));
+        assert_eq!(
+            first["counts"],
+            json!({"planned":1,"active":1,"done":1,"archived":1})
+        );
+        assert_eq!(
+            (&first["total"], &first["has_more"]),
+            (&json!(3), &json!(true))
+        );
+        assert_eq!(second["has_more"], false);
+        let mut found = row_ids(&first["tasks"]);
+        found.extend(row_ids(&second["tasks"]));
+        found.sort_unstable();
+        assert_eq!(found, ["T001", "T004", "T006"]);
+        assert_eq!(first["tasks_version"], version);
+        assert_eq!(second["tasks_version"], version);
+
+        // Some clients send unused optional fields as null or blank. These still
+        // mean a filtered list, not an exact lookup that drops daemon filters.
+        for task_id in [Value::Null, json!(""), json!("  \t")] {
+            let response = tool(
+                &home,
+                id,
+                "lead",
+                "cccc_task",
+                json!({"action":"list","task_id":task_id,"query":"parser"}),
+            )
+            .await;
+            let mut found = row_ids(&payload(&response)["tasks"]);
+            found.sort_unstable();
+            assert_eq!(found, ["T001", "T004", "T006"]);
+
+            let response = tool(
+                &home,
+                id,
+                "lead",
+                "cccc_task",
+                json!({"action":"list","task_id":task_id,"attention":"blocked"}),
+            )
+            .await;
+            assert_eq!(row_ids(&payload(&response)["tasks"]), ["T004"]);
+
+            let response = tool(
+                &home,
+                id,
+                "lead",
+                "cccc_task",
+                json!({"action":"list","task_id":task_id,"assignee":"no-such-member"}),
+            )
+            .await;
+            assert!(row_ids(&payload(&response)["tasks"]).is_empty());
+        }
+        let invalid_id = tool(
+            &home,
+            id,
+            "lead",
+            "cccc_task",
+            json!({"action":"list","task_id":123,"query":"parser"}),
+        )
+        .await;
+        assert_eq!(invalid_id["result"]["isError"], true, "{invalid_id}");
+        assert_eq!(
+            invalid_id["result"]["structuredContent"]["error"]["code"],
+            "invalid_args"
+        );
+
+        for (attention, expected) in [("blocked", "T004"), ("waiting_user", "T002")] {
+            let response = tool(
+                &home,
+                id,
+                "lead",
+                "cccc_task",
+                json!({"action":"list","attention":attention}),
+            )
+            .await;
+            assert_eq!(
+                row_ids(&payload(&response)["tasks"]),
+                [expected],
+                "{attention}"
+            );
+        }
+
+        // Coordination names the same tasks as short rows and carries no task list.
+        let coordination = tool(
+            &home,
+            id,
+            "lead",
+            "cccc_coordination",
+            json!({"action":"get"}),
+        )
+        .await;
+        let coordination = payload(&coordination);
+        assert!(coordination["coordination"].get("tasks").is_none());
+        assert_eq!(row_ids(&coordination["attention"]["blocked"]), ["T004"]);
+        assert!(
+            coordination["attention"]["blocked"][0]
+                .get("notes")
+                .is_none()
+        );
+        // Its total leaves out archived work, which has its own count.
+        assert_eq!(coordination["tasks_summary"]["total"], 5);
+        assert_eq!(coordination["tasks_summary"]["archived"], 1);
+
+        // A write changes the version; task_id reads the whole task.
+        payload(
+            &tool(
+                &home,
+                id,
+                "lead",
+                "cccc_task",
+                json!({"action":"update","task_id":"T003","notes":"Evict by size."}),
+            )
+            .await,
+        );
+        let after = tool(&home, id, "lead", "cccc_task", json!({"action":"list"})).await;
+        let after = payload(&after)["tasks_version"]
+            .as_str()
+            .expect("tasks_version");
+        assert_ne!(after, version);
+        let full = tool(
+            &home,
+            id,
+            "lead",
+            "cccc_task",
+            json!({"action":"list","task_id":"T001"}),
+        )
+        .await;
+        assert_eq!(
+            payload(&full)["task"]["notes"],
+            "Full notes stay behind task_id."
+        );
+        let full = tool(
+            &home,
+            id,
+            "lead",
+            "cccc_task",
+            json!({"action":"list","task_id":"T006"}),
+        )
+        .await;
+        assert_eq!(payload(&full)["task"]["checklist"][1]["text"], "patch");
+    })
+    .await;
+    daemon_task.abort();
+    let _ = daemon_task.await;
+    outcome.expect("task row assertions");
+}
+
+cccc_daemon::session_owner_test_entry!();
+
+#[tokio::test]
+async fn bound_agent_state_read_ignores_a_different_runtime_actor() {
+    // A binding can run in a process whose environment names another actor. Only a target the
+    // caller gave may move the read; the environment's actor must not.
+    const CHILD: &str = "CCCC_AGENT_STATE_ENV_FIXTURE";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .args([
+                "--exact",
+                "bound_agent_state_read_ignores_a_different_runtime_actor",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CCCC_ACTOR_ID", "lead")
+            .env_remove("CCCC_GROUP_ID")
+            .output()
+            .expect("isolated child");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path()).expect("home");
+    let groups = GroupStore::new(home.clone()).expect("groups");
+    let mut group = groups.create("agent state env", "").expect("group");
+    for id in ["lead", "peer"] {
+        cccc_core::actors::add(&mut group, cccc_contracts::Actor::new(id)).expect("actor");
+    }
+    groups.save(&group).expect("save group");
+    let daemon_home = home.clone();
+    let daemon_task = tokio::spawn(async move { cccc_daemon::run(daemon_home).await });
+    let client = cccc_client::DaemonClient::new(home.clone());
+    for _ in 0..100 {
+        let ping = cccc_contracts::DaemonRequest {
+            v: 1,
+            op: "ping".into(),
+            args: Default::default(),
+        };
+        if client.call(&ping).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let id = group.group_id.as_str();
+    for (actor, focus) in [("lead", "lead focus"), ("peer", "peer focus")] {
+        payload(
+            &tool(
+                &home,
+                id,
+                actor,
+                "cccc_agent_state",
+                json!({"action":"update","focus":focus}),
+            )
+            .await,
+        );
+    }
+    let own = tool(
+        &home,
+        id,
+        "peer",
+        "cccc_agent_state",
+        json!({"action":"get","include_warm":false}),
+    )
+    .await;
+    let state = &payload(&own)["agent_state"];
+    assert_eq!(state["id"], "peer");
+    assert_eq!(state["hot"]["focus"], "peer focus");
+    daemon_task.abort();
+    let _ = daemon_task.await;
 }

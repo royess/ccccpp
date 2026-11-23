@@ -1,9 +1,11 @@
 import type {
   AutomationRuleSet,
+  BacklogSource,
+  AutomationRunResult,
   CapabilityBlockEntry,
+  CapabilityDomain,
   CapabilityImportRecord,
   CapabilityOverviewItem,
-  CapabilitySourceInstance,
   CapabilitySourceState,
   CapabilityStateResult,
   ContextDetailLevel,
@@ -14,20 +16,24 @@ import type {
   LedgerEvent,
   MessageMode,
   MessageRef,
-  Task,
+  TaskChecklistItem,
+  TaskWaitingOn,
 } from "../../types";
 import {
   apiForm,
   apiJson,
   ApiResponse,
+  asRecord,
   capabilityStateRequestKey,
   clearCapabilityStateRequests,
   clearContextRequest,
   contextRequestKey,
   FetchContextOptions,
+  isTaskRevision,
   normalizeContext,
   reuseSharedReadRequest,
 } from "./base";
+import { fetchTaskById } from "./tasks";
 
 export async function fetchContext(groupId: string, opts?: FetchContextOptions) {
   const gid = String(groupId || "").trim();
@@ -43,7 +49,7 @@ export async function fetchContext(groupId: string, opts?: FetchContextOptions) 
     if (opts?.noCache || opts?.signal) {
       return apiJson<unknown>(
         `/api/v1/groups/${encodeURIComponent(gid)}/context?${params.toString()}`,
-        { signal: opts?.signal },
+        { signal: opts?.signal, cache: "no-store" },
       ).then((resp) => {
         if (!resp.ok) return resp as ApiResponse<GroupContext>;
         return { ok: true, result: normalizeContext(resp.result) } as ApiResponse<GroupContext>;
@@ -52,6 +58,7 @@ export async function fetchContext(groupId: string, opts?: FetchContextOptions) 
     return reuseSharedReadRequest(contextRequestKey(gid, detail), async () => {
       const resp = await apiJson<unknown>(
         `/api/v1/groups/${encodeURIComponent(gid)}/context?${params.toString()}`,
+        { cache: "no-store" },
       );
       if (!resp.ok) return resp as ApiResponse<GroupContext>;
       return { ok: true, result: normalizeContext(resp.result) } as ApiResponse<GroupContext>;
@@ -81,16 +88,67 @@ export async function contextSync(
   groupId: string,
   ops: Array<Record<string, unknown>>,
   dryRun: boolean = false,
+  ifVersion?: string,
 ) {
   clearContextRequest(groupId);
   try {
-    return await apiJson(`/api/v1/groups/${encodeURIComponent(groupId)}/context`, {
-      method: "POST",
-      body: JSON.stringify({ ops, by: "user", dry_run: dryRun }),
-    });
+    const response = await apiJson<unknown>(
+      `/api/v1/groups/${encodeURIComponent(groupId)}/context`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ops,
+          by: "user",
+          dry_run: dryRun,
+          ...(ifVersion !== undefined ? { if_version: ifVersion } : {}),
+        }),
+      },
+    );
+    // A successful HTTP status alone cannot prove a task write. In particular,
+    // an empty response must not cause an editor to discard its draft.
+    if (
+      response.ok &&
+      ops.some((op) => typeof op.op === "string" && op.op.startsWith("task.")) &&
+      !taskReceiptConfirmed(response.result, ops, dryRun)
+    ) {
+      return {
+        ok: false,
+        error: {
+          code: "task_receipt_unconfirmed",
+          message:
+            "The task change could not be confirmed. It may have been applied; check the latest state before trying again.",
+        },
+      } as ApiResponse<never>;
+    }
+    return response;
   } finally {
     clearContextRequest(groupId);
   }
+}
+
+function taskReceiptConfirmed(
+  value: unknown,
+  ops: Array<Record<string, unknown>>,
+  dryRun: boolean,
+): boolean {
+  const result = asRecord(value);
+  if (
+    result?.success !== true ||
+    result.dry_run !== dryRun ||
+    !Array.isArray(result.changes) ||
+    result.changes.length !== ops.length
+  )
+    return false;
+  const changes = result.changes;
+  return ops.every((op, index) => {
+    const change = asRecord(changes[index]);
+    return (
+      change?.index === index &&
+      change.op === op.op &&
+      (op.op !== "task.create" ||
+        (typeof change.task_id === "string" && change.task_id.trim().length > 0))
+    );
+  });
 }
 
 export async function updateCoordinationBrief(groupId: string, brief: CoordinationBrief) {
@@ -104,55 +162,166 @@ export async function updateCoordinationBrief(groupId: string, brief: Coordinati
   return contextSync(groupId, [op]);
 }
 
-export async function addCoordinationNote(
-  groupId: string,
-  kind: "decision" | "handoff",
-  summary: string,
-  taskId?: string | null,
-) {
-  const op: Record<string, unknown> = {
-    op: "coordination.note.add",
-    kind,
-    summary: String(summary || ""),
+function revisionUnavailable(): ApiResponse<never> {
+  return {
+    ok: false,
+    error: {
+      code: "task_revision_unavailable",
+      message: "The task revision is unavailable. Reload the task before trying again.",
+    },
   };
-  if (taskId) op.task_id = String(taskId || "");
-  return contextSync(groupId, [op]);
 }
 
-export async function updateCoordinationTask(groupId: string, task: Task) {
-  const resolvedTaskType =
-    String(task.task_type || "").trim() ||
-    (String(task.parent_id || "").trim() ? "free" : "standard");
-  const updateOp: Record<string, unknown> = {
-    op: "task.update",
-    task_id: task.id,
-    title: String(task.title || ""),
-    outcome: String(task.outcome || ""),
-    assignee: task.assignee || null,
-    priority: String(task.priority || ""),
-    parent_id: task.parent_id || null,
-    blocked_by: Array.isArray(task.blocked_by) ? task.blocked_by : [],
-    waiting_on: String(task.waiting_on || "none"),
-    handoff_to: task.handoff_to || null,
-    task_type: resolvedTaskType,
-    notes: String(task.notes || ""),
-    checklist: Array.isArray(task.checklist)
-      ? task.checklist.map((item, index) => ({
-          id: String(item.id || `item-${index + 1}`),
-          text: String(item.text || ""),
-          status: String(item.status || "pending"),
-        }))
-      : [],
+function deleteReadFailure(error: {
+  code: string;
+  message: string;
+  details?: unknown;
+}): ApiResponse<never> {
+  if (["task_not_found", "permission_denied", "group_not_found"].includes(error.code)) {
+    return { ok: false, error };
+  }
+  return {
+    ok: false,
+    error: {
+      code: "task_delete_check_unavailable",
+      message: "Could not check the task before deletion. Nothing was deleted; try again.",
+    },
   };
-  const ops: Array<Record<string, unknown>> = [updateOp];
-  if (task.status) {
-    ops.push({ op: "task.move", task_id: task.id, status: String(task.status || "planned") });
+}
+
+export type TaskUpdatePatch = Partial<{
+  title: string;
+  outcome: string;
+  assignee: string | null;
+  priority: string | null;
+  parent_id: string | null;
+  blocked_by: string[];
+  waiting_on: TaskWaitingOn;
+  handoff_to: string | null;
+  task_type: string;
+  notes: string;
+  checklist: TaskChecklistItem[];
+  status: string;
+  /** null removes the link; the entry itself is not changed. */
+  source: BacklogSource | null;
+}>;
+
+export async function updateCoordinationTask(
+  groupId: string,
+  taskId: string,
+  patch: TaskUpdatePatch,
+  expectedRev: number | undefined,
+): Promise<ApiResponse<unknown>> {
+  const fields = [
+    "title",
+    "outcome",
+    "assignee",
+    "priority",
+    "parent_id",
+    "blocked_by",
+    "waiting_on",
+    "handoff_to",
+    "task_type",
+    "notes",
+    "checklist",
+    "source",
+  ] as const;
+  const update: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (patch[field] !== undefined) {
+      // The task.update contract uses a string, including "" for no priority.
+      update[field] = field === "priority" ? patch.priority || "" : patch[field];
+    }
+  }
+  if (Object.keys(update).length === 0 && patch.status === undefined) {
+    return { ok: true, result: {} };
+  }
+  if (!isTaskRevision(expectedRev)) return revisionUnavailable();
+
+  const ops: Array<Record<string, unknown>> = [];
+  if (Object.keys(update).length > 0) {
+    ops.push({ op: "task.update", task_id: taskId, if_task_rev: expectedRev, ...update });
+  }
+  if (patch.status !== undefined) {
+    ops.push({
+      op: "task.move",
+      task_id: taskId,
+      status: patch.status,
+      ...(ops.length === 0 ? { if_task_rev: expectedRev } : {}),
+    });
   }
   return contextSync(groupId, ops);
 }
 
-export async function deleteCoordinationTask(groupId: string, taskId: string) {
-  return contextSync(groupId, [{ op: "task.delete", task_id: String(taskId || "") }]);
+export async function moveCoordinationTask(
+  groupId: string,
+  taskId: string,
+  status: string,
+  expectedRev: number | undefined,
+) {
+  if (!isTaskRevision(expectedRev)) return revisionUnavailable();
+  return contextSync(groupId, [
+    { op: "task.move", task_id: String(taskId || ""), status, if_task_rev: expectedRev },
+  ]);
+}
+
+export async function restoreCoordinationTask(
+  groupId: string,
+  taskId: string,
+  expectedRev: number | undefined,
+) {
+  if (!isTaskRevision(expectedRev)) return revisionUnavailable();
+  return contextSync(groupId, [
+    { op: "task.restore", task_id: String(taskId || ""), if_task_rev: expectedRev },
+  ]);
+}
+
+export async function deleteCoordinationTaskConfirmed(
+  groupId: string,
+  taskId: string,
+  confirmed: { rev: number | undefined; total: number; tasksVersion: string },
+) {
+  if (
+    !isTaskRevision(confirmed.rev) ||
+    !Number.isSafeInteger(confirmed.total) ||
+    confirmed.total < 1 ||
+    !confirmed.tasksVersion
+  )
+    return revisionUnavailable();
+
+  const changed = (): ApiResponse<never> => ({
+    ok: false,
+    error: {
+      code: "task_changed",
+      message: "The state changed. Reload the task and confirm again.",
+    },
+  });
+
+  // The confirmation came from one task-list snapshot. A root revision by
+  // itself cannot detect a new or replaced child in its deletion subtree.
+  const task = await fetchTaskById(groupId, taskId);
+  if (!task.ok) return deleteReadFailure(task.error);
+  if (
+    task.result.tasksVersion !== confirmed.tasksVersion ||
+    task.result.task.rev !== confirmed.rev ||
+    task.result.deleteInfo.total !== confirmed.total ||
+    !task.result.deleteInfo.allowed
+  )
+    return changed();
+
+  // Pair that task snapshot with a whole-context revision from the same task
+  // generation. The daemon checks if_version and if_task_rev under one lock.
+  const context = await fetchContext(groupId, { fresh: true, detail: "summary", noCache: true });
+  if (!context.ok) return deleteReadFailure(context.error);
+  if (!context.result.version || !context.result.tasks_version) return revisionUnavailable();
+  if (context.result.tasks_version !== task.result.tasksVersion) return changed();
+  const response = await contextSync(
+    groupId,
+    [{ op: "task.delete", task_id: String(taskId || ""), if_task_rev: confirmed.rev }],
+    false,
+    context.result.version,
+  );
+  return !response.ok && response.error.code === "version_conflict" ? changed() : response;
 }
 
 export async function fetchSettings(groupId: string, init?: RequestInit & { noCache?: boolean }) {
@@ -171,9 +340,11 @@ export async function fetchCapabilityOverview(opts?: {
   policy?: "all" | "actionable" | "blocked" | "indexed";
   sourceId?: string;
   groupId?: string;
-  includeSourceInstances?: boolean;
+  /** The language the daemon localizes release recommendations into. */
+  locale?: string;
 }) {
   const params = new URLSearchParams();
+  if (String(opts?.locale || "").trim()) params.set("locale", String(opts?.locale || "").trim());
   if (String(opts?.query || "").trim()) params.set("query", String(opts?.query || "").trim());
   if (typeof opts?.limit === "number" && Number.isFinite(opts.limit)) {
     params.set("limit", String(Math.max(1, Math.trunc(opts.limit))));
@@ -183,9 +354,6 @@ export async function fetchCapabilityOverview(opts?: {
   }
   if (typeof opts?.includeIndexed === "boolean") {
     params.set("include_indexed", opts.includeIndexed ? "true" : "false");
-  }
-  if (typeof opts?.includeSourceInstances === "boolean") {
-    params.set("include_source_instances", opts.includeSourceInstances ? "true" : "false");
   }
   if (String(opts?.kind || "").trim() && String(opts?.kind || "").trim() !== "all") {
     params.set("kind", String(opts?.kind || "").trim());
@@ -209,10 +377,13 @@ export async function fetchCapabilityOverview(opts?: {
     has_more: boolean;
     query?: string;
     kind_counts?: { skill?: number; mcp?: number; pack?: number };
+    /** Matches of the query enabled for the user in the Group, across every page. */
+    enabled_count?: number;
     sources?: Record<string, CapabilitySourceState>;
-    source_instances?: CapabilitySourceInstance[];
     blocked_capabilities?: CapabilityBlockEntry[];
     allowlist_revision?: string;
+    /** The release's recommendation areas, in its order and in the requested language. */
+    domains?: CapabilityDomain[];
   }>(`/api/v1/capabilities/overview${suffix}`);
 }
 
@@ -231,35 +402,13 @@ export async function fetchCapabilityAllowlist() {
   }>(`/api/v1/capabilities/allowlist?by=user`);
 }
 
-export async function updateCapabilityAllowlist(args: {
-  patch?: Record<string, unknown>;
-  overlay?: Record<string, unknown>;
-  mode?: "patch" | "replace";
-  expectedRevision?: string;
-}) {
-  const body: Record<string, unknown> = { by: "user", mode: args.mode || "patch" };
-  if (args.patch) body.patch = args.patch;
-  if (args.overlay) body.overlay = args.overlay;
-  if (String(args.expectedRevision || "").trim()) {
-    body.expected_revision = String(args.expectedRevision || "").trim();
-  }
-  return apiJson<{
-    updated: boolean;
-    revision: string;
-    default: Record<string, unknown>;
-    overlay: Record<string, unknown>;
-    effective: Record<string, unknown>;
-    policy_source?: string;
-    policy_error?: string;
-    external_capability_safety_mode?: string;
-  }>(`/api/v1/capabilities/allowlist`, { method: "PUT", body: JSON.stringify(body) });
-}
-
-export async function blockCapabilityGlobal(
+/** Blocks everywhere by default; a block an agent set for one Group is lifted with scope "group". */
+export async function setCapabilityBlocked(
   capabilityId: string,
   blocked: boolean,
   reason: string = "",
   groupId?: string,
+  scope: "global" | "group" = "global",
 ) {
   const body: Record<string, unknown> = {
     by: "user",
@@ -267,7 +416,7 @@ export async function blockCapabilityGlobal(
     capability_id: capabilityId,
     blocked,
     reason,
-    scope: "global",
+    scope,
   };
   if (String(groupId || "").trim()) body.group_id = String(groupId || "").trim();
   clearCapabilityStateRequests(groupId);
@@ -275,6 +424,33 @@ export async function blockCapabilityGlobal(
     return await apiJson<Record<string, unknown>>(`/api/v1/capabilities/block`, {
       method: "POST",
       body: JSON.stringify(body),
+    });
+  } finally {
+    clearCapabilityStateRequests(groupId);
+  }
+}
+
+/** Replaces the one global installation of an MCP; the fingerprint is the one the user reviewed. */
+export async function updateCapabilityInstallation(
+  capabilityId: string,
+  expectedRecipeFingerprint: string,
+  groupId?: string,
+) {
+  clearCapabilityStateRequests(groupId);
+  try {
+    return await apiJson<{
+      capability_id: string;
+      updated: boolean;
+      state: string;
+      enabled_group_count?: number;
+      refresh_required?: boolean;
+    }>(`/api/v1/capabilities/update`, {
+      method: "POST",
+      body: JSON.stringify({
+        by: "user",
+        capability_id: capabilityId,
+        expected_recipe_fingerprint: expectedRecipeFingerprint,
+      }),
     });
   } finally {
     clearCapabilityStateRequests(groupId);
@@ -329,7 +505,6 @@ export async function enableGroupCapability(
     actorId?: string;
     ttlSeconds?: number;
     reason?: string;
-    cleanup?: boolean;
   },
 ) {
   clearCapabilityStateRequests(groupId);
@@ -345,7 +520,6 @@ export async function enableGroupCapability(
           actor_id: opts?.actorId || "user",
           ttl_seconds: opts?.ttlSeconds || 3600,
           reason: opts?.reason || "",
-          cleanup: opts?.cleanup || false,
         }),
       },
     );
@@ -399,7 +573,7 @@ export async function useGroupCapability(
     reason: args.reason || "",
   };
   if (String(args.toolName || "").trim()) body.tool_name = String(args.toolName || "").trim();
-  if (args.toolArguments) body.tool_arguments = args.toolArguments;
+  if (args.toolArguments) body.arguments = args.toolArguments;
   clearCapabilityStateRequests(groupId);
   try {
     return await apiJson<Record<string, unknown>>(
@@ -501,7 +675,7 @@ export async function uninstallCapability(
 export async function deleteCapabilitySource(
   groupId: string,
   sourceId: string,
-  opts?: { actorId?: string; reason?: string; sourceInstanceKey?: string },
+  opts?: { actorId?: string; reason?: string },
 ) {
   return apiJson<Record<string, unknown>>(
     `/api/v1/groups/${encodeURIComponent(groupId)}/capabilities/sources/delete`,
@@ -509,7 +683,6 @@ export async function deleteCapabilitySource(
       method: "POST",
       body: JSON.stringify({
         source_id: sourceId,
-        source_instance_key: opts?.sourceInstanceKey || "",
         actor_id: opts?.actorId || "user",
         reason: opts?.reason || "",
       }),
@@ -562,6 +735,17 @@ export async function manageAutomation(
   );
 }
 
+export async function runAutomationRule(groupId: string, ruleId: string, expectedVersion?: number) {
+  const body: Record<string, unknown> = { rule_id: ruleId, by: "user" };
+  if (typeof expectedVersion === "number" && Number.isFinite(expectedVersion)) {
+    body.expected_version = Math.trunc(expectedVersion);
+  }
+  return apiJson<AutomationRunResult>(
+    `/api/v1/groups/${encodeURIComponent(groupId)}/automation/run`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
 export async function resetAutomationBaseline(groupId: string, expectedVersion?: number) {
   const body: Record<string, unknown> = { by: "user" };
   if (typeof expectedVersion === "number" && Number.isFinite(expectedVersion)) {
@@ -606,6 +790,7 @@ export async function sendMessage(
   messageMode: MessageMode = "send",
   clientId = "",
   refs?: MessageRef[],
+  signal?: AbortSignal,
 ) {
   if (files && files.length > 0) {
     const tooLarge = attachmentLimitError(files);
@@ -619,7 +804,7 @@ export async function sendMessage(
     if (clientId) form.append("client_id", clientId);
     if (refs && refs.length > 0) form.append("refs_json", JSON.stringify(refs));
     for (const file of files) form.append("files", file);
-    return apiForm(`/api/v1/groups/${encodeURIComponent(groupId)}/send_upload`, form);
+    return apiForm(`/api/v1/groups/${encodeURIComponent(groupId)}/send_upload`, form, { signal });
   }
   return apiJson(`/api/v1/groups/${encodeURIComponent(groupId)}/send`, {
     method: "POST",
@@ -708,6 +893,7 @@ export async function replyMessage(
   refs?: MessageRef[],
   quoteText = "",
   messageMode: "send" | "mail" = "send",
+  signal?: AbortSignal,
 ) {
   if (files && files.length > 0) {
     const tooLarge = attachmentLimitError(files);
@@ -722,7 +908,7 @@ export async function replyMessage(
     if (clientId) form.append("client_id", clientId);
     if (refs && refs.length > 0) form.append("refs_json", JSON.stringify(refs));
     for (const file of files) form.append("files", file);
-    return apiForm(`/api/v1/groups/${encodeURIComponent(groupId)}/reply_upload`, form);
+    return apiForm(`/api/v1/groups/${encodeURIComponent(groupId)}/reply_upload`, form, { signal });
   }
   return apiJson(`/api/v1/groups/${encodeURIComponent(groupId)}/reply`, {
     method: "POST",
@@ -794,20 +980,12 @@ export async function sendCrossGroupMessage(
   to: string[],
   messageMode: MessageMode = "send",
   files?: File[],
-  options?: {
-    replyTo?: string;
-    quoteText?: string;
-    clientId?: string;
-    remoteReplyToEventId?: string;
-  },
+  options?: { replyTo?: string; quoteText?: string; clientId?: string; signal?: AbortSignal },
 ) {
   const replyMetadata = {
     ...(options?.replyTo ? { reply_to: options.replyTo } : {}),
     ...(options?.quoteText ? { quote_text: options.quoteText } : {}),
     ...(options?.clientId ? { client_id: options.clientId } : {}),
-    ...(options?.remoteReplyToEventId
-      ? { remote_reply_to_event_id: options.remoteReplyToEventId }
-      : {}),
   };
   if (files && files.length > 0) {
     const tooLarge = attachmentLimitError(files);
@@ -821,7 +999,9 @@ export async function sendCrossGroupMessage(
     form.append("message_mode", messageMode);
     for (const [key, value] of Object.entries(replyMetadata)) form.append(key, value);
     for (const file of files) form.append("files", file);
-    return apiForm(`/api/v1/groups/${encodeURIComponent(srcGroupId)}/send_upload`, form);
+    return apiForm(`/api/v1/groups/${encodeURIComponent(srcGroupId)}/send_upload`, form, {
+      signal: options?.signal,
+    });
   }
   return apiJson(`/api/v1/groups/${encodeURIComponent(srcGroupId)}/send_cross_group`, {
     method: "POST",

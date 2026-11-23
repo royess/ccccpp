@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { TFunction } from "i18next";
 import type { Actor } from "../../../types";
 import * as api from "../../../services/api";
+import type { LogComponent } from "../../../services/api/diagnostics";
 import { useObservabilityStore } from "../../../stores";
 import { copyTextToClipboard } from "../../../utils/copy";
 import { loadedWebEntry, type RuntimeBuildInfo } from "../../../utils/runtimeBuildInfo";
@@ -49,7 +50,6 @@ export function useSettingsDiagnostics(args: {
 
   // Global observability (developer mode)
   const [developerMode, setDeveloperMode] = useState(false);
-  const [logLevel, setLogLevel] = useState<"INFO" | "DEBUG">("INFO");
   const [terminalBacklogMiB, setTerminalBacklogMiB] = useState(10);
   const [terminalScrollbackLines, setTerminalScrollbackLines] = useState(8000);
   const [peerRuntimeVisibility, setPeerRuntimeVisibility] =
@@ -69,7 +69,7 @@ export function useSettingsDiagnostics(args: {
   const [daemonVersion, setDaemonVersion] = useState("");
   const [runtimeInfoErr, setRuntimeInfoErr] = useState("");
 
-  const [logComponent, setLogComponent] = useState<"daemon" | "web" | "im">("daemon");
+  const [logComponent, setLogComponent] = useState<LogComponent>("daemon");
   const [logLines, setLogLines] = useState(200);
   const [logText, setLogText] = useState("");
   const [logErr, setLogErr] = useState("");
@@ -132,8 +132,6 @@ export function useSettingsDiagnostics(args: {
         const obs = resp.result.observability;
         useObservabilityStore.getState().setFromObs(obs);
         setDeveloperMode(Boolean(obs.developer_mode));
-        const lvl = String(obs.log_level || "INFO").toUpperCase();
-        setLogLevel(lvl === "DEBUG" ? "DEBUG" : "INFO");
         const perActorBytes = Number(obs.terminal_transcript?.per_actor_bytes || 0);
         if (Number.isFinite(perActorBytes) && perActorBytes > 0) {
           setTerminalBacklogMiB(Math.max(1, Math.round(perActorBytes / (1024 * 1024))));
@@ -384,7 +382,6 @@ export function useSettingsDiagnostics(args: {
       );
       const resp = await api.updateObservability({
         developerMode,
-        logLevel,
         terminalTranscriptPerActorBytes: perActorBytes,
         terminalUiScrollbackLines: scrollbackLines,
         peerRuntimeVisibility,
@@ -394,8 +391,6 @@ export function useSettingsDiagnostics(args: {
         const obs = resp.result.observability;
         useObservabilityStore.getState().setFromObs(obs);
         setDeveloperMode(Boolean(obs.developer_mode));
-        const lvl = String(obs.log_level || "INFO").toUpperCase();
-        setLogLevel(lvl === "DEBUG" ? "DEBUG" : "INFO");
         const bytes = Number(obs.terminal_transcript?.per_actor_bytes || 0);
         if (Number.isFinite(bytes) && bytes > 0) {
           setTerminalBacklogMiB(Math.max(1, Math.round(bytes / (1024 * 1024))));
@@ -530,8 +525,6 @@ export function useSettingsDiagnostics(args: {
     devActors,
     developerMode,
     setDeveloperMode,
-    logLevel,
-    setLogLevel,
     terminalBacklogMiB,
     setTerminalBacklogMiB,
     terminalScrollbackLines,

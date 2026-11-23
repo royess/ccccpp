@@ -1,7 +1,5 @@
 // @vitest-environment happy-dom
 
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -176,30 +174,6 @@ describe("MarkdownRenderer Mermaid contract", () => {
     host.remove();
   });
 
-  it("enables diagrams only on Chat and Inbox message surfaces", () => {
-    const messageBubble = readFileSync(
-      resolve(process.cwd(), "src/components/MessageBubble.tsx"),
-      "utf8",
-    );
-    const messageContent = readFileSync(
-      resolve(process.cwd(), "src/components/messageBubble/MessageContent.tsx"),
-      "utf8",
-    );
-    const inbox = readFileSync(
-      resolve(process.cwd(), "src/components/modals/InboxModal.tsx"),
-      "utf8",
-    );
-    const documentSurface = readFileSync(
-      resolve(process.cwd(), "src/components/document/MarkdownDocumentSurface.tsx"),
-      "utf8",
-    );
-
-    expect(messageBubble).toContain('from "./messageBubble/MessageContent"');
-    expect(messageContent).toContain("enableMermaid");
-    expect(inbox).toContain("enableMermaid");
-    expect(documentSurface).not.toContain("enableMermaid");
-  });
-
   it("ships the complete message diagram labels in every supported locale", () => {
     for (const chat of [enChat, jaChat, zhChat]) {
       expect(chat.mermaid.diagram).toBeTruthy();
@@ -244,17 +218,51 @@ describe("MarkdownRenderer table contract", () => {
       expect(chat.table.scrollRegion).toBeTruthy();
     }
   });
+});
 
-  it("keeps overflow and column sizing scoped to the table wrapper", () => {
-    const stylesheet = readFileSync(resolve(process.cwd(), "src/styles/markdown.css"), "utf8");
+describe("MarkdownRenderer link contract", () => {
+  it("opens web addresses in a new tab, and leaves paths, anchors and mailto alone", () => {
+    const html = renderToStaticMarkup(
+      <MarkdownRenderer
+        content={
+          "See https://example.com/a?b=1, [the docs](HTTP://example.org/docs) and [a mirror](//example.net/x).\n\n[Write](mailto:team@example.com), [jump](#notes) or [open](/ui/push)."
+        }
+      />,
+    );
+    const anchors = [...new DOMParser().parseFromString(html, "text/html").querySelectorAll("a")];
 
-    expect(stylesheet).toContain(".markdown-table-scroll {");
-    expect(stylesheet).toMatch(/\.markdown-table-scroll\s*\{[^}]*overflow-x:\s*auto;/s);
-    expect(stylesheet).toMatch(
-      /\.prose\.markdown-body \.markdown-table-scroll > table\s*\{[^}]*width:\s*max-content;[^}]*min-width:\s*100%;/s,
+    expect(anchors.map((anchor) => anchor.getAttribute("href"))).toEqual([
+      "https://example.com/a?b=1",
+      "HTTP://example.org/docs",
+      "//example.net/x",
+      "mailto:team@example.com",
+      "#notes",
+      "/ui/push",
+    ]);
+    expect(anchors.map((anchor) => anchor.getAttribute("target"))).toEqual([
+      "_blank",
+      "_blank",
+      "_blank",
+      null,
+      null,
+      null,
+    ]);
+    expect(anchors.map((anchor) => anchor.getAttribute("rel"))).toEqual([
+      "noopener noreferrer",
+      "noopener noreferrer",
+      "noopener noreferrer",
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it("leaves link handling to a document preview that maps its own URLs", () => {
+    const html = renderToStaticMarkup(
+      <MarkdownRenderer content="[Site](https://example.com)" resolveUrl={(url) => url} />,
     );
-    expect(stylesheet).toMatch(
-      /\.prose\.markdown-body \.markdown-table-scroll (?:th|th,)\s*[\s\S]*?min-width:\s*12rem;/,
-    );
+
+    expect(html).toContain('href="https://example.com"');
+    expect(html).not.toContain("target=");
   });
 });

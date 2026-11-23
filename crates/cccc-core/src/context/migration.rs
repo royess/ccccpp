@@ -17,6 +17,7 @@ pub(super) fn migrate_legacy_json(paths: &ContextPaths) -> io::Result<()> {
     };
     let before = yaml_storage::load(paths)?;
     let (mut merged, mappings) = merge(before.clone(), legacy)?;
+    super::task_revision::advance(&before.tasks, &mut merged.tasks)?;
     yaml_storage::touch_updated_at(&mut merged);
     yaml_storage::persist_diff(paths, &before, &merged)?;
     write_json(
@@ -120,6 +121,9 @@ fn merge(
     Ok((canonical, mappings))
 }
 
+/// Coordination notes (`recent_decisions`, `recent_handoffs`) were removed as a feature and
+/// nothing reads them; migration still carries them over so moving to the current layout
+/// never drops what an older context file stored.
 fn merge_coordination(target: &mut Map<String, Value>, source: Map<String, Value>) {
     for key in ["brief", "recent_decisions", "recent_handoffs"] {
         let Some(value) = source.get(key) else {

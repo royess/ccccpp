@@ -139,6 +139,146 @@ impl Fixture {
 }
 
 #[test]
+fn grok_outer_claim_failure_does_not_consume_an_instruction_notice() {
+    let f = Fixture::new();
+    let workspace = f._temp.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let instructions = workspace.join("AGENTS.md");
+    std::fs::write(&instructions, "first").expect("original instructions");
+    let groups = GroupStore::new(f.home.clone()).expect("store");
+    cccc_core::group_scope::attach(
+        &groups,
+        &f.group.group_id,
+        cccc_core::scope::detect(&workspace).expect("scope"),
+    )
+    .expect("attach");
+    f.start();
+    std::fs::write(instructions, "changed").expect("changed instructions");
+    let event_id = f.source("first task");
+    let delivery = f.next();
+    let captured = f.capture(&delivery, "cccc_runtime_wait_next_turn");
+    // Make token creation fail after the inner runtime accepted the turn.
+    store::update_connector(&f.home, &f.id, |connector| {
+        connector["routing_key"] = Value::Null
+    })
+    .expect("corrupt isolated fixture key");
+    assert!(
+        !f.response(
+            "grok_work_claim",
+            json!({"by":"bot","_cccc_web_binding":captured})
+        )
+        .ok
+    );
+    let group = groups.load(&f.group.group_id).expect("group");
+    let actor = group
+        .actors
+        .iter()
+        .find(|actor| actor.id == "bot")
+        .expect("actor");
+    let state = super::super::runtime_delivery::latest_state(
+        &f.home,
+        &group.group_id,
+        &actor.id,
+        &event_id,
+    )
+    .expect("delivery state");
+    assert!(
+        state.is_some_and(|(state, _)| state == "accepted"),
+        "the inner claim must have been reached"
+    );
+    let root = workspace.canonicalize().expect("workspace root");
+    assert!(
+        super::super::instruction_files::check(
+            &f.home,
+            &group.group_id,
+            actor,
+            &format!("web:{}", root.display()),
+            &root
+        )
+        .is_some(),
+        "failed outer claim must leave the notice pending"
+    );
+}
+
+#[test]
+fn grok_claim_delivers_instruction_changes_once_after_successful_outer_commit() {
+    let f = Fixture::new();
+    let workspace = f._temp.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let instructions = workspace.join("AGENTS.md");
+    std::fs::write(&instructions, "first").expect("original instructions");
+    let groups = GroupStore::new(f.home.clone()).expect("store");
+    cccc_core::group_scope::attach(
+        &groups,
+        &f.group.group_id,
+        cccc_core::scope::detect(&workspace).expect("scope"),
+    )
+    .expect("attach");
+    f.start();
+    std::fs::write(instructions, "changed").expect("changed instructions");
+    f.source("first task");
+    let delivery = f.next();
+    let first = f.claim(&f.capture(&delivery, "cccc_runtime_wait_next_turn"));
+    assert!(
+        first["turn"]["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("AGENTS.md changed")
+    );
+    f.complete(&first);
+    f.source("second task");
+    let next = f.next();
+    let second = f.claim(&f.capture(&next, "cccc_runtime_wait_next_turn"));
+    assert!(
+        !second["turn"]["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("INSTRUCTION FILES CHANGED")
+    );
+}
+
+#[test]
+fn a_terminal_that_still_runs_keeps_its_work_from_the_webhook() {
+    let f = Fixture::new();
+    f.start();
+    f.source("for the running terminal");
+    let group_id = &f.group.group_id;
+    let history = crate::ops::actor_runtime::terminal_history::config(&f.home, group_id, "bot")
+        .expect("isolated Grok fixture");
+    cccc_runtime::start_actor_with_history(
+        cccc_runtime::LaunchSpec {
+            group_id: group_id.clone(),
+            actor_id: "bot".into(),
+            runner: RunnerKind::Pty,
+            command: vec!["sh".into(), "-c".into(), "exec sleep 30".into()],
+            cwd: f._temp.path().into(),
+            env: Default::default(),
+            cols: 80,
+            rows: 24,
+        },
+        history,
+        cccc_runtime::ActorLaunch {
+            runtime: ActorRuntime::Custom,
+            submit: cccc_contracts::ActorSubmit::Enter,
+        },
+    )
+    .expect("isolated Grok fixture");
+
+    assert!(f.next().is_null(), "no wake while a push owner runs");
+    let refused = f.response(
+        "grok_webhook_configure",
+        json!({"url":"https://api2.cursor.sh/automations/webhook/replacement","key":"synthetic"}),
+    );
+    assert_eq!(
+        refused.error.expect("refused").code,
+        "actor_must_be_stopped"
+    );
+
+    cccc_runtime::stop(group_id, "bot").expect("isolated Grok fixture");
+    assert!(f.next().is_object(), "the work is offered once it stopped");
+}
+
+#[test]
 fn idle_configuration_preserves_access_and_queued_work_and_retires_old_wakes() {
     let f = Fixture::new();
     let args = json!({"url":"https://api2.cursor.sh/automations/webhook/replacement","key":"synthetic-key"});
@@ -402,21 +542,63 @@ fn grok_claims_require_a_current_webhook_event() {
 }
 
 #[test]
+fn user_can_resolve_enabled_turn_without_replaying_inputs_or_reviving_credentials() {
+    let f = Fixture::new();
+    f.start();
+    f.source("abandoned input");
+    let delivery = f.next();
+    let claimed = f.claim(&f.capture(&delivery, "cccc_runtime_wait_next_turn"));
+    let execution = f.execution(&claimed, "cccc_message_send");
+    let exact =
+        json!({"turn_id":claimed["turn"]["turn_id"],"event_ids":claimed["turn"]["event_ids"]});
+    let mut denied = exact.clone();
+    denied["by"] = json!("bot");
+    assert!(!f.response("grok_work_resolve", denied).ok);
+    let mut stale = exact.clone();
+    stale["event_ids"] = json!(["different-input"]);
+    assert!(!f.response("grok_work_resolve", stale).ok);
+    assert!(store::validate_binding(&f.home, &execution).is_ok());
+    let later = f.source("independent queued input");
+    f.call("grok_work_resolve", exact.clone());
+    let status = f.call("grok_webhook_status", json!({}));
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["active_turn_id"], "");
+    assert_eq!(status["last_execution"]["status"], "cancelled");
+    assert!(store::validate_binding(&f.home, &execution).is_err());
+    let next = f.next();
+    let next_claim = f.claim(&f.capture(&next, "cccc_runtime_wait_next_turn"));
+    assert_eq!(next_claim["turn"]["event_ids"], json!([later]));
+    assert!(!f.response("grok_work_resolve", exact).ok);
+    assert_eq!(
+        f.call("grok_webhook_status", json!({}))["active_turn_id"],
+        next_claim["turn"]["turn_id"]
+    );
+    f.complete(&next_claim);
+}
+
+#[test]
 fn stop_revokes_authority_and_requires_explicit_resolution_without_replay() {
     let f = Fixture::new();
     f.start();
     let old = f.source("accepted");
     let d = f.next();
     let claim = f.claim(&f.capture(&d, "cccc_runtime_wait_next_turn"));
+    assert_eq!(
+        private::state(&f.private(), &f.group.group_id, "bot")["execution"]["claimed_at"],
+        claim["turn"]["created_at"]
+    );
+    assert!(f.call("grok_webhook_status", json!({}))["active_turn_elapsed_seconds"].is_u64());
+    let reopened = HomeLayout::from_path(f.home.root()).expect("reopen isolated home");
+    super::super::runtime_restore::restore_running(&reopened).expect("daemon startup restore");
+    assert!(f.call("grok_webhook_status", json!({}))["active_turn_elapsed_seconds"].is_u64());
     let b = f.execution(&claim, "cccc_message_send");
     f.call("actor_stop", json!({}));
     assert!(store::validate_binding(&f.home, &b).is_err());
     f.start();
     assert!(f.next().is_null());
-    assert_eq!(
-        f.call("grok_webhook_status", json!({}))["phase"],
-        "interrupted"
-    );
+    let interrupted = f.call("grok_webhook_status", json!({}));
+    assert_eq!(interrupted["phase"], "interrupted");
+    assert!(interrupted["active_turn_elapsed_seconds"].is_u64());
     assert!(store::validate_binding(&f.home, &b).is_err());
     assert!(!f.response("grok_webhook_retry", json!({})).ok);
     f.call("actor_stop", json!({}));
@@ -435,6 +617,7 @@ fn stop_revokes_authority_and_requires_explicit_resolution_without_replay() {
         "grok_work_resolve",
         json!({"turn_id":claim["turn"]["turn_id"],"event_ids":claim["turn"]["event_ids"]}),
     );
+    assert!(f.call("grok_webhook_status", json!({}))["active_turn_elapsed_seconds"].is_null());
     let later = f.source("later");
     f.start();
     let next = f.next();
@@ -627,6 +810,40 @@ fn native_scheduler_settles_legacy_claims_after_interrupted_configuration() {
             .expect("old claim")
             .0,
         "ambiguous"
+    );
+}
+
+#[test]
+fn idle_native_scheduler_reuses_claims_and_settles_new_legacy_claims() {
+    let f = Fixture::new();
+    f.start();
+    assert!(f.next().is_null());
+    let before = super::super::runtime_delivery::reduced_stranded_claim_events();
+    assert!(f.next().is_null());
+    assert_eq!(
+        super::super::runtime_delivery::reduced_stranded_claim_events(),
+        before,
+        "idle polling does not re-decode the claim history"
+    );
+
+    let source = legacy_browser_claim(&f);
+    assert!(f.next().is_null());
+    assert_eq!(
+        super::super::runtime_delivery::latest_state(&f.home, &f.group.group_id, "bot", &source)
+            .expect("old handoff")
+            .expect("old claim")
+            .0,
+        "ambiguous"
+    );
+    assert!(super::super::runtime_delivery::reduced_stranded_claim_events() > before);
+    // The ambiguity receipt was appended after the preceding snapshot.
+    assert!(f.next().is_null());
+    let settled = super::super::runtime_delivery::reduced_stranded_claim_events();
+    assert!(f.next().is_null());
+    assert_eq!(
+        super::super::runtime_delivery::reduced_stranded_claim_events(),
+        settled,
+        "the settled ledger becomes idle again"
     );
 }
 

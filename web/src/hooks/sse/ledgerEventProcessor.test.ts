@@ -3,7 +3,7 @@ import { useUIStore } from "../../stores/useUIStore";
 import { useGroupStore } from "../../stores/useGroupStore";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import type { ChatMessageData, LedgerEvent } from "../../types";
+import type { Actor, ChatMessageData, LedgerEvent } from "../../types";
 import { processLedgerEvent, type LedgerEventProcessorDeps } from "./ledgerEventProcessor";
 
 function processorDeps() {
@@ -12,6 +12,7 @@ function processorDeps() {
   const updateObligationStatus = vi.fn();
   const updateActorActivity = vi.fn();
   const refreshActors = vi.fn();
+  const showError = vi.fn();
   const noop = vi.fn();
   const deps = {
     actors: [],
@@ -32,6 +33,7 @@ function processorDeps() {
     refreshActors,
     refreshPresentation: noop,
     incrementChatUnread: noop,
+    showError,
     markPresentationSlotAttention: noop,
     clearPresentationSlotAttention: noop,
   } as unknown as LedgerEventProcessorDeps;
@@ -42,6 +44,7 @@ function processorDeps() {
     updateObligationStatus,
     updateActorActivity,
     refreshActors,
+    showError,
   };
 }
 
@@ -227,10 +230,31 @@ describe("processLedgerEvent obligation facts", () => {
 
     expect(updateObligationStatus).toHaveBeenCalledWith(
       "message-1",
-      { actorId: "peer1", deliveryState: "accepted" },
+      { actorId: "peer1", deliveryState: "accepted", deliveryReason: "" },
       "g1",
     );
     expect(appendEvent).not.toHaveBeenCalled();
+  });
+
+  it("says when a member ends on its own with an error, once", () => {
+    const { deps, showError } = processorDeps();
+    const stop = (data: Record<string, unknown>) =>
+      ({ kind: "actor.stop", data: { actor_id: "peer1", ...data } }) as LedgerEvent;
+    const crashed = stop({ reason: "process_exit", exit_code: 3 });
+
+    processLedgerEvent("g1", crashed, { ...deps, alreadyProcessed: true });
+    processLedgerEvent("g1", stop({ reason: "process_exit", exit_code: 0 }), deps);
+    processLedgerEvent("g1", stop({ reason: "process_exit", exit_code: null }), deps);
+    processLedgerEvent("g1", stop({ reason: "user", exit_code: 1 }), deps);
+    expect(showError).not.toHaveBeenCalled();
+
+    processLedgerEvent("g1", crashed, {
+      ...deps,
+      actors: [{ id: "peer1", title: "Reviewer" } as Actor],
+    });
+    expect(showError).toHaveBeenCalledOnce();
+    expect(showError.mock.calls[0][0]).toContain("Reviewer");
+    expect(showError.mock.calls[0][0]).toContain("3");
   });
 
   it("projects reply cancellation onto all source recipients", () => {
@@ -250,9 +274,39 @@ describe("processLedgerEvent obligation facts", () => {
 });
 
 describe("Group work view unread state", () => {
+  it("counts a new message while a covering view is open, even at the bottom", () => {
+    const { deps } = processorDeps();
+    deps.incrementChatUnread = vi.fn();
+    useGroupStore.setState({ chatByGroup: {} });
+    useUIStore.setState({
+      activeTab: "chat",
+      chatSessions: {},
+      isSmallScreen: false,
+      workspaceFileViewerGroupId: "",
+      chatObscuringViews: 0,
+    });
+    const event = {
+      id: "covered-reply",
+      kind: "chat.message",
+      by: "actor-1",
+      data: { text: "Work finished", to: ["user"], message_mode: "send" },
+    } as LedgerEvent;
+    const release = useUIStore.getState().registerChatObscuringView();
+    try {
+      processLedgerEvent("g1", event, deps);
+      expect(deps.incrementChatUnread).toHaveBeenCalledWith("g1");
+    } finally {
+      release();
+    }
+    vi.mocked(deps.incrementChatUnread).mockClear();
+    processLedgerEvent("g1", { ...event, id: "visible-reply" }, deps);
+    expect(deps.incrementChatUnread).not.toHaveBeenCalled();
+  });
+
   it("counts replies while the message viewport is hidden even if it was at the bottom", () => {
     const { deps } = processorDeps();
     deps.incrementChatUnread = vi.fn();
+    useGroupStore.setState({ chatByGroup: {} });
     useUIStore.setState({ activeTab: "chat", chatSessions: {}, isSmallScreen: false });
     const event = {
       id: "reply-1",
@@ -268,6 +322,75 @@ describe("Group work view unread state", () => {
     processLedgerEvent("g1", { ...event, id: "reply-2" }, deps);
     expect(deps.incrementChatUnread).not.toHaveBeenCalled();
   });
+});
+
+describe("live events already present in another chat view", () => {
+  it.each([
+    ["sender history", "mail"],
+    ["context window", "send"],
+  ] as const)(
+    "appends and counts a new event from %s (%s) once, then refreshes actor badges",
+    (view, mode) => {
+      const event = {
+        id: `other-view-${view}`,
+        kind: "chat.message",
+        by: "actor-1",
+        data: { text: "Arrived before the live frame", message_mode: mode, to: ["recipient"] },
+      } as LedgerEvent;
+      const groupId = `group-${view}`;
+      useGroupStore.setState({ chatByGroup: {} });
+      useGroupStore.getState().setEvents([], groupId);
+      if (view === "sender history") {
+        useGroupStore
+          .getState()
+          .setSenderHistory(
+            {
+              key: "actor-1",
+              senders: ["actor-1"],
+              events: [event],
+              messageRevision: 0,
+              receiptRevision: 0,
+            },
+            groupId,
+          );
+      } else {
+        useGroupStore
+          .getState()
+          .setChatWindow(
+            {
+              groupId,
+              centerEventId: event.id!,
+              centerIndex: 0,
+              events: [event],
+              hasMoreBefore: false,
+              hasMoreAfter: false,
+            },
+            groupId,
+          );
+      }
+      const { deps, refreshActors } = processorDeps();
+      deps.appendEvent = useGroupStore.getState().appendEvent;
+      deps.actors = [{ id: "recipient" }] as LedgerEventProcessorDeps["actors"];
+      deps.incrementChatUnread = vi.fn();
+      deps.incrementActorUnread = vi.fn();
+      deps.incrementWebModelQueued = vi.fn();
+      deps.chatAtBottom = false;
+
+      processLedgerEvent(groupId, event, deps);
+      deps.alreadyProcessed = true;
+      processLedgerEvent(groupId, event, deps);
+
+      expect(useGroupStore.getState().chatByGroup[groupId].events.map((item) => item.id)).toEqual([
+        event.id,
+      ]);
+      expect(deps.incrementChatUnread).toHaveBeenCalledOnce();
+      expect(deps.incrementChatUnread).toHaveBeenCalledWith(groupId);
+      expect(refreshActors).toHaveBeenCalledOnce();
+      expect(refreshActors).toHaveBeenCalledWith(groupId, { includeUnread: true });
+      expect(deps.incrementActorUnread).not.toHaveBeenCalled();
+      expect(deps.incrementWebModelQueued).not.toHaveBeenCalled();
+    },
+  );
 });
 
 it("keeps Connect cancellation evidence for propagation while updating obligations", () => {

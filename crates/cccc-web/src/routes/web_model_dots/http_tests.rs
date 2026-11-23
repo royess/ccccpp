@@ -1,5 +1,7 @@
 //! Shared-entrance tests use an owned Home and in-process HTTP router. No
-//! browser, provider CLI, callback connection or global environment is used.
+//! browser, provider CLI or callback connection is used. Test options never
+//! modify the process environment.
+use super::super::remote_maintenance_test_daemon::TestDaemons;
 use super::*;
 use axum::{
     body::{Body, to_bytes},
@@ -19,10 +21,12 @@ struct Fixture {
     secret: String,
     admin: String,
     daemon: Option<tokio::task::JoinHandle<()>>,
+    daemon_sources: TestDaemons,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let daemon_sources = TestDaemons::new();
         let temp = tempfile::tempdir().expect("fixture");
         let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
         let store = GroupStore::new(home.clone()).expect("store");
@@ -107,34 +111,106 @@ impl Fixture {
             secret,
             admin,
             daemon: None,
+            daemon_sources,
         }
     }
 
     async fn start_daemon(&mut self) {
         let home = self.state.home.clone();
-        self.daemon = Some(tokio::spawn(async move {
-            cccc_daemon::run(home).await.expect("owned daemon");
-        }));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if self
-                    .state
-                    .client
-                    .call(&DaemonRequest {
-                        v: 1,
-                        op: "ping".into(),
-                        args: Default::default(),
-                    })
+        self.daemon = Some(self.daemon_sources.spawn(home));
+        self.daemon_sources.started(&self.state.client).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn restart_preserving(&mut self) {
+        let ping = self
+            .state
+            .client
+            .call(&DaemonRequest {
+                v: 1,
+                op: "ping".into(),
+                args: Default::default(),
+            })
+            .await
+            .expect("daemon identity before maintenance");
+        assert!(ping.ok);
+        let daemon_pid = u32::try_from(ping.result["pid"].as_u64().expect("daemon PID"))
+            .expect("native daemon PID");
+        if self.daemon_sources.runs_in_test_process() {
+            let candidate = cccc_core::update_capabilities::UpdateCapabilities {
+                preserve_agents: true,
+                owner_contracts: vec![1],
+                mcp_daemon_contracts: cccc_contracts::MCP_DAEMON_ACCEPTED_CONTRACTS.to_vec(),
+                ..Default::default()
+            };
+            assert!(
+                cccc_daemon::session_owner::preservation_check(&self.state.home, &candidate)
                     .await
-                    .is_ok()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("daemon ready");
+                    .allowed
+            );
+        }
+        let response = self
+            .state
+            .client
+            .call(&DaemonRequest {
+                v: 1,
+                op: "shutdown_preserving_agents".into(),
+                args: Default::default(),
+            })
+            .await
+            .expect("maintenance request");
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result["mode"], "preserve_agents");
+        tokio::time::timeout(Duration::from_secs(5), self.daemon.take().expect("daemon"))
+            .await
+            .expect("maintenance timeout")
+            .expect("daemon task");
+        let receipt = cccc_daemon::session_owner::read_shutdown_report(
+            &self.state.home,
+            daemon_pid,
+            response.result["request_id"].as_str(),
+        )
+        .expect("shutdown report")
+        .expect("matching maintenance receipt");
+        assert!(receipt.retained.is_empty() && receipt.confirmed_stopped.is_empty());
+        if self.daemon_sources.expects_remote_receipt() {
+            assert_eq!(receipt.unconfirmed.len(), 1);
+            assert_eq!(receipt.unconfirmed[0].group_id, self.group_id);
+            assert_eq!(receipt.unconfirmed[0].actor_id, "dots");
+            assert!(receipt.unconfirmed[0].owner_id.is_none());
+            assert!(receipt.unconfirmed[0].generation.is_none());
+        } else {
+            assert!(
+                receipt.unconfirmed.is_empty(),
+                "selected old build has no remote receipt rows"
+            );
+        }
+        let _ = self.state.shutdown.send(());
+        let (shutdown, _) = tokio::sync::broadcast::channel(1);
+        let (router, _, _, state) = crate::app_with_shutdown(
+            self.state.home.clone(),
+            shutdown,
+            crate::WebMode::Normal,
+            None,
+            crate::LiveBinding {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            "dots-http-after-maintenance".into(),
+        );
+        self.router = router;
+        self.state = state;
+        self.start_daemon().await;
+        if self.daemon_sources.runs_in_test_process() {
+            let observed =
+                cccc_daemon::session_owner::observations(&self.state.home, Duration::from_secs(5))
+                    .await
+                    .expect("remote observations");
+            assert!(observed.running.is_empty());
+            assert_eq!(observed.unconfirmed.len(), 1);
+            assert!(observed.unconfirmed[0].owner_id.is_none());
+            assert!(observed.unconfirmed[0].generation.is_none());
+        }
     }
 
     fn connector(&self) -> Value {
@@ -230,6 +306,187 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn claimed_dot_turn_survives_maintenance_without_replaying_input() {
+    let mut fixture = Fixture::new();
+    let groups = GroupStore::new(fixture.state.home.clone()).expect("store");
+    groups
+        .mutate(&fixture.group_id, |group| {
+            group.running = true;
+            group.state = cccc_contracts::GroupState::Active;
+            group.actors[1].enabled = true;
+            Ok(())
+        })
+        .expect("enable Dot");
+    fixture.start_daemon().await;
+    connectors::dots_update(&fixture.state.home, &fixture.connector_id, |connector| {
+        connector["dots"]["subscription"] = json!({"enabled":true,
+            "subscription_id":"maintenance-subscription",
+            "callback_url":"https://callback.invalid/maintenance",
+            "signing_secret":"synthetic-maintenance-key","expires_at_ms":null});
+        Ok(())
+    })
+    .expect("subscription without a callback worker");
+    let pairing = connectors::begin_dots_pairing(&fixture.state.home, &fixture.connector_id)
+        .expect("pairing")
+        .expect("new pairing");
+    let metadata = json!({"openai/session":"synthetic-maintenance-dot",
+        "openai/subject":"synthetic-maintenance-user"});
+    let (_, paired) = fixture
+        .mcp(
+            "tools/call",
+            json!({"name":"cccc_pair",
+            "arguments":{"code":pairing["code"]},"_meta":metadata}),
+            true,
+        )
+        .await;
+    assert_eq!(
+        paired["result"]["isError"], false,
+        "pairing requires the owned daemon before maintenance can be tested"
+    );
+    assert_eq!(paired["result"]["structuredContent"]["state"], "bound");
+    let mut source = Event::new("chat.message", &fixture.group_id);
+    source.by = "user".into();
+    source.data = json!({"to":["dots"],"message_mode":"send",
+        "text":"one Dot task across maintenance"})
+    .as_object()
+    .expect("source")
+    .clone();
+    let ledger_path = groups.ledger_path(&fixture.group_id).expect("ledger");
+    ledger::append(&ledger_path, &source).expect("append source");
+    let next = || DaemonRequest {
+        v: 1,
+        op: "dots_events_next_delivery".into(),
+        args: json!({"by":"user"}).as_object().expect("args").clone(),
+    };
+    let response = fixture.state.client.call(&next()).await.expect("wake");
+    assert!(response.ok, "{:?}", response.error);
+    let delivery = response.result["delivery"].clone();
+    assert_eq!(delivery["attempt"], 1);
+    let connector_before = fixture.connector();
+
+    // Preserve a wake whose peer may have received it without returning an
+    // HTTP receipt. Its retry is the same wake, never a new business input.
+    fixture.restart_preserving().await;
+    assert!(
+        fixture.connector() == connector_before,
+        "maintenance must preserve the saved connector state"
+    );
+    let response = fixture
+        .state
+        .client
+        .call(&next())
+        .await
+        .expect("leased wake");
+    assert!(response.ok, "{:?}", response.error);
+    assert!(response.result["delivery"].is_null());
+    connectors::dots_update(&fixture.state.home, &fixture.connector_id, |connector| {
+        connector["dots"]["wake"]["sent_at_ms"] = json!(0);
+        Ok(())
+    })
+    .expect("expire only the sending lease");
+    let response = fixture
+        .state
+        .client
+        .call(&next())
+        .await
+        .expect("retry wake");
+    assert!(response.ok, "{:?}", response.error);
+    let retried = &response.result["delivery"];
+    assert_eq!(retried["event_id"], delivery["event_id"]);
+    assert_eq!(retried["epoch"], delivery["epoch"]);
+    assert_eq!(retried["event"], delivery["event"]);
+    assert_eq!(retried["attempt"], 2);
+    let (_, claim) = fixture
+        .mcp(
+            "tools/call",
+            json!({"name":"cccc_runtime_wait_next_turn",
+            "arguments":{},"_meta":metadata}),
+            true,
+        )
+        .await;
+    assert_eq!(claim["result"]["isError"], false);
+    let work = claim["result"]["structuredContent"].clone();
+    assert_eq!(work["status"], "work_available");
+    assert_eq!(work["turn"]["event_ids"], json!([source.id]));
+    let connector_claimed = fixture.connector();
+
+    fixture.restart_preserving().await;
+    assert!(
+        fixture.connector() == connector_claimed,
+        "maintenance must preserve the original execution state"
+    );
+    let (_, duplicate) = fixture
+        .mcp(
+            "tools/call",
+            json!({"name":"cccc_runtime_wait_next_turn",
+            "arguments":{},"_meta":metadata}),
+            true,
+        )
+        .await;
+    assert_eq!(
+        duplicate["result"]["structuredContent"]["status"],
+        "turn_in_progress"
+    );
+    let (_, reply) = fixture
+        .mcp(
+            "tools/call",
+            json!({"name":"cccc_message_reply",
+            "arguments":{"actor_token":work["actor_token"],"event_id":source.id,
+                "text":"Original Dot turn completed after restart","mode":"send",
+                "insight":"One claimed turn retains its authority"}}),
+            true,
+        )
+        .await;
+    assert_ne!(reply["result"]["isError"], true, "{reply}");
+    let completion = json!({"actor_token":work["actor_token"],
+        "turn_id":work["turn"]["turn_id"],"event_ids":work["turn"]["event_ids"]});
+    for _ in 0..2 {
+        let (_, result) = fixture
+            .mcp(
+                "tools/call",
+                json!({"name":"cccc_runtime_complete_turn",
+                "arguments":completion}),
+                true,
+            )
+            .await;
+        assert_ne!(result["result"]["isError"], true, "{result}");
+    }
+    let response = fixture
+        .state
+        .client
+        .call(&next())
+        .await
+        .expect("no extra wake");
+    assert!(response.ok, "{:?}", response.error);
+    assert!(response.result["delivery"].is_null());
+    let events = ledger::read_all(&ledger_path).expect("events");
+    assert_eq!(
+        events.iter().filter(|event| event.id == source.id).count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "runtime.delivery"
+                && event.data["source_event_id"] == source.id
+                && event.data["state"] == "accepted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "runtime.turn.completed"
+                && event.data["turn_id"] == work["turn"]["turn_id"])
+            .count(),
+        1
+    );
+    fixture.daemon_sources.assert_switched();
+    fixture.close().await;
+}
+
 #[tokio::test]
 async fn authenticated_modern_scan_and_legacy_catalog_share_the_same_connector() {
     let mut fixture = Fixture::new();
@@ -246,6 +503,10 @@ async fn authenticated_modern_scan_and_legacy_catalog_share_the_same_connector()
                     json!([protocol::VERSION])
                 );
                 assert!(response["result"]["capabilities"]["events"].is_object());
+                assert_eq!(
+                    response["result"]["instructions"],
+                    cccc_mcp::CAPABILITY_INSTRUCTIONS
+                );
             }
             "events/list" => {
                 let event = &response["result"]["events"][0];
@@ -263,6 +524,12 @@ async fn authenticated_modern_scan_and_legacy_catalog_share_the_same_connector()
             ),
         }
     }
+    let (status, initialized) = fixture.mcp("initialize", json!({}), false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        initialized["result"]["instructions"],
+        cccc_mcp::CAPABILITY_INSTRUCTIONS
+    );
     let (status, legacy) = fixture.mcp("tools/list", json!({}), false).await;
     assert_eq!(status, StatusCode::OK);
     assert!(legacy["result"]["resultType"].is_null());
@@ -399,6 +666,129 @@ async fn rejected_pairing_remains_in_shared_diagnostics_after_status_reads() {
 }
 
 #[tokio::test]
+async fn paused_dot_pairing_preserves_identity_and_resumes_without_repairing() {
+    let mut fixture = Fixture::new();
+    fixture.start_daemon().await;
+    let pair = connectors::begin_dots_pairing(&fixture.state.home, &fixture.connector_id)
+        .expect("setup")
+        .expect("new Dot pair");
+    let metadata = json!({"openai/session":"synthetic-dot-session",
+        "openai/subject":"synthetic-user","openai/organization":"synthetic-org"});
+    let (_, paired) = fixture
+        .mcp(
+            "tools/call",
+            json!({"name":"cccc_pair",
+        "arguments":{"code":pair["code"]},"_meta":metadata}),
+            true,
+        )
+        .await;
+    assert_eq!(paired["result"]["structuredContent"]["state"], "bound");
+    let (_, paused) = fixture
+        .mcp(
+            "tools/call",
+            json!({"name":"cccc_runtime_wait_next_turn",
+        "arguments":{},"_meta":metadata}),
+            true,
+        )
+        .await;
+    assert_eq!(paused["result"]["isError"], true);
+    assert!(
+        paused["result"]["structuredContent"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("paired_actor_stopped"))
+    );
+    let (_, status) = fixture
+        .mcp(
+            "tools/call",
+            json!({"name":"cccc_connector_status",
+        "arguments":{},"_meta":metadata}),
+            true,
+        )
+        .await;
+    let status = &status["result"]["structuredContent"];
+    assert_eq!(status["paired"], true);
+    assert_eq!(status["enabled"], false);
+    assert_eq!(status["subscribed"], false);
+    // Setup phases retain their priority while the independent access flag is
+    // paused; consumers must not infer enabled state from the phase alone.
+    assert_eq!(status["state"], "waiting_subscription");
+    let mut changed = metadata.clone();
+    changed["openai/organization"] = json!("synthetic-other-org");
+    changed["unrelated-private-metadata"] = json!("synthetic-do-not-log");
+    let (_, unpaired) = fixture
+        .mcp(
+            "tools/call",
+            json!({"name":"cccc_runtime_wait_next_turn",
+        "arguments":{},"_meta":changed}),
+            true,
+        )
+        .await;
+    assert!(
+        unpaired["result"]["structuredContent"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("conversation_not_paired"))
+    );
+    let (_, listed) = fixture.admin_get("/api/v1/web-model/connectors").await;
+    let log = &listed["result"]["connectors"][0]["events_log"];
+    assert_eq!(log.as_array().expect("diagnostics").len(), 3);
+    assert_eq!(log[1]["reason"], "paired_actor_stopped");
+    assert_eq!(log[2]["reason"], "conversation_not_paired");
+    assert_eq!(log[0]["host_identity"], log[1]["host_identity"]);
+    for field in ["session", "subject"] {
+        assert_eq!(
+            log[0]["host_identity"][field],
+            log[2]["host_identity"][field]
+        );
+    }
+    assert_ne!(
+        log[0]["host_identity"]["organization"],
+        log[2]["host_identity"]["organization"]
+    );
+    for private in [
+        "synthetic-dot-session",
+        "synthetic-user",
+        "synthetic-org",
+        "synthetic-other-org",
+        "synthetic-do-not-log",
+        &fixture.secret,
+        pair["code"].as_str().expect("code"),
+    ] {
+        assert!(!listed.to_string().contains(private));
+    }
+    let before = fixture.connector()["bindings"].clone();
+    let groups = GroupStore::new(fixture.state.home.clone()).expect("store");
+    groups
+        .mutate(&fixture.group_id, |group| {
+            group.running = true;
+            group.state = cccc_contracts::GroupState::Active;
+            group.actors[1].enabled = true;
+            Ok(())
+        })
+        .expect("resume access without provider work");
+    let (_, resumed) = fixture
+        .mcp(
+            "tools/call",
+            json!({"name":"cccc_runtime_wait_next_turn",
+        "arguments":{},"_meta":metadata}),
+            true,
+        )
+        .await;
+    assert_ne!(resumed["result"]["isError"], true, "{resumed}");
+    assert_eq!(resumed["result"]["structuredContent"]["status"], "idle");
+    assert_eq!(
+        fixture.connector()["events_log"][3]["host_identity"],
+        log[0]["host_identity"]
+    );
+    let after = fixture.connector()["bindings"].clone();
+    let key = json!([fixture.group_id, "dots"]).to_string();
+    for field in ["session_key", "revision", "generation", "pairing_id"] {
+        assert_eq!(before[&key][field], after[&key][field]);
+    }
+    assert!(fixture.connector()["dots"]["execution"].is_null());
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn paired_dot_status_waits_for_subscription_without_creating_work() {
     let mut fixture = Fixture::new();
     fixture.start_daemon().await;
@@ -446,6 +836,164 @@ async fn paired_dot_status_waits_for_subscription_without_creating_work() {
         &ledger_before,
         "reading connector status",
     );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn host_javascript_forwards_current_claim_arguments_without_business_code_credentials() {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut fixture = Fixture::new();
+    let store = GroupStore::new(fixture.state.home.clone()).expect("store");
+    let project = fixture._temp.path().join("host-workspace");
+    std::fs::create_dir(&project).expect("workspace");
+    cccc_core::group_scope::attach(
+        &store,
+        &fixture.group_id,
+        cccc_core::scope::detect(&project).expect("scope"),
+    )
+    .expect("attach workspace");
+    store
+        .mutate(&fixture.group_id, |group| {
+            group.running = true;
+            group.state = cccc_contracts::GroupState::Active;
+            group.actors[1].enabled = true;
+            Ok(())
+        })
+        .expect("enable Dot");
+    fixture.start_daemon().await;
+    connectors::dots_update(&fixture.state.home, &fixture.connector_id, |connector| {
+        connector["dots"]["subscription"] = json!({"enabled":true,"subscription_id":"fixture-sub",
+            "callback_url":"https://callback.invalid/fixture","signing_secret":"synthetic-only","expires_at_ms":null});
+        Ok(())
+    }).expect("subscription without network delivery");
+    let pair = connectors::begin_dots_pairing(&fixture.state.home, &fixture.connector_id)
+        .expect("pairing")
+        .expect("new pairing");
+    let metadata =
+        json!({"openai/session":"synthetic-host-dot","openai/subject":"synthetic-host-user"});
+    let (_, paired) = fixture
+        .mcp(
+            "tools/call",
+            json!({"name":"cccc_pair",
+        "arguments":{"code":pair["code"]},"_meta":metadata}),
+            true,
+        )
+        .await;
+    assert_eq!(paired["result"]["structuredContent"]["state"], "bound");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("owned HTTP listener");
+    let address = listener.local_addr().expect("address");
+    let router = fixture.router.clone();
+    let http = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("owned HTTP server");
+    });
+    for mode in ["retained-reference", "original-tool-output"] {
+        let mut event = Event::new("chat.message", &fixture.group_id);
+        event.by = "user".into();
+        event.data = json!({"to":["dots"],"message_mode":"send","text":mode})
+            .as_object()
+            .expect("source")
+            .clone();
+        ledger::append(
+            &store.ledger_path(&fixture.group_id).expect("ledger"),
+            &event,
+        )
+        .expect("seed source");
+        let wake = fixture
+            .state
+            .client
+            .call(&DaemonRequest {
+                v: 1,
+                op: "dots_events_next_delivery".into(),
+                args: json!({"by":"user"}).as_object().expect("args").clone(),
+            })
+            .await
+            .expect("wake");
+        assert!(wake.result["delivery"]["event"]["data"]["event_id"].is_string());
+        let mut child = tokio::process::Command::new("node")
+            .args([
+                "--input-type=module",
+                "--eval",
+                include_str!("../../../tests/fixtures/native_tool_client.mjs"),
+            ])
+            .current_dir(&project)
+            .env("CCCC_HOME", fixture.state.home.root())
+            .env("CODEX_HOME", fixture._temp.path().join("codex"))
+            .env("CLAUDE_CONFIG_DIR", fixture._temp.path().join("claude"))
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("isolated JavaScript host client");
+        let input = json!({"url":format!("http://{address}/mcp/web-model/{}", fixture.connector_id),
+            "secret":fixture.secret,"metadata":metadata,"mode":mode});
+        {
+            let mut stdin = child.stdin.take().expect("private input pipe");
+            stdin
+                .write_all(&serde_json::to_vec(&input).expect("input"))
+                .await
+                .expect("private input");
+        }
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .expect("host client timeout")
+            .expect("host client exit");
+        assert!(
+            output.status.success(),
+            "host client: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(&fixture.secret));
+        let report: Value = serde_json::from_slice(&output.stdout).expect("safe host report");
+        assert_eq!(report["mode"], mode);
+        assert_eq!(report["claim_count"], 1);
+        for field in [
+            "code_completed",
+            "reply_completed",
+            "turn_completed",
+            "temporary_context_discarded",
+        ] {
+            assert_eq!(report[field], true);
+        }
+        let (_, state) = fixture
+            .admin_get(&format!(
+                "/api/v1/web-model/dots?group_id={}&actor_id=dots",
+                fixture.group_id
+            ))
+            .await;
+        assert_eq!(state["result"]["active_turn_id"], "");
+        assert_eq!(state["result"]["last_execution"]["status"], "done");
+    }
+    let events =
+        ledger::read_all(&store.ledger_path(&fixture.group_id).expect("ledger")).expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "chat.message" && event.by == "dots")
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |event| event.kind == "runtime.turn.completed" && event.data["actor_id"] == "dots"
+            )
+            .count(),
+        2
+    );
+    http.abort();
+    let _ = http.await;
     fixture.close().await;
 }
 
@@ -741,6 +1289,16 @@ async fn paired_dot_claims_successive_turns_without_saved_credentials_or_event_p
         );
         assert!(duplicate["result"]["structuredContent"]["turn"].is_null());
         assert!(duplicate["result"]["structuredContent"]["actor_token"].is_null());
+        assert_eq!(
+            duplicate["result"]["structuredContent"]["reason_code"],
+            "dots_turn_unfinished"
+        );
+        assert!(
+            duplicate["result"]["structuredContent"]["instructions"]
+                .as_str()
+                .expect("recovery guidance")
+                .contains("End this turn")
+        );
         if let Some(old) = tokens.last() {
             let path = store.ledger_path(&fixture.group_id).expect("ledger");
             let (_, forged) = fixture.mcp("tools/call", json!({"name":"cccc_runtime_complete_turn","arguments":{"actor_token":old,"turn_id":packet["turn"]["turn_id"],"event_ids":packet["turn"]["event_ids"]}}), true).await;
@@ -1124,6 +1682,10 @@ async fn grok_modern_discovery_does_not_advertise_chatgpt_events() {
     assert_eq!(status, StatusCode::OK);
     assert!(response["result"]["capabilities"]["tools"].is_object());
     assert!(response["result"]["capabilities"]["events"].is_null());
+    assert_eq!(
+        response["result"]["instructions"],
+        cccc_mcp::CAPABILITY_INSTRUCTIONS
+    );
     fixture.close().await;
 }
 
@@ -1310,10 +1872,67 @@ async fn subscription_refresh_and_unsubscribe_use_modern_wire_contract_and_fixed
 }
 
 #[tokio::test]
-async fn one_click_create_refuses_to_rotate_an_existing_connector() {
+async fn one_click_create_is_idempotent_and_explicit_rotation_preserves_bindings() {
     let mut fixture = Fixture::new();
     fixture.start_daemon().await;
-    let before = fixture.connector()["secret_hash"].clone();
+    let before = fixture.connector();
+    for flags in [
+        json!({}),
+        json!({"create_only":true}),
+        json!({"create_only":false}),
+        json!({"rotate":false}),
+    ] {
+        let mut args = json!({"provider":"chatgpt_web"});
+        args.as_object_mut()
+            .expect("args")
+            .extend(flags.as_object().expect("flags").clone());
+        let (status, response) = fixture
+            .send(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/web-model/connectors")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", fixture.admin))
+                    .body(Body::from(args.to_string()))
+                    .expect("create"),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["result"]["outcome"], "existing");
+        assert_eq!(
+            response["result"]["connector"]["connector_id"],
+            fixture.connector_id
+        );
+        assert_eq!(response["result"]["connector"]["secret_available"], false);
+        assert!(response["result"].get("secret").is_none());
+        assert!(
+            response["result"]["connector"]
+                .get("connector_url_path_token")
+                .is_none()
+        );
+        assert!(response["result"]["connector"].get("secret_hash").is_none());
+        assert!(!response.to_string().contains(&fixture.secret));
+        assert_eq!(fixture.connector(), before);
+    }
+    for name in ["create_only", "rotate"] {
+        for flag in [json!("true"), json!(1), Value::Null] {
+            let mut args = json!({"provider":"chatgpt_web"});
+            args[name] = flag;
+            let (status, _) = fixture
+                .send(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/web-model/connectors")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, format!("Bearer {}", fixture.admin))
+                        .body(Body::from(args.to_string()))
+                        .expect("invalid flag"),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(fixture.connector(), before);
+        }
+    }
     let (status, response) = fixture
         .send(
             Request::builder()
@@ -1322,34 +1941,58 @@ async fn one_click_create_refuses_to_rotate_an_existing_connector() {
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, format!("Bearer {}", fixture.admin))
                 .body(Body::from(
-                    json!({"provider":"chatgpt_web","create_only":true}).to_string(),
+                    json!({"provider":"chatgpt_web","rotate":true}).to_string(),
                 ))
-                .expect("create-only request"),
+                .expect("rotate"),
         )
         .await;
-    assert_ne!(status, StatusCode::OK);
-    assert_eq!(response["ok"], false);
-    assert_eq!(response["error"]["code"], "connector_exists");
-    // A mistyped flag is refused rather than read as "rotate".
-    for flag in [json!("true"), json!(1), Value::Null] {
-        let (status, _) = fixture
-            .send(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/web-model/connectors")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", fixture.admin))
-                    .body(Body::from(
-                        json!({"provider":"chatgpt_web","create_only":flag}).to_string(),
-                    ))
-                    .expect("mistyped request"),
-            )
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{flag}");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["result"]["outcome"], "rotated");
+    assert_eq!(response["result"]["connector"]["secret_available"], true);
+    let after = fixture.connector();
+    for field in [
+        "connector_id",
+        "bindings",
+        "pairings",
+        "dots",
+        "routing_salt",
+    ] {
+        assert_eq!(after[field], before[field], "preserve {field}");
     }
-    assert!(!response.to_string().contains("wmcs_"));
-    // The credential already added to ChatGPT keeps working.
-    assert_eq!(fixture.connector()["secret_hash"], before);
+    let (old_status, _) = fixture.mcp("initialize", json!({}), false).await;
+    assert_eq!(old_status, StatusCode::FORBIDDEN);
+    fixture.secret = response["result"]["secret"]
+        .as_str()
+        .expect("replacement secret")
+        .into();
+    let (new_status, _) = fixture.mcp("initialize", json!({}), false).await;
+    assert_eq!(new_status, StatusCode::OK);
+    connectors::revoke(&fixture.state.home, &fixture.connector_id).expect("revoked fixture");
+    let (status, created) = fixture
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/web-model/connectors")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.admin))
+                .body(Body::from(json!({"provider":"chatgpt_web"}).to_string()))
+                .expect("fresh create"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created["result"]["outcome"], "created");
+    assert_ne!(
+        created["result"]["connector"]["connector_id"],
+        fixture.connector_id
+    );
+    assert_eq!(created["result"]["connector"]["secret_available"], true);
+    let secret = created["result"]["secret"].as_str().expect("new secret");
+    assert!(
+        created["result"]["connector"]["connector_url_path_token"]
+            .as_str()
+            .expect("token URL")
+            .ends_with(secret)
+    );
     fixture.close().await;
 }
 

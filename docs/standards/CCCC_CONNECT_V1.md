@@ -210,9 +210,10 @@ version and the challenge. The signature covers the fixed array defined by
 
 `POST /api/v1/connect/open { instance_id, frame_id }` requires current entry
 administrator access, including a recheck after the network challenge. It returns
-a target `/ui/connect/` URL and an Ed25519 frame proof binding account issuer,
-both instance/device IDs, exact parent origin, frame ID, nonce, issue and expiry
-times. `ConnectFrameProof::signing_material` defines the ordered signing array.
+a target `/ui/connect/` URL, the current account ID, and an Ed25519 frame proof
+binding account issuer, both instance/device IDs, exact parent origin, frame ID,
+nonce, issue and expiry times. `ConnectFrameProof::signing_material` defines the
+ordered signing array.
 Proof lifetime is at most 120 seconds, with up to 30 seconds of future clock skew.
 This proof permits embedding only; it does not create a target Web login.
 
@@ -222,12 +223,19 @@ in `frame-ancestors`; ordinary pages retain same-origin embedding policy. An
 already opened frame cannot be opened again with that proof. Public signed
 `POST /api/v1/connect/frame` renews an existing frame with a newer issue time and
 fresh nonce without changing its origin or bindings. Replayed renewals fail.
-The ephemeral registry is not a durable replay store: a Web restart ends live
-frames; an old proof still within its original expiry may open again after a
-restart, but never creates a human login or extends its authority.
+The ephemeral registry is not a durable replay store: a Web restart ends its
+registrations; an old proof still within its original expiry may open again
+after a restart, but never creates a human login or extends its authority.
 
 Administrator `GET /api/v1/connect/frame?frame_id=...` checks current target
-authority. Nested target-owned Presentation resources carry only `connect_frame`
+authority and returns the account ID associated with the admission. A loaded
+document may recover after expiration or a target Web restart using administrator
+`POST /api/v1/connect/frame/resume {proof,account_id}`. The target verifies the
+fresh signed proof and current account, checks the original bindings when a
+registration is still live, and records it atomically. A retry of the identical
+valid proof and account is idempotent; an older proof cannot replace a newer one.
+The account ID is retained in the page and registry memory, not browser storage.
+Nested target-owned Presentation resources carry only `connect_frame`
 to select that existing embedding authority; they still require the target
 token. Target downloads use authenticated fetch and a Blob URL because native
 download navigation can leave the embedded cookie partition. No bearer token
@@ -250,8 +258,18 @@ leaving it releases those connections. Previously viewed Group navigation remain
 in entry-page memory, independently of the selected workspace and explicit
 expand/collapse state. Inactive lists are labeled as saved navigation, not current
 online or administrator confirmation. Reopening always authenticates the target
-again before receiving content. Expired entry directory/entry access, device or
-origin replacement, and an active target lock clear the affected navigation.
+again before receiving content. When fresh authority is temporarily unavailable,
+implementations that support recovery keep the selected target document in memory
+but hide it, block new requests through the shared API wrappers, and stop the
+workbench's interactive streams. They resume only after the entry
+administrator, both account IDs, the target administrator, bindings and a fresh
+proof have been checked. Entry access revocation or an account, device or origin
+replacement ends the old document; older targets that cannot confirm recovery
+continue to close it. When an active target login is lost, the target shows its
+login gate and the entry clears the affected navigation. The workbench unmounts;
+only page-level state remains in memory. Target authorization rejected during a
+recovery closes the old page. A write already in flight may have completed and is
+not automatically replayed.
 No inactive iframe, TUI connection, bearer cache, or content synchronization is
 kept alive merely to preserve the sidebar. Realtime event and terminal connections also recheck current token access
 every 15 seconds; embedded resource connections additionally check the frame.
@@ -405,6 +423,13 @@ to this qualified route, even when a remote Group ID equals the source Group ID.
 It maps `idempotency_key` to `client_id`, generating a key if omitted. An explicit
 malformed or incomplete remote address fails instead of falling back locally.
 The operation takes only the source Group write permit and performs no network I/O.
+Both `connect_send` and `connect_send_files` reject unknown top-level arguments
+with `unknown_arguments` and
+`details: { unknown: string[], new_side_effects: false }` before replay lookup,
+file/blob handling or durable acceptance. The sorted list contains names only,
+never their values. The public calls accept the qualified destination and
+canonical `client_id`; an internal reply reference is constructed only by the
+existing verified reply path, not supplied to these send calls.
 
 Recipients use the existing recipient normalization and Inbox audience rules.
 Aliases are materialized against the known target catalog into concrete Actor IDs
@@ -759,7 +784,7 @@ account-peer endpoints MUST reject Direct authority; ordinary HTTPS certificate
 validation is unchanged. A copied Home is the same cryptographic identity and
 must not be run as an independent instance.
 
-An invitation is `cccc-direct:` plus base64url JSON with version `v:1`, a fresh
+A legacy single-use invitation is `cccc-direct:` plus base64url JSON with version `v:1`, a fresh
 `direct-<UUID>` ID, address, exact host instance/key/Group generation, expiry and
 random secret. The 30-minute invitation is shared through a trusted channel;
 it is not a navigation URL. The receiving store holds a secret digest. The
@@ -777,6 +802,21 @@ expired invitation can be newly imported or approved; this recovery only checks
 requests already persisted on the joining side. Revocation cannot be undone;
 reconnection requires a new invitation. A Group replacement or identity change
 invalidates its grants. Names are descriptive snapshots, not authority.
+
+Reusable invitations use the same envelope fields with `v:2` and a selected
+24-hour, 7-day (default), or 30-day deadline. Both endpoints must support them;
+legacy invitation generation/import and existing grants remain compatible. A permanent reusable key uses `v:3` with the explicit `expires_at:"never"` marker. V1/v2 require a finite RFC3339 deadline, and v3 requires this marker; neither may be silently converted to the other.
+The receiving store retains the reusable invitation in owner-only state, separate
+from its per-Group grants. A fresh request derives its connection ID from the first
+16 bytes of SHA-256 over the UTF-8 JSON array
+`[invitation_id, joining_instance_id, joining_group_id, joining_generation]`,
+formatted as `direct-` plus a UUID. The mutual-TLS hello adds `invitation_id` only
+for reusable v2/v3 tickets; the receiver verifies this derivation, the secret and the TLS peer before
+creating a separate pending grant. V1 hello messages omit the added field entirely.
+Each exact Group pair still requires explicit approval; replaying the same request
+does not create another grant or consume another use. Copying a shared invitation
+is an explicit local administrator action, never a status poll. Deletion requires
+Web confirmation and immediately retires the key and all grants minted from it, including approved pairs. The receiver denies their requests/reconnects and closes existing channels on its authorization check. Retired IDs remain non-reusable; deleting a key frees its grant quota. A joining client may replace a definitively revoked/expired record only through an explicit fresh-key import, which still needs new approval. Expiry alone preserves approved grants. Group retirement removes its shared invitations too.
 
 `direct_connections.json` is owner-only daemon state. Removed grant IDs remain
 as compact retirement markers, so removing a row cannot make an old invitation

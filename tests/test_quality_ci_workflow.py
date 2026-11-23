@@ -41,12 +41,30 @@ def test_ci_has_read_only_permissions_bounded_jobs_and_cancels_stale_runs() -> N
     }
     assert all(job.get("timeout-minutes") for job in jobs.values())
     assert max(int(job["timeout-minutes"]) for job in jobs.values()) <= 60
-    rust_toolchain = next(
-        step["uses"]
-        for step in jobs["rust-linux"]["steps"]
-        if step.get("uses", "").startswith("dtolnay/rust-toolchain")
-    )
-    assert rust_toolchain == "dtolnay/rust-toolchain@1.88.0"
+
+
+def test_rust_build_entrypoints_share_the_pinned_compatible_toolchain() -> None:
+    with (ROOT / "rust-toolchain.toml").open("rb") as handle:
+        pinned = tomllib.load(handle)["toolchain"]["channel"]
+    with (ROOT / "Cargo.toml").open("rb") as handle:
+        minimum = tomllib.load(handle)["workspace"]["package"]["rust-version"]
+    assert tuple(map(int, pinned.split("."))) >= tuple(map(int, minimum.split(".")))
+    for candidate in (_workflow(), _nightly_workflow(), _release_workflow()):
+        pins = [
+            step["uses"]
+            for job in candidate["jobs"].values()
+            for step in job.get("steps", [])
+            if step.get("uses", "").startswith("dtolnay/rust-toolchain@")
+        ]
+        assert pins
+        assert set(pins) == {f"dtolnay/rust-toolchain@{pinned}"}
+    stages = [
+        line.split()
+        for line in (ROOT / "docker/Dockerfile").read_text().splitlines()
+        if line.startswith("FROM ")
+    ]
+    rust_builder = next(stage[1] for stage in stages if stage[-1] == "rust-builder")
+    assert rust_builder == f"rust:{minimum}-bookworm"
 
 
 def test_pr_jobs_keep_quality_web_package_and_native_boundaries() -> None:
@@ -57,6 +75,7 @@ def test_pr_jobs_keep_quality_web_package_and_native_boundaries() -> None:
         "web",
         "package",
         "windows-smoke",
+        "tui-macos-smoke",
         "rust-linux",
         "ci-required",
     }
@@ -94,9 +113,9 @@ def test_web_ci_uses_managed_node_and_composite_vite_plus_check() -> None:
 def test_native_empty_session_smoke_is_enabled_without_provider_secrets() -> None:
     steps = _workflow()["jobs"]["rust-linux"]["steps"]
     install = next(step for step in steps if step.get("name") == "Install verified native CLI versions")
-    assert "@openai/codex@0.153.2" in install["run"]
-    assert "@anthropic-ai/claude-code@2.1.261" in install["run"]
-    assert "@kilocode/cli@7.5.14" in install["run"]
+    assert "@openai/codex@0.170.0" in install["run"]
+    assert "@anthropic-ai/claude-code@2.1.327" in install["run"]
+    assert "@kilocode/cli@7.8.27" in install["run"]
     smoke = next(step for step in steps if step.get("name") == "Verify native sessions without external model access")
     assert smoke["timeout-minutes"] == "5"
     assert smoke["env"]["CCCC_CODEX_EMPTY_LIVE"] == "1"
@@ -185,6 +204,9 @@ def test_nightly_runs_the_real_chrome_fixtures_ci_leaves_out() -> None:
     assert runs.index("google-chrome") < runs.index("--profile chrome")
     assert runs.index("Xvfb") < runs.index("--profile chrome")
     assert "cargo nextest run --workspace --locked --profile chrome" in runs
+    # Fixtures skip unless opted in, so only the nightly test step may opt in.
+    chrome_step = next(step for step in job["steps"] if "--profile chrome" in step.get("run", ""))
+    assert chrome_step["env"]["CCCC_TEST_REAL_CHROME"] == "1"
 
 
 def test_nightly_failure_reaches_the_team_without_committing_the_webhook() -> None:
@@ -277,7 +299,7 @@ def test_ci_keeps_python_only_for_release_and_repository_tooling() -> None:
     assert "python-compat" not in jobs
     assert not any(
         step.get("uses", "").startswith("actions/setup-python")
-        for name in ("web", "windows-smoke", "rust-linux")
+        for name in ("web", "windows-smoke", "tui-macos-smoke", "rust-linux")
         for step in jobs[name]["steps"]
     )
 
@@ -404,6 +426,7 @@ def test_release_builds_one_atomic_rust_only_set() -> None:
     assert "cargo build --release --locked --features standalone" in release_runs
     assert "scripts/check_release_versions.py --rust-binary" in release_runs
     assert "scripts/build_standalone_archive.py" in release_runs
+    assert "--label" not in release_runs
     assert "scripts/build_native_wheel.py" in release_runs
     assert "scripts/verify_native_wheel.py" in release_runs
     assert release_runs.count("scripts/tests/smoke_wheel_frontdoor.py") == 2
@@ -632,6 +655,9 @@ def test_source_helpers_use_one_native_product_path() -> None:
     assert "cccc.daemon_main" not in start
     for script in (package_unix, package_windows):
         assert "build_standalone_archive.py" in script
+        assert "--label" in script
+        assert ".git" in script
+        assert "-dirty" in script
         assert "--install-deps" in script
         assert "--features standalone" in script
         assert "--version" in script

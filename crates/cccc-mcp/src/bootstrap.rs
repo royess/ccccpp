@@ -1,49 +1,80 @@
 use cccc_client::DaemonClient;
-use cccc_core::HomeLayout;
+use cccc_core::{GroupDoc, HomeLayout, group_scope};
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::fs;
-use std::time::Duration;
 
 use crate::ToolCallError;
 use crate::router::daemon;
 
 const RECOVERY_TOKEN_BUDGET: usize = 1_100;
+const MAX_RECOVERY_CONSTRAINTS: usize = 6;
 const STALE_AFTER_SECONDS: i64 = 20 * 60;
 const MIND_HOT_ONLY_UPDATE_THRESHOLD: u64 = 3;
+const MAX_LISTED_SKILLS: usize = 8;
+const MAX_RECOMMENDED_ENTRIES: usize = 24;
+const MAX_RECOMMENDED_BYTES: usize = 3072;
+const MAX_USE_WHEN_CHARS: usize = 96;
+const MAX_REQUIREMENTS_CHARS: usize = 90;
+const RECOMMENDED_NOTE: &str = "Entries are optional; listing does not enable them. Search an exact ID with cccc_capability_search to check requirements and limitations before use. Use cccc_capability_use(capability_id=...) to enable an MCP or read a skill. Meet setup requirements first. Keep your own tools when they fit. Roles apply only to the stated use case.";
+const RECOMMENDED_SEARCH: &str = "cccc_capability_search(query=...) by name or a short word";
+
 pub(crate) async fn build(
     home: &HomeLayout,
     client: &DaemonClient,
     args: Map<String, Value>,
 ) -> Result<Value, ToolCallError> {
+    crate::local_tools::revalidate(home, &args)?;
     let group_id = string_value(args.get("group_id"))
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "group_id is required".to_owned())?;
-    let actor_id = string_value(args.get("actor_id"))
+    // actor_id can be a model-selected target on other tools. Bootstrap always
+    // reports and reads the authenticated caller, just like local execution.
+    let actor_id = string_value(args.get("by"))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "user".into());
+    let binding = args.get("_cccc_web_binding");
+    let native_binding = args.get("_cccc_native_binding");
     let inbox_limit = args
         .get("inbox_limit")
         .and_then(Value::as_u64)
         .unwrap_or(50)
         .clamp(1, 200) as usize;
-    let group_result = daemon(client, "group_show", request_args(&group_id, &actor_id)).await?;
-    let group = group_result
-        .get("group")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "group_show returned no group".to_owned())?;
+    let group_result = daemon(
+        client,
+        "group_show",
+        request_args(&group_id, &actor_id, binding, native_binding),
+    )
+    .await?;
+    let group: GroupDoc = serde_json::from_value(
+        group_result
+            .get("group")
+            .cloned()
+            .ok_or("group_show returned no group")?,
+    )
+    .map_err(|error| format!("group_show returned an invalid group: {error}"))?;
 
-    let actors_result = daemon(client, "actor_list", request_args(&group_id, &actor_id)).await?;
+    let actors_result = daemon(
+        client,
+        "actor_list",
+        request_args(&group_id, &actor_id, binding, native_binding),
+    )
+    .await?;
     let actors = actors_result
         .get("actors")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
 
-    let context = daemon(client, "context_get", request_args(&group_id, &actor_id)).await?;
+    let context = daemon(
+        client,
+        "context_get",
+        request_args(&group_id, &actor_id, binding, native_binding),
+    )
+    .await?;
 
-    let mut inbox_args = request_args(&group_id, &actor_id);
+    let mut inbox_args = request_args(&group_id, &actor_id, binding, native_binding);
     inbox_args.insert(
         "limit".into(),
         json!(inbox_limit.saturating_add(1).min(200)),
@@ -56,23 +87,183 @@ pub(crate) async fn build(
         .get("context_hygiene")
         .cloned()
         .unwrap_or_else(|| missing_hygiene(&actor_id));
-    let memory_recall_gate =
-        build_memory_recall_gate(client, &group_id, &actor_id, &recovery_pack).await;
 
     let mut payload = assemble_payload(
-        build_session(group, actors, &actor_id),
+        build_session(
+            &group,
+            actors,
+            &actor_id,
+            group_result
+                .get("effective_scope")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        ),
         build_recovery(&recovery_pack),
         build_inbox_preview(&inbox, inbox_limit),
         context_hygiene,
-        memory_recall_gate,
     );
+    if native_binding.is_some() {
+        name_group_in_examples(&mut payload, &group_id);
+    }
     if let Ok(store) = cccc_core::GroupStore::new(home.clone())
         && let Ok(group) = store.load(&group_id)
         && let Ok(Some(pending)) = cccc_core::inbox::mail_pending_summary(home, &group, &actor_id)
     {
         payload["mail_pending"] = pending;
     }
+    // Bootstrap must survive a failed read; the agent only misses the capability lists.
+    let capabilities = daemon(
+        client,
+        "capability_state",
+        request_args(&group_id, &actor_id, binding, native_binding),
+    )
+    .await
+    .unwrap_or_default();
+    let skills = available_skills(&capabilities);
+    // A skill the agent already sees in available_skills is not listed twice.
+    let listed = skills
+        .as_ref()
+        .and_then(|skills| skills["skills"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|skill| skill["capability_id"].as_str().map(str::to_owned))
+        .collect::<HashSet<_>>();
+    if let Some(skills) = skills {
+        payload["available_skills"] = skills;
+    }
+    if let Some(recommended) = recommended(&capabilities, &listed) {
+        payload["recommended"] = recommended;
+    }
+    crate::local_tools::revalidate(home, &args)?;
     Ok(payload)
+}
+
+/// The skills this agent may use, assigned ones first. An assigned skill counts before
+/// the agent restarts, since using it enables it. The agent is told only that they
+/// exist: their rules can be long, and most tasks need none of them.
+fn available_skills(capabilities: &Map<String, Value>) -> Option<Value> {
+    let mut seen = std::collections::BTreeSet::new();
+    let skills = ["autoload_skills", "active_capsule_skills"]
+        .iter()
+        .filter_map(|key| capabilities.get(*key).and_then(Value::as_array))
+        .flatten()
+        .filter(|skill| seen.insert(skill["capability_id"].to_string()))
+        .collect::<Vec<_>>();
+    if skills.is_empty() {
+        return None;
+    }
+    let listed = skills
+        .iter()
+        .take(MAX_LISTED_SKILLS)
+        .map(|skill| {
+            let description = skill["description_short"].as_str().unwrap_or_default();
+            json!({
+                "capability_id": skill["capability_id"],
+                "name": skill["name"],
+                "description": description.chars().take(160).collect::<String>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut result = json!({
+        "skills": listed,
+        "note": "For the tasks they fit. cccc_capability_use(capability_id=...) returns a skill's rules in capsule_text.",
+    });
+    if skills.len() > MAX_LISTED_SKILLS {
+        result["omitted"] = json!({
+            "count": skills.len() - MAX_LISTED_SKILLS,
+            "list": "cccc_capability_use(tool_name=\"cccc_capability_state\")",
+        });
+    }
+    Some(result)
+}
+
+/// Every release recommendation this agent might use, one line each: its role, exact ID and
+/// first use case, and what it still needs. Blocked and unsupported entries are left out, and so
+/// are skills already in available_skills. needs_setup and unknown entries stay, marked with their
+/// requirements: an option the agent cannot use yet is still one it should know about. Pending
+/// entries come first, then primaries, then alternatives in manifest order. Both bounds (entries,
+/// and the compact JSON size of the whole section) keep the packet small however long the catalog
+/// grows; the omitted count says how many eligible entries were left out.
+fn recommended(capabilities: &Map<String, Value>, listed: &HashSet<String>) -> Option<Value> {
+    let entries = capabilities.get("recommended")?.as_array()?;
+    let mut seen = HashSet::new();
+    let items = cccc_core::capability_recommendations::for_member(entries)
+        .into_iter()
+        .filter(|entry| {
+            entry["capability_id"]
+                .as_str()
+                .is_some_and(|id| !listed.contains(id) && seen.insert(id.to_owned()))
+        })
+        .filter_map(index_item)
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return None;
+    }
+    let eligible = items.len();
+    let mut lines = items
+        .into_iter()
+        .take(MAX_RECOMMENDED_ENTRIES)
+        .collect::<Vec<_>>();
+    // Whole lines leave from the end until the section fits, so an ID is never cut. The note and
+    // the omitted object alone stay far below the bound.
+    let mut section = index_section(&lines, eligible);
+    while section.to_string().len() > MAX_RECOMMENDED_BYTES && lines.pop().is_some() {
+        section = index_section(&lines, eligible);
+    }
+    Some(section)
+}
+
+fn index_section(lines: &[String], eligible: usize) -> Value {
+    let mut section = json!({"lines": lines, "note": RECOMMENDED_NOTE});
+    if eligible > lines.len() {
+        section["omitted"] = json!({
+            "count": eligible - lines.len(),
+            "search": RECOMMENDED_SEARCH,
+        });
+    }
+    section
+}
+
+/// Format a member recommendation without copying its full rules.
+fn index_item(entry: &Value) -> Option<String> {
+    let for_you = &entry["for_you"];
+    let id = entry["capability_id"].as_str()?;
+    // A role applies to the use case on its line, never to the catalog as a whole.
+    let primary = entry["recommendation"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["role"] == "primary"));
+    let role = if primary { "primary" } else { "alternative" };
+    let mut text = match entry["use_when"].get(0).and_then(Value::as_str) {
+        Some(when) if !when.trim().is_empty() => {
+            format!("[{role}] {id} ({})", trim_text(when, MAX_USE_WHEN_CHARS))
+        }
+        _ => format!("[{role}] {id}"),
+    };
+    let requirements = |label: &str| match entry["requirements_summary"].as_str() {
+        Some(requires) if !requires.trim().is_empty() => {
+            format!("{label}: {}", trim_text(requires, MAX_REQUIREMENTS_CHARS))
+        }
+        _ => label.to_owned(),
+    };
+    let pending = for_you["activation_pending"] == true;
+    let mut marks = Vec::new();
+    if for_you["enabled"] == true {
+        marks.push("enabled".to_owned());
+    }
+    match for_you["availability"].as_str() {
+        // Discovery with the agent's own credential has yet to be tried, which
+        // says nothing about whether it will succeed.
+        Some("compatible") if pending => marks.push("discovery pending".to_owned()),
+        Some("compatible") => {}
+        // CCCC cannot see the agent's own tools, so it cannot say what is missing.
+        Some("unknown") => marks.push(requirements("check requirements")),
+        Some("needs_setup") => marks.push(requirements("setup required")),
+        _ => return None,
+    }
+    if !marks.is_empty() {
+        text.push_str(&format!(" [{}]", marks.join("; ")));
+    }
+    Some(text)
 }
 
 fn assemble_payload(
@@ -80,74 +271,116 @@ fn assemble_payload(
     recovery: Value,
     inbox_preview: Value,
     context_hygiene: Value,
-    memory_recall_gate: Value,
 ) -> Value {
     json!({
         "session": session,
         "recovery": recovery,
         "inbox_preview": inbox_preview,
         "context_hygiene": context_hygiene,
-        "memory_recall_gate": memory_recall_gate,
         "next_calls": {
             "help": "cccc_help()  # when a CCCC route or state boundary is unclear",
-            "context_get": "cccc_context_get()",
+            "context_get": "cccc_context_get(detail=\"overview\")  # brief, agent states",
+            "tasks": "cccc_task()  # open tasks, one row each; pass task_id to read one in full",
             "connect": "cccc_connect()  # discover accessible remote Groups/Actors; use both instance_id and target_group_id for an external_groups entry",
             "inbox_read": "cccc_inbox_read()",
-            "memory_search": "cccc_capability_use(tool_name=\"cccc_memory\", tool_arguments={\"action\":\"search\",\"query\":\"...\"})",
         }
     })
 }
 
-fn request_args(group_id: &str, actor_id: &str) -> Map<String, Value> {
-    Map::from_iter([
+/// A native session has no Group of its own to fall back on, so the calls
+/// bootstrap suggests to it name the Group.
+fn name_group_in_examples(payload: &mut Value, group_id: &str) {
+    let name_group = |example: &mut Value| {
+        if let Some((tool, arguments)) = example.as_str().and_then(|call| call.split_once('(')) {
+            let separator = if arguments.starts_with(')') { "" } else { ", " };
+            *example = json!(format!(
+                "{tool}(group_id=\"{group_id}\"{separator}{arguments}"
+            ));
+        }
+    };
+    if let Some(calls) = payload["next_calls"].as_object_mut() {
+        calls.values_mut().for_each(name_group);
+    }
+    for key in [
+        "update_command",
+        "execution_update_command",
+        "mind_context_update_command",
+    ] {
+        if let Some(example) = payload["context_hygiene"].get_mut(key) {
+            name_group(example);
+        }
+    }
+}
+
+fn request_args(
+    group_id: &str,
+    actor_id: &str,
+    binding: Option<&Value>,
+    native_binding: Option<&Value>,
+) -> Map<String, Value> {
+    let mut args = Map::from_iter([
         ("group_id".into(), Value::String(group_id.to_owned())),
         ("actor_id".into(), Value::String(actor_id.to_owned())),
         ("by".into(), Value::String(actor_id.to_owned())),
-    ])
+    ]);
+    if let Some(binding) = binding {
+        args.insert("_cccc_web_binding".into(), binding.clone());
+    }
+    if let Some(binding) = native_binding {
+        args.insert("_cccc_native_binding".into(), binding.clone());
+    }
+    args
 }
 
-fn build_session(group: &Map<String, Value>, actors: &[Value], actor_id: &str) -> Value {
+fn build_session(
+    group: &GroupDoc,
+    actors: &[Value],
+    actor_id: &str,
+    effective_scope: Value,
+) -> Value {
     let actor = actors
         .iter()
         .filter_map(Value::as_object)
         .find(|actor| actor.get("id").and_then(Value::as_str) == Some(actor_id));
-    let scope = selected_scope(group);
-    let active_scope = scope.map_or_else(
+    let active_scope = group_scope::effective_scope(group, None).map_or_else(
         || json!({}),
         |scope| {
             json!({
-                "scope_key": string_value(scope.get("scope_key")).unwrap_or_default(),
-                "path": string_value(scope.get("url")).unwrap_or_default(),
+                "scope_key": scope.scope_key,
+                "path": cccc_runtime::compatible_path(std::path::Path::new(&scope.url)),
             })
         },
     );
+    let members = actors
+        .iter()
+        .map(|member| {
+            let mut summary = json!({
+                "actor_id": member["id"],
+                "runtime": member["runtime"],
+                "role": member["role"],
+                "enabled": member["enabled"],
+            });
+            if let Some(source_id) = member
+                .get("external_session_id")
+                .and_then(Value::as_str)
+                .filter(|source_id| !source_id.is_empty())
+            {
+                summary["source_id"] = json!(source_id);
+            }
+            summary
+        })
+        .collect::<Vec<_>>();
 
     json!({
-        "group_id": string_value(group.get("group_id")).unwrap_or_default(),
-        "group_title": string_value(group.get("title"))
-            .filter(|value| !value.is_empty())
-            .or_else(|| string_value(group.get("group_id")))
-            .unwrap_or_default(),
+        "group_id": group.group_id,
+        "group_title": if group.title.trim().is_empty() { &group.group_id } else { group.title.trim() },
         "actor_id": actor_id,
         "role": actor.and_then(|item| string_value(item.get("role"))).unwrap_or_default(),
         "runner": actor.and_then(|item| string_value(item.get("runner"))).unwrap_or_default(),
+        "members": members,
         "active_scope": active_scope,
+        "effective_scope": effective_scope,
     })
-}
-
-fn selected_scope(group: &Map<String, Value>) -> Option<&Map<String, Value>> {
-    let active = group
-        .get("active_scope_key")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let scopes = group.get("scopes").and_then(Value::as_array)?;
-    scopes
-        .iter()
-        .filter_map(Value::as_object)
-        .find(|scope| {
-            !active.is_empty() && scope.get("scope_key").and_then(Value::as_str) == Some(active)
-        })
-        .or_else(|| scopes.iter().find_map(Value::as_object))
 }
 
 fn build_recovery_pack(
@@ -200,7 +433,7 @@ fn build_recovery_pack(
         now,
     );
 
-    let mut pack = json!({
+    let pack = json!({
         "agent_state": {
             "id": actor_state.and_then(|state| state.get("id")).cloned().unwrap_or_else(|| Value::String(actor_id.to_owned())),
             "hot": hot,
@@ -217,28 +450,33 @@ fn build_recovery_pack(
             ),
             ("project_brief".into(), trimmed_value(brief.and_then(|value| value.get("project_brief")), 260)),
             ("project_brief_stale".into(), Value::Bool(brief.and_then(|value| value.get("project_brief_stale")).and_then(Value::as_bool).unwrap_or(false))),
+            // When the brief itself was last edited, so a reader can see an old brief. Not the
+            // context document's time, which other writes advance; absent stays absent.
+            ("updated_at".into(), brief.and_then(|value| value.get("updated_at")).and_then(Value::as_str).map_or(Value::Null, |value| Value::String(value.to_owned()))),
         ])),
         "tasks": {
             "assigned_active": assigned_active,
             "attention": attention,
         },
-        "recent_decisions": recent_notes(coordination, "recent_decisions"),
-        "recent_handoffs": recent_notes(coordination, "recent_handoffs"),
         "context_hygiene": hygiene,
     });
-    let constraints = brief.and_then(|value| value.get("constraints"));
-    // Reserve a small explicit omission notice while trimming the other context.
-    // Never turn a partial constraint into an apparently complete instruction.
-    set_constraints(&mut pack, full_constraints(constraints, 0));
-    shrink_recovery_pack(&mut pack);
-    for count in 1..=6 {
-        let previous = pack["coordination_brief"]["constraints"].clone();
-        set_constraints(&mut pack, full_constraints(constraints, count));
-        if estimate_tokens(&pack) > RECOVERY_TOKEN_BUDGET {
-            pack["coordination_brief"]["constraints"] = previous;
-            break;
+    fit_constraints(pack, brief.and_then(|value| value.get("constraints")))
+}
+
+/// Standing rules outrank the rest of the pack, which is trimmed to keep them.
+/// Rules that still do not fit leave whole, behind an explicit omission notice:
+/// never turn a partial constraint into an apparently complete instruction.
+fn fit_constraints(mut pack: Value, constraints: Option<&Value>) -> Value {
+    for count in (1..=MAX_RECOVERY_CONSTRAINTS).rev() {
+        let mut candidate = pack.clone();
+        set_constraints(&mut candidate, full_constraints(constraints, count));
+        shrink_recovery_pack(&mut candidate);
+        if estimate_tokens(&candidate) <= RECOVERY_TOKEN_BUDGET {
+            return candidate;
         }
     }
+    set_constraints(&mut pack, full_constraints(constraints, 0));
+    shrink_recovery_pack(&mut pack);
     pack
 }
 
@@ -329,12 +567,7 @@ fn task_slice(tasks: &[Value], actor_id: &str) -> (Vec<Value>, Vec<Value>) {
             actor_attention.push(slim);
         } else if waiting_on == "user" {
             waiting_user.push(slim);
-        } else if task
-            .get("blocked_by")
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-            || waiting_on == "external"
-        {
+        } else if cccc_core::context::task_is_blocked(task) {
             globally_blocked.push(slim);
         }
     }
@@ -395,8 +628,12 @@ fn slim_task(task: &Map<String, Value>) -> Value {
         })
         .collect::<Vec<_>>();
     let blocked_by = trimmed_list(task.get("blocked_by"), 4, 64);
-    Value::Object(clean_object(Map::from_iter([
+    let mut result = clean_object(Map::from_iter([
         ("id".into(), trimmed_value(task.get("id"), 64)),
+        (
+            "rev".into(),
+            task.get("rev").cloned().unwrap_or(Value::Null),
+        ),
         ("title".into(), trimmed_value(task.get("title"), 120)),
         ("outcome".into(), trimmed_value(task.get("outcome"), 160)),
         ("parent_id".into(), trimmed_value(task.get("parent_id"), 64)),
@@ -419,27 +656,14 @@ fn slim_task(task: &Map<String, Value>) -> Value {
             task.get("updated_at").cloned().unwrap_or(Value::Null),
         ),
         ("blocked_by".into(), Value::Array(blocked_by)),
-    ])))
-}
-
-fn recent_notes(coordination: Option<&Map<String, Value>>, key: &str) -> Value {
-    let notes = coordination
-        .and_then(|value| value.get(key))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_object)
-        .take(2)
-        .map(|item| {
-            Value::Object(clean_object(Map::from_iter([
-                ("at".into(), item.get("at").cloned().unwrap_or(Value::Null)),
-                ("by".into(), trimmed_value(item.get("by"), 64)),
-                ("summary".into(), trimmed_value(item.get("summary"), 180)),
-                ("task_id".into(), trimmed_value(item.get("task_id"), 64)),
-            ])))
-        })
-        .collect();
-    Value::Array(notes)
+    ]));
+    if task.contains_key("open_blocked_by") {
+        result.insert(
+            "open_blocked_by".into(),
+            Value::Array(trimmed_list(task.get("open_blocked_by"), 4, 64)),
+        );
+    }
+    Value::Object(result)
 }
 
 fn build_recovery(pack: &Value) -> Value {
@@ -465,13 +689,6 @@ fn build_recovery(pack: &Value) -> Value {
             pack.get("tasks")
                 .cloned()
                 .unwrap_or_else(|| json!({"assigned_active": [], "attention": []})),
-        ),
-        (
-            "recent_notes".into(),
-            json!({
-                "decisions": pack.get("recent_decisions").cloned().unwrap_or_else(|| json!([])),
-                "handoffs": pack.get("recent_handoffs").cloned().unwrap_or_else(|| json!([])),
-            }),
         ),
     ]);
     Value::Object(recovery)
@@ -513,157 +730,6 @@ fn build_inbox_preview(inbox: &Map<String, Value>, limit: usize) -> Value {
         })
         .collect::<Vec<_>>();
     json!({"messages": preview, "truncated": messages.len() > limit})
-}
-
-async fn build_memory_recall_gate(
-    client: &DaemonClient,
-    group_id: &str,
-    actor_id: &str,
-    recovery_pack: &Value,
-) -> Value {
-    let query = memory_recall_query(recovery_pack);
-    let mut args = request_args(group_id, actor_id);
-    args.insert("query".into(), Value::String(query.clone()));
-    args.insert("max_results".into(), json!(3));
-    args.insert("min_score".into(), json!(0.1));
-    let result = tokio::time::timeout(
-        Duration::from_secs(4),
-        daemon(client, "memory_reme_search", args),
-    )
-    .await;
-    let mut gate = json!({
-        "required": true,
-        "status": "empty",
-        "query": query,
-        "hits": [],
-        "note": "Recall gate: read this before planning or implementation. If it is empty, expand with local cccc_memory(search/get).",
-    });
-    match result {
-        Ok(Ok(response)) => {
-            let hits = response
-                .get("hits")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_object)
-                .take(3)
-                .map(|item| {
-                    json!({
-                        "path": string_value(item.get("path")).unwrap_or_default(),
-                        "start_line": item.get("start_line").and_then(Value::as_u64).unwrap_or(1),
-                        "score": item.get("score").and_then(Value::as_f64).unwrap_or(0.0),
-                        "snippet": trim_text(item.get("snippet").and_then(Value::as_str).unwrap_or_default(), 220),
-                    })
-                })
-                .collect::<Vec<_>>();
-            gate["status"] = Value::String(if hits.is_empty() { "empty" } else { "ready" }.into());
-            gate["hits"] = Value::Array(hits);
-        }
-        Ok(Err(error)) => {
-            gate["status"] = Value::String("error".into());
-            gate["error"] = Value::String(error.to_string());
-        }
-        Err(_) => {
-            gate["status"] = Value::String("error".into());
-            gate["error"] = Value::String("memory recall timed out after 4 seconds".into());
-        }
-    }
-    gate
-}
-
-fn memory_recall_query(pack: &Value) -> String {
-    let agent_state = pack.get("agent_state").and_then(Value::as_object);
-    let hot = agent_state
-        .and_then(|value| value.get("hot"))
-        .and_then(Value::as_object);
-    let warm = agent_state
-        .and_then(|value| value.get("warm"))
-        .and_then(Value::as_object);
-    let mini = agent_state
-        .and_then(|value| value.get("mind_context_mini"))
-        .and_then(Value::as_object);
-    let brief = pack.get("coordination_brief").and_then(Value::as_object);
-    let tasks = pack.get("tasks").and_then(Value::as_object);
-    let mut ranked = Vec::new();
-    let mut seen = HashSet::new();
-    let mut add = |priority: usize, value: Option<&Value>, max_chars: usize| {
-        let text = trim_text(&string_value(value).unwrap_or_default(), max_chars);
-        if !text.is_empty() && seen.insert(text.to_lowercase()) {
-            ranked.push((priority, text));
-        }
-    };
-    add(0, hot.and_then(|value| value.get("active_task_id")), 48);
-    add(1, hot.and_then(|value| value.get("focus")), 120);
-    add(2, hot.and_then(|value| value.get("next_action")), 120);
-    add(3, brief.and_then(|value| value.get("current_focus")), 120);
-    if let Some(task) = tasks
-        .and_then(|value| value.get("assigned_active"))
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(Value::as_object)
-    {
-        add(4, task.get("title"), 100);
-        add(5, task.get("outcome"), 120);
-    }
-    add(6, warm.and_then(|value| value.get("what_changed")), 120);
-    for value in warm
-        .and_then(|value| value.get("open_loops"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .take(2)
-    {
-        add(7, Some(value), 120);
-    }
-    if let Some(task) = tasks
-        .and_then(|value| value.get("attention"))
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(Value::as_object)
-    {
-        add(8, task.get("title"), 100);
-    }
-    for value in warm
-        .and_then(|value| value.get("commitments"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .take(2)
-    {
-        add(8, Some(value), 120);
-    }
-    add(9, brief.and_then(|value| value.get("objective")), 120);
-    add(
-        10,
-        warm.and_then(|value| value.get("environment_summary"))
-            .or_else(|| mini.and_then(|value| value.get("environment_summary"))),
-        100,
-    );
-    add(
-        11,
-        warm.and_then(|value| value.get("user_model"))
-            .or_else(|| mini.and_then(|value| value.get("user_model"))),
-        100,
-    );
-    add(
-        12,
-        warm.and_then(|value| value.get("persona_notes"))
-            .or_else(|| mini.and_then(|value| value.get("persona_notes"))),
-        100,
-    );
-    if ranked.is_empty() {
-        return "recent decisions constraints preferences".into();
-    }
-    ranked.sort_by_key(|item| item.0);
-    trim_text(
-        &ranked
-            .into_iter()
-            .take(6)
-            .map(|(_, text)| text)
-            .collect::<Vec<_>>()
-            .join(" | "),
-        240,
-    )
 }
 
 fn evaluate_hygiene(
@@ -769,9 +835,9 @@ fn evaluate_hygiene(
             "touch_age_seconds": mind_age,
             "hot_only_updates_since_touch": churn,
         },
-        "update_command": "cccc_agent_state(action=\"update\", actor_id=\"<self>\", focus=\"...\", next_action=\"...\", what_changed=\"...\", environment_summary=\"...\", user_model=\"...\", persona_notes=\"...\")",
-        "execution_update_command": "cccc_agent_state(action=\"update\", actor_id=\"<self>\", focus=\"...\", next_action=\"...\", what_changed=\"...\")",
-        "mind_context_update_command": "cccc_agent_state(action=\"update\", actor_id=\"<self>\", environment_summary=\"...\", user_model=\"...\", persona_notes=\"...\")",
+        "update_command": "cccc_agent_state(action=\"update\", focus=\"...\", next_action=\"...\", what_changed=\"...\", environment_summary=\"...\", user_model=\"...\", persona_notes=\"...\")",
+        "execution_update_command": "cccc_agent_state(action=\"update\", focus=\"...\", next_action=\"...\", what_changed=\"...\")",
+        "mind_context_update_command": "cccc_agent_state(action=\"update\", environment_summary=\"...\", user_model=\"...\", persona_notes=\"...\")",
         "recommendation": recommendation,
     })
 }
@@ -803,12 +869,6 @@ fn load_runtime_meta(home: &HomeLayout, group_id: &str, actor_id: &str) -> Map<S
 }
 
 fn shrink_recovery_pack(pack: &mut Value) {
-    while estimate_tokens(pack) > RECOVERY_TOKEN_BUDGET && pop_last(pack.get_mut("recent_handoffs"))
-    {
-    }
-    while estimate_tokens(pack) > RECOVERY_TOKEN_BUDGET
-        && pop_last(pack.get_mut("recent_decisions"))
-    {}
     while estimate_tokens(pack) > RECOVERY_TOKEN_BUDGET
         && array_len(pack.pointer("/tasks/attention")) > 1
         && pop_last(pack.pointer_mut("/tasks/attention"))
@@ -973,6 +1033,53 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    #[test]
+    fn session_lists_recipients_without_runtime_configuration() {
+        let temp = tempfile::tempdir().expect("fixture directory");
+        let home = HomeLayout::from_path(temp.path()).expect("home");
+        let group = cccc_core::GroupStore::new(home)
+            .expect("groups")
+            .create("Recipients", "")
+            .expect("group");
+        let members = [
+            json!({"id":"lead","runtime":"codex","role":"foreman","enabled":true,
+                "external_session_id":"codex:thread-a","env":{"FIXTURE":"private"},
+                "command":["private-launcher"],"pid":123}),
+            json!({"id":"peer","runtime":"claude","role":"peer","enabled":false,
+                "external_session_id":"","env":{"FIXTURE":"private"}}),
+        ];
+        let session = build_session(&group, &members, "lead", json!({}));
+        assert_eq!(session["actor_id"], "lead");
+        assert_eq!(
+            session["members"],
+            json!([
+                {"actor_id":"lead","runtime":"codex","role":"foreman","enabled":true,
+                    "source_id":"codex:thread-a"},
+                {"actor_id":"peer","runtime":"claude","role":"peer","enabled":false},
+            ])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn session_shows_the_drive_path_of_a_verbatim_group_scope() {
+        let temp = tempfile::tempdir().expect("fixture directory");
+        let home = HomeLayout::from_path(temp.path()).expect("home");
+        let mut group = cccc_core::GroupStore::new(home)
+            .expect("groups")
+            .create("Verbatim scope", "")
+            .expect("group");
+        group.scopes.push(cccc_core::Scope {
+            scope_key: "scope_demo".into(),
+            url: r"\\?\C:\work\demo".into(),
+            label: "demo".into(),
+            git_remote: String::new(),
+        });
+        group.active_scope_key = "scope_demo".into();
+        let session = build_session(&group, &[], "lead", json!({}));
+        assert_eq!(session["active_scope"]["path"], r"C:\work\demo");
+    }
+
     fn fixture_context() -> Map<String, Value> {
         json!({
             "coordination": {
@@ -986,9 +1093,7 @@ mod tests {
                     "outcome": "The native engine exposes one useful packet.",
                     "status": "active",
                     "assignee": "peer1"
-                }],
-                "recent_decisions": [],
-                "recent_handoffs": []
+                }]
             },
             "agent_states": [{
                 "id": "peer1",
@@ -1008,6 +1113,31 @@ mod tests {
         .as_object()
         .cloned()
         .expect("fixture context")
+    }
+
+    #[test]
+    fn brief_edit_time_comes_from_the_brief_and_is_never_invented() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 9, 5, 1, 0)
+            .single()
+            .expect("timestamp");
+        let pack = build_recovery_pack(&fixture_context(), "peer1", &Map::new(), now);
+        assert!(pack["coordination_brief"].get("updated_at").is_none());
+
+        let mut context = fixture_context();
+        context.insert("updated_at".into(), json!("2026-08-09T04:59:00Z"));
+        context
+            .get_mut("coordination")
+            .and_then(|value| value.pointer_mut("/brief"))
+            .and_then(Value::as_object_mut)
+            .expect("brief")
+            .insert("updated_at".into(), json!("2026-08-07T10:43:13Z"));
+        let pack = build_recovery_pack(&context, "peer1", &Map::new(), now);
+        assert_eq!(
+            pack["coordination_brief"]["updated_at"],
+            "2026-08-07T10:43:13Z"
+        );
+        assert_eq!(pack["agent_state"]["updated_at"], "2026-08-09T05:00:00Z");
     }
 
     #[test]
@@ -1065,13 +1195,45 @@ mod tests {
     }
 
     #[test]
+    fn standing_rules_outrank_the_rest_of_the_pack() {
+        let rules = json!([
+            "Only the user pushes",
+            "Relay messages sent only to the foreman",
+            "Do not restart the user's services",
+            "GitHub actions are the user's",
+            "A parked task stays parked",
+        ]);
+        // Many small attention rows sit just under the budget, as for a busy agent. Trimming
+        // only for the omission notice would free too little for any rule.
+        let row = json!({"id": "T1"});
+        let mut pack = json!({"coordination_brief": {}, "tasks": {"attention": []}});
+        while estimate_tokens(&pack) + estimate_tokens(&row) < RECOVERY_TOKEN_BUDGET {
+            pack["tasks"]["attention"]
+                .as_array_mut()
+                .expect("valid test fixture")
+                .push(row.clone());
+        }
+
+        let pack = fit_constraints(pack, Some(&rules));
+
+        assert_eq!(pack["coordination_brief"]["constraints"], rules);
+        assert!(estimate_tokens(&pack) <= RECOVERY_TOKEN_BUDGET);
+    }
+
+    #[test]
     fn long_constraints_respect_budget_without_cutting_individual_rules() {
         for rule in ["r".repeat(1_200), "条件を守る。".repeat(400)] {
             let mut context = fixture_context();
             context.get_mut("coordination").expect("valid test fixture")["brief"]["constraints"] =
                 json!(vec![rule.clone(); 8]);
+            context.get_mut("coordination").expect("valid test fixture")["brief"]["updated_at"] =
+                json!("2026-08-07T10:43:13Z");
             let pack = build_recovery_pack(&context, "peer1", &Map::new(), Utc::now());
             assert!(estimate_tokens(&pack) <= RECOVERY_TOKEN_BUDGET);
+            assert_eq!(
+                pack["coordination_brief"]["updated_at"],
+                "2026-08-07T10:43:13Z"
+            );
             let constraints = pack["coordination_brief"]["constraints"]
                 .as_array()
                 .expect("valid test fixture");
@@ -1114,26 +1276,12 @@ mod tests {
     }
 
     #[test]
-    fn recall_query_prioritizes_live_execution_state() {
-        let now = Utc
-            .with_ymd_and_hms(2026, 8, 9, 5, 1, 0)
-            .single()
-            .expect("timestamp");
-        let pack = build_recovery_pack(&fixture_context(), "peer1", &Map::new(), now);
-        let query = memory_recall_query(&pack);
-
-        assert!(query.starts_with("bootstrap semantic conformance | compare packets"));
-        assert!(query.chars().count() <= 240);
-    }
-
-    #[test]
-    fn public_payload_has_only_the_six_cold_start_sections() {
+    fn public_payload_has_only_the_five_cold_start_sections() {
         let payload = assemble_payload(
             json!({}),
             json!({}),
             json!({"messages": [], "truncated": false}),
             json!({}),
-            json!({"required": true, "status": "empty", "query": "q", "hits": []}),
         );
         let mut keys = payload
             .as_object()
@@ -1147,7 +1295,6 @@ mod tests {
             [
                 "context_hygiene",
                 "inbox_preview",
-                "memory_recall_gate",
                 "next_calls",
                 "recovery",
                 "session",
@@ -1155,5 +1302,313 @@ mod tests {
         );
         assert!(payload.get("group").is_none());
         assert!(payload.get("context").is_none());
+    }
+
+    #[test]
+    fn available_skills_lists_assigned_ones_first_without_their_rules() {
+        let skill = |id: &str| {
+            json!({
+                "capability_id": id,
+                "name": id,
+                "description_short": "d".repeat(200),
+                "capsule_text": "rules",
+                "capsule_preview": "rules",
+            })
+        };
+        let state = json!({
+            "autoload_skills": [skill("skill:assigned")],
+            "active_capsule_skills": [skill("skill:group"), skill("skill:assigned")],
+        });
+
+        let result = available_skills(state.as_object().expect("state")).expect("skills");
+        let skills = result["skills"].as_array().expect("list");
+
+        assert_eq!(
+            skills
+                .iter()
+                .map(|skill| skill["capability_id"].as_str().expect("id"))
+                .collect::<Vec<_>>(),
+            ["skill:assigned", "skill:group"]
+        );
+        assert_eq!(skills[0]["description"].as_str().expect("text").len(), 160);
+        assert!(skills[0].get("capsule_text").is_none());
+        assert!(skills[0].get("capsule_preview").is_none());
+        assert!(result.get("omitted").is_none());
+    }
+
+    #[test]
+    fn available_skills_says_how_many_it_left_out() {
+        let many = (0..20)
+            .map(|index| json!({"capability_id":format!("skill:{index}"),"name":"n"}))
+            .collect::<Vec<_>>();
+        let state = json!({"active_capsule_skills":many});
+
+        let result = available_skills(state.as_object().expect("state")).expect("skills");
+
+        assert_eq!(
+            result["skills"].as_array().expect("list").len(),
+            MAX_LISTED_SKILLS
+        );
+        assert_eq!(result["omitted"]["count"], 12);
+        assert!(available_skills(&Map::new()).is_none());
+    }
+
+    #[test]
+    fn recommended_lists_every_entry_the_agent_might_use() {
+        let entry = |id: &str, kind: &str, roles: &[(&str, &str)], for_you: Value| {
+            json!({
+                "capability_id": id, "kind": kind,
+                "recommendation": roles.iter().map(|(domain, role)|
+                    json!({"domain_id": domain, "role": role, "reason": "r"})).collect::<Vec<_>>(),
+                "use_when": [format!("when {id}")],
+                "requirements_summary": format!("needs for {id}"),
+                "capsule_text": "CCCC_FIXTURE_FULL_SKILL_BODY",
+                "for_you": for_you,
+            })
+        };
+        let compatible = json!({"availability":"compatible","enabled":false,"blocked":false});
+        let state = json!({
+            "recommended": [
+                entry("mcp:alt", "mcp_toolpack", &[("research", "alternative")], compatible.clone()),
+                entry("skill:listed", "skill", &[("research", "primary")], compatible.clone()),
+                entry("skill:unknown", "skill", &[("writing", "alternative")],
+                    json!({"availability":"unknown","enabled":true,"blocked":false})),
+                entry("mcp:setup", "mcp_toolpack", &[("documents", "alternative")],
+                    json!({"availability":"needs_setup","enabled":false,"blocked":false})),
+                entry("mcp:blocked", "mcp_toolpack", &[("research", "primary")],
+                    json!({"availability":"compatible","enabled":false,"blocked":true})),
+                entry("mcp:unsupported", "mcp_toolpack", &[("data", "primary")],
+                    json!({"availability":"unsupported","enabled":false,"blocked":false})),
+                // Primary in one domain and alternative in another: one line, marked primary.
+                entry("mcp:primary", "mcp_toolpack", &[("data", "alternative"), ("research", "primary")],
+                    compatible.clone()),
+                entry("mcp:alt", "mcp_toolpack", &[("research", "alternative")], compatible),
+            ],
+        });
+        let listed = HashSet::from(["skill:listed".to_owned()]);
+
+        let result = recommended(state.as_object().expect("state"), &listed).expect("recommended");
+
+        assert_eq!(
+            result["lines"],
+            json!([
+                "[primary] mcp:primary (when mcp:primary)",
+                "[alternative] mcp:alt (when mcp:alt)",
+                "[alternative] skill:unknown (when skill:unknown) [enabled; check requirements: needs for skill:unknown]",
+                "[alternative] mcp:setup (when mcp:setup) [setup required: needs for mcp:setup]",
+            ])
+        );
+        assert_eq!(result["note"], RECOMMENDED_NOTE);
+        assert!(result.get("omitted").is_none());
+        assert!(result.get("routes").is_none());
+        let text = result.to_string();
+        assert!(!text.contains("CCCC_FIXTURE_FULL_SKILL_BODY"));
+        assert!(!text.contains("skill:listed"));
+    }
+
+    #[test]
+    fn recommended_is_absent_when_no_entry_is_eligible() {
+        let state = json!({
+            "recommended": [
+                {"capability_id":"mcp:blocked","recommendation":[{"domain_id":"research","role":"primary"}],
+                    "for_you":{"availability":"compatible","blocked":true}},
+                {"capability_id":"mcp:unsupported","recommendation":[{"domain_id":"research","role":"alternative"}],
+                    "for_you":{"availability":"unsupported","blocked":false}},
+                {"capability_id":"mcp:unreported","recommendation":[{"domain_id":"research","role":"alternative"}],
+                    "for_you":{"blocked":false}},
+            ],
+        });
+
+        assert!(recommended(state.as_object().expect("state"), &HashSet::new()).is_none());
+        assert!(recommended(&Map::new(), &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn recommended_keeps_pending_first_and_counts_what_the_bounds_leave_out() {
+        let total = MAX_RECOMMENDED_ENTRIES + 8;
+        let entries = (0..total)
+            .map(|index| {
+                let pending = index == total - 1;
+                json!({
+                    "capability_id": format!("mcp:e{index:02}"), "kind": "mcp_toolpack",
+                    "recommendation": [{"domain_id": "d", "role": if index == 3 { "primary" } else { "alternative" }}],
+                    "for_you": {"availability":"compatible","enabled": pending, "blocked": false,
+                        "activation_pending": pending},
+                })
+            })
+            .collect::<Vec<_>>();
+        let state = json!({"recommended": entries});
+
+        let result =
+            recommended(state.as_object().expect("state"), &HashSet::new()).expect("recommended");
+
+        let lines = result["lines"].as_array().expect("lines");
+        assert_eq!(lines.len(), MAX_RECOMMENDED_ENTRIES);
+        let last = total - 1;
+        assert_eq!(
+            lines[0],
+            format!("[alternative] mcp:e{last:02} [enabled; discovery pending]").as_str()
+        );
+        assert_eq!(lines[1], "[primary] mcp:e03");
+        assert_eq!(lines[2], "[alternative] mcp:e00");
+        assert_eq!(result["omitted"]["count"], 8);
+        assert_eq!(result["omitted"]["search"], RECOMMENDED_SEARCH);
+    }
+
+    #[test]
+    fn recommended_stays_within_its_byte_bound_without_cutting_an_id() {
+        let long_id = |index: usize| format!("mcp:recommended:{index:02}-{}", "x".repeat(80));
+        let entries = (0..MAX_RECOMMENDED_ENTRIES)
+            .map(|index| {
+                json!({
+                    "capability_id": long_id(index), "kind": "mcp_toolpack",
+                    "recommendation": [{"domain_id": "d", "role": "alternative"}],
+                    // Multi-byte text past both character limits: the bound counts UTF-8 bytes.
+                    "use_when": ["界".repeat(110)],
+                    "requirements_summary": "設".repeat(104),
+                    "for_you": {"availability":"needs_setup","enabled": false, "blocked": false},
+                })
+            })
+            .collect::<Vec<_>>();
+        let state = json!({"recommended": entries});
+
+        let result =
+            recommended(state.as_object().expect("state"), &HashSet::new()).expect("recommended");
+
+        let size = result.to_string().len();
+        assert!(size <= MAX_RECOMMENDED_BYTES, "{size} bytes");
+        let lines = result["lines"].as_array().expect("lines");
+        assert!(!lines.is_empty() && lines.len() < MAX_RECOMMENDED_ENTRIES);
+        assert_eq!(
+            result["omitted"]["count"],
+            MAX_RECOMMENDED_ENTRIES - lines.len()
+        );
+        for (index, line) in lines.iter().enumerate() {
+            let line = line.as_str().expect("line");
+            assert!(line.contains(&long_id(index)), "{line}");
+            assert!(
+                line.contains(&format!(" ({}...)", "界".repeat(93))),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("[setup required: {}...]", "設".repeat(87))),
+                "{line}"
+            );
+        }
+
+        // An ID longer than the whole bound leaves no line rather than a cut one.
+        let state = json!({"recommended": [{
+            "capability_id": format!("mcp:{}", "x".repeat(MAX_RECOMMENDED_BYTES)),
+            "recommendation": [{"domain_id": "d", "role": "primary"}],
+            "for_you": {"availability":"compatible","enabled": false, "blocked": false},
+        }]});
+
+        let result =
+            recommended(state.as_object().expect("state"), &HashSet::new()).expect("recommended");
+
+        assert!(result.to_string().len() <= MAX_RECOMMENDED_BYTES);
+        assert_eq!(result["lines"], json!([]));
+        assert_eq!(result["omitted"]["count"], 1);
+    }
+
+    #[test]
+    fn a_native_session_gets_examples_that_name_its_group() {
+        let hygiene = missing_hygiene("peer");
+        for key in [
+            "update_command",
+            "execution_update_command",
+            "mind_context_update_command",
+        ] {
+            let example = hygiene[key].as_str().expect("example");
+            assert!(
+                example.starts_with("cccc_agent_state(action=\"update\", "),
+                "{example}"
+            );
+            // These self-update examples use the caller identity and need no actor_id argument.
+            assert!(!example.contains("actor_id"), "{example}");
+        }
+        let managed = assemble_payload(json!({}), json!({}), json!({}), hygiene);
+        assert_eq!(managed["next_calls"]["inbox_read"], "cccc_inbox_read()");
+        let mut native = managed.clone();
+        name_group_in_examples(&mut native, "g_fixture");
+        assert_eq!(
+            native["next_calls"]["inbox_read"],
+            "cccc_inbox_read(group_id=\"g_fixture\")"
+        );
+        assert_eq!(
+            native["next_calls"]["context_get"],
+            "cccc_context_get(group_id=\"g_fixture\", detail=\"overview\")  # brief, agent states"
+        );
+        assert_eq!(
+            native["context_hygiene"]["execution_update_command"],
+            "cccc_agent_state(group_id=\"g_fixture\", action=\"update\", focus=\"...\", next_action=\"...\", what_changed=\"...\")"
+        );
+        for (key, example) in native["next_calls"].as_object().expect("next calls") {
+            let example = example.as_str().expect("example");
+            assert!(
+                example.contains("(group_id=\"g_fixture\""),
+                "{key}: {example}"
+            );
+        }
+        assert_eq!(native["session"], managed["session"]);
+    }
+
+    #[test]
+    fn next_calls_point_at_the_compact_context_and_task_reads() {
+        let payload = assemble_payload(json!({}), json!({}), json!({}), json!({}));
+        let calls = &payload["next_calls"];
+        assert!(
+            calls["context_get"]
+                .as_str()
+                .expect("context_get")
+                .starts_with("cccc_context_get(detail=\"overview\")")
+        );
+        assert!(
+            calls["tasks"]
+                .as_str()
+                .expect("tasks")
+                .starts_with("cccc_task()")
+        );
+    }
+
+    #[test]
+    fn bootstrap_task_preview_keeps_the_recorded_task_revision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = cccc_core::HomeLayout::from_path(temp.path()).expect("home");
+        let groups = cccc_core::GroupStore::new(home.clone()).expect("groups");
+        let group = groups.create("task preview", "").expect("group");
+        let directory = groups
+            .group_dir(&group.group_id)
+            .expect("group dir")
+            .join("context/tasks");
+        let tasks: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../cccc-core/tests/fixtures/task-revision/tasks.json"
+        ))
+        .expect("recording");
+        for task in tasks {
+            cccc_core::fs::write_yaml(
+                &directory.join(format!("{}.yaml", task["id"].as_str().expect("id"))),
+                &task,
+            )
+            .expect("recorded task");
+        }
+        let loaded = cccc_core::context::ContextStore::new(home)
+            .expect("contexts")
+            .load(&group.group_id)
+            .expect("read");
+        assert_eq!(slim_task(&loaded.tasks[0])["rev"], 0);
+    }
+    #[test]
+    fn completed_dependencies_do_not_enter_the_blocked_recovery_slice() {
+        let done = json!({"id":"T2","status":"planned","blocked_by":["T1"],"open_blocked_by":[]});
+        let missing =
+            json!({"id":"T3","status":"planned","blocked_by":["T99"],"open_blocked_by":["T99"]});
+        let (_, attention) = task_slice(&[done.clone(), missing], "peer");
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0]["id"], "T3");
+        assert_eq!(
+            slim_task(done.as_object().expect("task"))["open_blocked_by"],
+            json!([])
+        );
     }
 }

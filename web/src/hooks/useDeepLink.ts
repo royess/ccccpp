@@ -1,13 +1,33 @@
-import { requestWorkspaceNavigation } from "../stores/workspaceNavigation";
+import { requestWorkspaceNavigation, useWorkspaceNavigation } from "../stores/workspaceNavigation";
 // useDeepLink - Handle deep links (?group=<id>&event=<event_id>)
 // Extracts deep link parsing, application, and openMessageWindow function
 
-import { useRef, useEffect, useCallback } from "react";
+import { useRef, useEffect, useCallback, useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { GroupMeta } from "../types";
+import { apiJson } from "../services/api/base";
+import { useUIStore } from "../stores/useUIStore";
+import {
+  isPushWorker,
+  parsePushMessageTarget,
+  type PushMessageTarget,
+} from "../features/pushNotifications/navigation";
+import {
+  beginMessageJumpNavigation,
+  cancelMessageJumpTrace,
+  startMessageJumpTrace,
+  startMessageWindowRequest,
+} from "../features/pushNotifications/messageJumpTrace";
 
 interface UseDeepLinkOptions {
   /** List of available groups */
   groups: GroupMeta[];
+  /** Whether that list has been loaded, even an empty one. */
+  groupsLoaded: boolean;
+  /** Populate the list after resolving a notification received during startup. */
+  setGroups?: (groups: GroupMeta[]) => void;
+  /** Read the latest store state even before React has rendered it. */
+  getGroupsSnapshot?: () => GroupMeta[];
   /** Currently selected group ID */
   selectedGroupId: string;
   /** Set selected group ID */
@@ -15,7 +35,7 @@ interface UseDeepLinkOptions {
   /** Set active tab */
   setActiveTab: (tab: string) => void;
   /** Open chat window for an event */
-  openChatWindow: (groupId: string, eventId: string) => Promise<void>;
+  openChatWindow: (groupId: string, eventId: string) => Promise<unknown>;
   /** Show error message */
   showError: (msg: string) => void;
 }
@@ -29,23 +49,108 @@ interface UseDeepLinkResult {
 
 export function useDeepLink({
   groups,
+  groupsLoaded,
+  setGroups,
+  getGroupsSnapshot,
   selectedGroupId,
   setSelectedGroupId,
   setActiveTab,
   openChatWindow,
   showError,
 }: UseDeepLinkOptions): UseDeepLinkResult {
+  const { t } = useTranslation("chat");
   const urlParsedRef = useRef(false);
   const deepLinkRef = useRef<{ groupId: string; eventId: string } | null>(null);
+  const lookupVersionRef = useRef(0);
+  const messageRequestRef = useRef(0);
+  const retryMessageRef = useRef<(groupId: string, eventId: string) => void>(() => {});
+  const jumpNoticeRef = useRef<{
+    groupId: string;
+    notice: NonNullable<ReturnType<typeof useUIStore.getState>["notice"]>;
+  } | null>(null);
+  const groupsRef = useRef(groups);
+  groupsRef.current = groups;
+  const selectedGroupRef = useRef(selectedGroupId);
+  selectedGroupRef.current = selectedGroupId;
+  const [pushTarget, setPushTarget] = useState<PushMessageTarget | null>(null);
+  const [urlLookupGroup, setUrlLookupGroup] = useState<string | null>(null);
+  const pendingNavigation = useWorkspaceNavigation((state) => state.pending);
+
+  const clearJumpNotice = useCallback(() => {
+    if (jumpNoticeRef.current && useUIStore.getState().notice === jumpNoticeRef.current.notice)
+      useUIStore.getState().dismissNotice();
+    jumpNoticeRef.current = null;
+  }, []);
+
+  const startTrace = useCallback(
+    (groupId: string, eventId: string, source: "worker" | "url" | "retry", startedAt?: number) => {
+      startMessageJumpTrace(groupId, eventId, source, {
+        workerToPageMs:
+          startedAt === undefined ? null : Math.max(0, Math.round(Date.now() - startedAt)),
+        isCurrentGroup: () => selectedGroupRef.current === groupId,
+        isWaitingForUser: () => !!useWorkspaceNavigation.getState().pending,
+      });
+    },
+    [],
+  );
+
+  useEffect(
+    () => () => {
+      messageRequestRef.current += 1;
+      cancelMessageJumpTrace();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (jumpNoticeRef.current && jumpNoticeRef.current.groupId !== selectedGroupId)
+      clearJumpNotice();
+  }, [clearJumpNotice, selectedGroupId]);
+
+  const openTarget = useCallback(
+    (groupId: string, eventId: string) => {
+      const request = ++messageRequestRef.current;
+      const finishTrace = startMessageWindowRequest(groupId, eventId);
+      void (async () => {
+        let opened: unknown;
+        try {
+          opened = await openChatWindow(groupId, eventId);
+        } catch {
+          opened = false;
+        }
+        finishTrace?.(opened === false ? "failed" : "resolved");
+        if (opened !== false || messageRequestRef.current !== request) return;
+        const params = new URLSearchParams(window.location.search);
+        if (
+          selectedGroupRef.current !== groupId ||
+          params.get("group") !== groupId ||
+          params.get("event") !== eventId
+        )
+          return;
+        const notice = {
+          message: t("notifications.messageUnavailable"),
+          actionLabel: t("notifications.retryMessage"),
+          onAction: () => retryMessageRef.current(groupId, eventId),
+        };
+        jumpNoticeRef.current = { groupId, notice };
+        useUIStore.getState().showNotice(notice);
+      })();
+    },
+    [openChatWindow, t],
+  );
 
   // Parse URL params on mount
   const parseUrlDeepLink = useCallback(() => {
+    lookupVersionRef.current += 1;
+    messageRequestRef.current += 1;
     const params = new URLSearchParams(window.location.search);
     const gid = String(params.get("group") || "").trim();
     const eid = String(params.get("event") || "").trim();
+    if (gid && eid) startTrace(gid, eid, "url");
     deepLinkRef.current = gid ? { groupId: gid, eventId: eid } : null;
     urlParsedRef.current = true;
-  }, []);
+    setUrlLookupGroup(gid || null);
+  }, [startTrace]);
 
   // Apply deep link after groups are loaded
   useEffect(() => {
@@ -57,11 +162,15 @@ export function useDeepLink({
       deepLinkRef.current = null;
       return;
     }
-    const exists = groups.some((g) => String(g.group_id || "") === gid);
+    const visibleGroups = getGroupsSnapshot?.() ?? groups;
+    const exists = visibleGroups.some((g) => String(g.group_id || "") === gid);
     if (!exists) {
-      if (groups.length > 0) {
-        showError(`Group not found: ${gid}`);
+      // A nonempty list can still predate a newly created Group. The shared
+      // lookup below checks the current visible list before calling it missing.
+      if (!setGroups && visibleGroups.length > 0) {
+        showError(t("notifications.groupNotFound", { groupId: gid }));
         deepLinkRef.current = null;
+        setUrlLookupGroup(null);
       }
       return;
     }
@@ -71,9 +180,23 @@ export function useDeepLink({
     }
 
     setActiveTab("chat");
-    if (eid) void openChatWindow(gid, eid);
+    if (eid) {
+      beginMessageJumpNavigation(gid, eid);
+      openTarget(gid, eid);
+    }
     deepLinkRef.current = null;
-  }, [groups, openChatWindow, selectedGroupId, setActiveTab, setSelectedGroupId, showError]);
+    setUrlLookupGroup(null);
+  }, [
+    getGroupsSnapshot,
+    groups,
+    openTarget,
+    selectedGroupId,
+    setActiveTab,
+    setGroups,
+    setSelectedGroupId,
+    showError,
+    t,
+  ]);
 
   // Once the incoming link is resolved, refresh should keep this tab's Group.
   useEffect(() => {
@@ -89,39 +212,189 @@ export function useDeepLink({
     window.history.replaceState(window.history.state, "", url.pathname + url.search + url.hash);
   }, [groups, selectedGroupId]);
 
+  const navigateToMessage = useCallback(
+    (gid: string, eid: string) => {
+      lookupVersionRef.current += 1;
+      messageRequestRef.current += 1;
+      clearJumpNotice();
+      beginMessageJumpNavigation(gid, eid);
+      // On a phone the Group list is a drawer over the chat, which the message must not hide.
+      useUIStore.getState().setSidebarOpen(false);
+      // Update URL
+      const url = new URL(window.location.href);
+      url.searchParams.set("group", gid);
+      url.searchParams.delete("file");
+      url.searchParams.set("event", eid);
+      url.searchParams.set("tab", "chat");
+      window.history.replaceState({}, "", url.pathname + "?" + url.searchParams.toString());
+
+      // If we're already in the target group, jump immediately
+      if (selectedGroupRef.current === gid) {
+        setActiveTab("chat");
+        openTarget(gid, eid);
+        deepLinkRef.current = null;
+        setUrlLookupGroup(null);
+        return;
+      }
+
+      // Otherwise, queue a deep link and switch groups; the effect will open the window
+      deepLinkRef.current = { groupId: gid, eventId: eid };
+      setUrlLookupGroup(gid);
+      setSelectedGroupId(gid);
+    },
+    [clearJumpNotice, setActiveTab, openTarget, setSelectedGroupId],
+  );
+
+  retryMessageRef.current = (groupId, eventId) => {
+    const retry = () => {
+      startTrace(groupId, eventId, "retry");
+      navigateToMessage(groupId, eventId);
+    };
+    if (selectedGroupRef.current === groupId) retry();
+    else requestWorkspaceNavigation(retry);
+  };
+
   // Open message window function
   const openMessageWindow = useCallback(
     (groupId: string, eventId: string) => {
       const gid = String(groupId || "").trim();
       const eid = String(eventId || "").trim();
       if (!gid || !eid) return;
-
-      const navigate = () => {
-        // Update URL
-        const url = new URL(window.location.href);
-        url.searchParams.set("group", gid);
-        url.searchParams.delete("file");
-        url.searchParams.set("event", eid);
-        url.searchParams.set("tab", "chat");
-        window.history.replaceState({}, "", url.pathname + "?" + url.searchParams.toString());
-
-        // If we're already in the target group, jump immediately
-        if (selectedGroupId === gid) {
-          setActiveTab("chat");
-          void openChatWindow(gid, eid);
-          deepLinkRef.current = null;
-          return;
-        }
-
-        // Otherwise, queue a deep link and switch groups; the effect will open the window
-        deepLinkRef.current = { groupId: gid, eventId: eid };
-        setSelectedGroupId(gid);
-      };
+      const navigate = () => navigateToMessage(gid, eid);
       if (selectedGroupId === gid) navigate();
       else requestWorkspaceNavigation(navigate);
     },
-    [selectedGroupId, setActiveTab, openChatWindow, setSelectedGroupId],
+    [navigateToMessage, selectedGroupId],
   );
+
+  useEffect(() => {
+    const serviceWorker = navigator.serviceWorker;
+    if (!serviceWorker) return;
+    let latestClick = -Infinity;
+    const onMessage = (event: MessageEvent) => {
+      const target = parsePushMessageTarget(event.data);
+      const port = event.ports[0];
+      if (!target || !port || !isPushWorker(event.source)) return;
+      // A click that arrives late, after a newer one, does not take its place.
+      if (target.deadline <= latestClick) return;
+      latestClick = target.deadline;
+      startTrace(target.groupId, target.eventId, "worker", target.startedAt);
+      // Keep the most recent explicit click until groups have loaded and an
+      // earlier navigation confirmation, if any, has been resolved.
+      lookupVersionRef.current += 1;
+      messageRequestRef.current += 1;
+      deepLinkRef.current = null;
+      setUrlLookupGroup(null);
+      setPushTarget(target);
+      port.postMessage({ handled: true });
+    };
+    serviceWorker.addEventListener("message", onMessage);
+    return () => serviceWorker.removeEventListener("message", onMessage);
+  }, [startTrace]);
+
+  useEffect(() => {
+    const groupId = pushTarget?.groupId || urlLookupGroup;
+    if (!groupId || !setGroups) return;
+    const before = getGroupsSnapshot?.() ?? groupsRef.current;
+    if (before.some((group) => group.group_id === groupId)) return;
+    // A link waits for the list the page loads anyway: every reload carries
+    // the open Group in its address. Only a list already loaded can be
+    // missing a Group made since; a notification is checked either way.
+    if (!pushTarget && !groupsLoaded) return;
+    const unavailable = pushTarget
+      ? t("notifications.groupsUnavailable")
+      : t("notifications.groupsUnavailableForLink");
+    let cancelled = false;
+    const controller = new AbortController();
+    const deadline = window.setTimeout(() => controller.abort(), 10000);
+    const version = lookupVersionRef.current;
+    // A newer list must win even if its React render has not happened yet.
+    const changed = () =>
+      lookupVersionRef.current !== version ||
+      (getGroupsSnapshot?.() ?? groupsRef.current) !== before;
+    const clearTarget = () => {
+      if (pushTarget) setPushTarget(null);
+      else {
+        deepLinkRef.current = null;
+        setUrlLookupGroup(null);
+      }
+    };
+    void (async () => {
+      try {
+        const response = await apiJson<{ groups: GroupMeta[] }>("/api/v1/groups", {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (cancelled || changed()) return;
+        if (!response.ok || !Array.isArray(response.result.groups)) {
+          showError(unavailable);
+          clearTarget();
+          return;
+        }
+        if (!response.result.groups.some((group) => group.group_id === groupId)) {
+          showError(t("notifications.groupNotFound", { groupId }));
+          clearTarget();
+          return;
+        }
+        setGroups(response.result.groups);
+      } catch {
+        if (!cancelled && !changed()) {
+          showError(unavailable);
+          clearTarget();
+        }
+      } finally {
+        window.clearTimeout(deadline);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(deadline);
+      controller.abort();
+    };
+  }, [
+    groups,
+    groupsLoaded,
+    pushTarget,
+    urlLookupGroup,
+    setGroups,
+    getGroupsSnapshot,
+    showError,
+    t,
+  ]);
+
+  useEffect(() => {
+    if (!pushTarget || groups.length === 0 || pendingNavigation) return;
+    if (useWorkspaceNavigation.getState().pending) return;
+    const groupExists = () =>
+      (getGroupsSnapshot?.() ?? groupsRef.current).some(
+        (group) => group.group_id === pushTarget.groupId,
+      );
+    if (!groupExists()) {
+      if (!setGroups) {
+        showError(t("notifications.groupNotFound", { groupId: pushTarget.groupId }));
+        setPushTarget(null);
+      }
+      return;
+    }
+    requestWorkspaceNavigation(() => {
+      // Group access can change while the discard dialog is open.
+      if (!groupExists()) {
+        showError(t("notifications.groupNotFound", { groupId: pushTarget.groupId }));
+        return;
+      }
+      navigateToMessage(pushTarget.groupId, pushTarget.eventId);
+    });
+    setPushTarget(null);
+  }, [
+    getGroupsSnapshot,
+    groups,
+    navigateToMessage,
+    pendingNavigation,
+    pushTarget,
+    setGroups,
+    showError,
+    t,
+  ]);
 
   return { openMessageWindow, parseUrlDeepLink };
 }

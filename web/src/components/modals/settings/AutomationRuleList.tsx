@@ -5,40 +5,55 @@ import type { AutomationRule, AutomationRuleStatus } from "../../../types";
 import {
   actionKind,
   clampInt,
+  cronTimeZone,
+  formatAutomationLastRun,
+  formatAutomationNext,
   formatTimeInput,
   getActorOperationCopy,
   getGroupStateCopy,
   getWeekdayOptions,
   isoToLocalDatetimeInput,
+  localTimeZone,
   parseCronToPreset,
 } from "./automationUtils";
 import { cardClass, dangerButtonClass, secondaryButtonClass } from "./types";
 
 interface AutomationRuleListProps {
   isDark: boolean;
+  groupState?: string;
   visibleRules: AutomationRule[];
   status: Record<string, AutomationRuleStatus>;
+  /** The daemon's clock when `status` was computed. */
+  serverNow?: string;
   rulesBusy: boolean;
   showCompletedRules: boolean;
-  completedOneTimeRuleIds: string[];
+  completedRuleIds: string[];
   onToggleShowCompleted: (value: boolean) => void;
   onClearCompleted: () => void;
   onToggleRuleEnabled: (ruleId: string, enabled: boolean) => void;
   onEditRule: (ruleId: string) => void;
+  /** Sends a saved notify rule's notification once, outside its schedule. */
+  onRunRule?: (ruleId: string) => void;
+  /** The outcome of the last run started from this list, shown on that rule. */
+  runNotice?: { ruleId: string; text: string; tone: "ok" | "warning" } | null;
   onDeleteRule: (ruleId: string) => void;
 }
 
 export function AutomationRuleList({
   isDark,
+  groupState,
   visibleRules,
   status,
+  serverNow,
   rulesBusy,
   showCompletedRules,
-  completedOneTimeRuleIds,
+  completedRuleIds,
   onToggleShowCompleted,
   onClearCompleted,
   onToggleRuleEnabled,
   onEditRule,
+  onRunRule,
+  runNotice,
   onDeleteRule,
 }: AutomationRuleListProps) {
   const { t } = useTranslation("settings");
@@ -62,10 +77,10 @@ export function AutomationRuleList({
           type="button"
           className={secondaryButtonClass("sm")}
           onClick={onClearCompleted}
-          disabled={rulesBusy || completedOneTimeRuleIds.length === 0}
+          disabled={rulesBusy || completedRuleIds.length === 0}
           title={t("ruleList.clearCompletedTitle")}
         >
-          {t("ruleList.clearCompleted", { count: completedOneTimeRuleIds.length })}
+          {t("ruleList.clearCompleted", { count: completedRuleIds.length })}
         </button>
       </div>
 
@@ -107,8 +122,8 @@ export function AutomationRuleList({
             : "",
         ).trim();
         const enabled = rule.enabled !== false;
-        const nextFireAt = String(ruleStatus.next_fire_at || "").trim();
-        const lastFireAt = String(ruleStatus.last_fired_at || "").trim();
+        const lastRun = formatAutomationLastRun(ruleStatus, t);
+        const runBlocked = groupState === "paused" || groupState === "stopped";
         const schedule = parseCronToPreset(cronExpr);
         const scheduleTime = formatTimeInput(schedule.hour, schedule.minute);
         const weekdayLabel =
@@ -122,7 +137,8 @@ export function AutomationRuleList({
             count: Math.max(1, Math.round(everySeconds / 60)),
           });
         } else if (triggerKind === "cron") {
-          if (schedule.preset === "daily")
+          if (schedule.preset === "custom") scheduleLabel = cronExpr;
+          else if (schedule.preset === "daily")
             scheduleLabel = t("ruleList.scheduleDailyAt", { time: scheduleTime });
           else if (schedule.preset === "weekly")
             scheduleLabel = t("ruleList.scheduleWeeklyAt", {
@@ -134,6 +150,9 @@ export function AutomationRuleList({
               day: schedule.dayOfMonth,
               time: scheduleTime,
             });
+          // The hours above are in the rule's own zone, which may not be the browser's.
+          const ruleZone = cronTimeZone(rule.trigger);
+          if (ruleZone !== localTimeZone()) scheduleLabel = `${scheduleLabel} (${ruleZone})`;
         } else if (triggerKind === "at") {
           scheduleLabel = atLocal
             ? t("ruleList.scheduleOneTimeAt", { time: atLocal })
@@ -186,31 +205,61 @@ export function AutomationRuleList({
         }
 
         const hasError = Boolean(ruleStatus.last_error);
-        const completed = Boolean(ruleStatus.completed) && triggerKind === "at";
-        const completedAt = String(ruleStatus.completed_at || "").trim();
+        const completed = Boolean(ruleStatus.completed);
+        const maxRuns =
+          rule.trigger && rule.trigger.kind !== "at" ? rule.trigger.max_runs : undefined;
 
         return (
           <div key={ruleId} className={cardClass(isDark)}>
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0 flex-1">
+            {/* On a phone the controls wrap below the title instead of squeezing it. */}
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-[11rem] flex-1 break-words">
                 <div className="text-sm font-semibold text-[var(--color-text-primary)]">
                   {ruleId || t("ruleList.rule")}
                 </div>
                 <div className="mt-0.5 text-xs text-[var(--color-text-muted)]">
                   {scheduleLabel} • {enabled ? t("ruleList.on") : t("ruleList.off")}{" "}
                   {completed ? `• ${t("ruleList.completedLabel")}` : ""}
+                  {maxRuns !== undefined
+                    ? ` • ${t("ruleList.runProgress", { done: ruleStatus.fired_count || 0, max: maxRuns })}`
+                    : ""}
                 </div>
               </div>
 
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex flex-wrap items-center gap-2">
                 <label className="text-xs text-[var(--color-text-tertiary)] flex items-center gap-2">
                   <input
                     type="checkbox"
                     checked={enabled}
+                    disabled={completed && triggerKind !== "at"}
+                    title={
+                      completed && triggerKind !== "at"
+                        ? t("ruleList.completedLimitHint")
+                        : undefined
+                    }
                     onChange={(e) => onToggleRuleEnabled(ruleId, e.target.checked)}
                   />
                   {t("ruleList.on")}
                 </label>
+                {kind === "notify" && onRunRule ? (
+                  <button
+                    type="button"
+                    className={secondaryButtonClass("sm")}
+                    disabled={rulesBusy || runBlocked}
+                    title={
+                      runBlocked
+                        ? t(
+                            groupState === "paused"
+                              ? "automation.runPaused"
+                              : "automation.runStopped",
+                          )
+                        : t("ruleList.runNowHint")
+                    }
+                    onClick={() => onRunRule(ruleId)}
+                  >
+                    {t("ruleList.runNow")}
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   className={secondaryButtonClass("sm")}
@@ -233,16 +282,26 @@ export function AutomationRuleList({
               <span className="font-mono">{actionLabel}</span>
             </div>
             <div className="mt-1 text-xs text-[var(--color-text-muted)]">
-              {t("ruleList.lastShort")}: {lastFireAt || "—"} • {t("ruleList.nextShort")}:{" "}
-              {nextFireAt || "—"}
+              {lastRun ? `${t("ruleList.lastShort")}: ${lastRun} • ` : ""}
+              {t("ruleList.nextShort")}: {formatAutomationNext(ruleStatus, t, serverNow)}
             </div>
-            {completed ? (
-              <div className="mt-1 text-xs text-emerald-700 dark:text-emerald-300">
-                {t("ruleList.completedAt")} {completedAt || lastFireAt || "—"}
+            {runNotice && runNotice.ruleId === ruleId ? (
+              <div
+                data-status-tone={runNotice.tone}
+                className={
+                  runNotice.tone === "ok"
+                    ? "mt-1 text-xs text-emerald-700 dark:text-emerald-300"
+                    : "mt-1 text-xs text-amber-700 dark:text-amber-300"
+                }
+              >
+                {runNotice.text}
               </div>
             ) : null}
             {hasError ? (
-              <div className="mt-1 text-xs break-words text-rose-600 dark:text-rose-300">
+              <div
+                data-status-tone="error"
+                className="mt-1 text-xs break-words text-rose-600 dark:text-rose-300"
+              >
                 {ruleStatus.last_error}
               </div>
             ) : null}

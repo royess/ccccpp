@@ -1,5 +1,6 @@
 import type { Actor, ActorProfile, ActorProfileUsage } from "../../types";
 import { actorProfileIdentityKey } from "../../utils/actorProfiles";
+import { getGroupBlobUrl } from "./groups";
 import {
   actorsReadOnlyRequestKey,
   apiForm,
@@ -12,6 +13,64 @@ import {
 
 export type ProfileView = "global" | "my" | "all" | "accessible";
 export type ProfileScope = "global" | "user";
+
+export type ActorRuntimeActionResult = {
+  actor?: Actor;
+  runtime_confirmation_required?: boolean;
+  /** Present when this start began a new conversation instead of the saved one. */
+  runtime_session_replaced?: { at: string; reasons: string[]; message?: string };
+};
+
+export type ActorRuntimeSwitchTarget =
+  | { kind: "native"; source_id: string; expected_native_session_id: string }
+  | {
+      kind: "managed";
+      patch: {
+        runtime: string;
+        runtime_mode?: "default" | "acp";
+        command?: string | string[];
+        env?: Record<string, string>;
+        submit?: string;
+        default_scope_key?: string;
+      };
+      profile_id?: string;
+      profile_scope?: ProfileScope;
+      profile_owner?: string;
+      expected_profile_revision?: number;
+      start?: boolean;
+    };
+
+export type ActorRuntimeSwitchRequest = {
+  expected_actor_generation: string;
+  expected_actor_updated_at: string;
+  expected_source_id?: string;
+  target: ActorRuntimeSwitchTarget;
+};
+
+export type ActorRuntimeSwitchResult = {
+  group_id: string;
+  actor_id: string;
+  op_id: string;
+  switched: true;
+  from: { kind: "native" | "managed"; runtime: string; source_id?: string };
+  to: { kind: "native" | "managed"; runtime: string; source_id?: string };
+  completion: "done" | "pending";
+  start: "started" | "pending" | "stopped" | "error" | "native" | "held";
+  start_error?: unknown;
+  access_paused?: boolean;
+  notice_event_id?: string;
+};
+
+export type ActorRuntimeSwitchCompletion =
+  | ActorRuntimeSwitchResult
+  | {
+      group_id: string;
+      actor_id: string;
+      switched: false;
+      completion: "done";
+      start?: undefined;
+      access_paused?: undefined;
+    };
 
 type ProfileLookupOptions = { scope?: ProfileScope; ownerId?: string };
 
@@ -34,6 +93,19 @@ function buildProfileDeleteQuery(opts?: ProfileDeleteOptions): string {
   return params.toString();
 }
 
+export function actorWithAvatar(groupId: string, actor: Actor): Actor {
+  const avatarUrl = getGroupBlobUrl(groupId, actor.avatar_asset_path || "");
+  const projected = { ...actor };
+  if (avatarUrl) {
+    projected.avatar_url = avatarUrl;
+    projected.has_custom_avatar = true;
+  } else {
+    delete projected.avatar_url;
+    delete projected.has_custom_avatar;
+  }
+  return projected;
+}
+
 export async function fetchActors(
   groupId: string,
   includeUnread = false,
@@ -49,15 +121,19 @@ export async function fetchActors(
   const url = includeUnread
     ? `/api/v1/groups/${encodeURIComponent(gid)}/actors?${query}`
     : `/api/v1/groups/${encodeURIComponent(gid)}/actors${query ? `?${query}` : ""}`;
-  if (init?.noCache || init?.signal) {
-    return apiJson<{ actors: Actor[] }>(url, init);
-  }
-  if (includeUnread) {
-    return apiJson<{ actors: Actor[] }>(url);
-  }
-  return reuseSharedReadRequest(actorsReadOnlyRequestKey(gid, includeInternal), () =>
-    apiJson<{ actors: Actor[] }>(url),
-  );
+  const read = async () => {
+    const response = await apiJson<{ actors: Actor[] }>(url, init);
+    if (!response.ok) return response;
+    return {
+      ...response,
+      result: {
+        ...response.result,
+        actors: response.result.actors.map((actor) => actorWithAvatar(gid, actor)),
+      },
+    };
+  };
+  if (init?.noCache || init?.signal || includeUnread) return read();
+  return reuseSharedReadRequest(actorsReadOnlyRequestKey(gid, includeInternal), read);
 }
 
 function invalidateGroupActorsReads(groupId: string, includeGroups = true) {
@@ -78,6 +154,7 @@ export async function addActor(
     profileScope?: ProfileScope;
     profileOwner?: string;
     title?: string;
+    defaultScopeKey?: string;
     capabilityAutoload?: string[];
     capabilityHidden?: string[];
   },
@@ -102,7 +179,7 @@ export async function addActor(
           : [],
         capability_hidden: Array.isArray(options?.capabilityHidden) ? options.capabilityHidden : [],
         title: options?.title || "",
-        default_scope_key: "",
+        default_scope_key: options?.defaultScopeKey || "",
         by: "user",
       }),
     });
@@ -126,6 +203,7 @@ export async function updateActor(
     enabled?: boolean;
     capabilityAutoload?: string[];
     capabilityHidden?: string[];
+    defaultScopeKey?: string;
   },
 ) {
   invalidateGroupActorsReads(groupId);
@@ -141,8 +219,9 @@ export async function updateActor(
   if (typeof opts?.enabled === "boolean") body.enabled = opts.enabled;
   if (Array.isArray(opts?.capabilityAutoload)) body.capability_autoload = opts.capabilityAutoload;
   if (Array.isArray(opts?.capabilityHidden)) body.capability_hidden = opts.capabilityHidden;
+  if (opts?.defaultScopeKey !== undefined) body.default_scope_key = opts.defaultScopeKey;
   try {
-    return await apiJson(
+    return await apiJson<ActorRuntimeActionResult>(
       `/api/v1/groups/${encodeURIComponent(groupId)}/actors/${encodeURIComponent(actorId)}`,
       { method: "POST", body: JSON.stringify(body) },
     );
@@ -230,9 +309,27 @@ export async function removeActor(groupId: string, actorId: string) {
 export async function startActor(groupId: string, actorId: string) {
   invalidateGroupActorsReads(groupId);
   try {
-    return await apiJson(
+    return await apiJson<ActorRuntimeActionResult>(
       `/api/v1/groups/${encodeURIComponent(groupId)}/actors/${encodeURIComponent(actorId)}/start`,
       { method: "POST" },
+    );
+  } finally {
+    invalidateGroupActorsReads(groupId);
+  }
+}
+
+/** Lets CCCC send its waiting input into the terminal process named by `generation`. It answers
+ *  no prompt in that terminal; a replaced terminal fails with runtime_session_changed. */
+export async function releaseActorStartupInput(
+  groupId: string,
+  actorId: string,
+  generation: string,
+) {
+  invalidateGroupActorsReads(groupId);
+  try {
+    return await apiJson<{ released: boolean }>(
+      `/api/v1/groups/${encodeURIComponent(groupId)}/actors/${encodeURIComponent(actorId)}/terminal_ready`,
+      { method: "POST", body: JSON.stringify({ generation }) },
     );
   } finally {
     invalidateGroupActorsReads(groupId);
@@ -254,7 +351,7 @@ export async function stopActor(groupId: string, actorId: string) {
 export async function restartActor(groupId: string, actorId: string) {
   invalidateGroupActorsReads(groupId);
   try {
-    return await apiJson(
+    return await apiJson<ActorRuntimeActionResult>(
       `/api/v1/groups/${encodeURIComponent(groupId)}/actors/${encodeURIComponent(actorId)}/restart?by=user`,
       { method: "POST" },
     );
@@ -263,10 +360,123 @@ export async function restartActor(groupId: string, actorId: string) {
   }
 }
 
+function runtimeSwitchUnknown<T>(response: ApiResponse<T>): ApiResponse<T> {
+  if (
+    !response.ok &&
+    ([
+      "NETWORK_ERROR",
+      "PARSE_ERROR",
+      "EMPTY_RESPONSE",
+      "HTTP_ERROR",
+      "UNKNOWN_ERROR",
+      "daemon_unavailable",
+    ].includes(response.error.code) ||
+      response.error.httpStatus === 408 ||
+      (response.error.httpStatus ?? 0) >= 500)
+  ) {
+    return {
+      ok: false,
+      error: {
+        code: "actor_switch_unknown",
+        message: "The result is unknown. Refresh the member before trying again.",
+        details: { cause: response.error.code },
+      },
+    };
+  }
+  return response;
+}
+
+function isRuntimeSwitchResult(
+  value: ActorRuntimeSwitchResult | undefined,
+  groupId: string,
+  actorId: string,
+): value is ActorRuntimeSwitchResult {
+  return Boolean(
+    value &&
+    value.switched === true &&
+    value.group_id === groupId &&
+    value.actor_id === actorId &&
+    typeof value.op_id === "string" &&
+    value.op_id.length > 0 &&
+    ["done", "pending"].includes(value.completion) &&
+    ["started", "pending", "stopped", "error", "native", "held"].includes(value.start) &&
+    (value.completion === "pending" ? value.start === "held" : value.start !== "held") &&
+    value.from &&
+    ["native", "managed"].includes(value.from.kind) &&
+    value.to &&
+    ["native", "managed"].includes(value.to.kind),
+  );
+}
+
+export async function switchActorRuntime(
+  groupId: string,
+  actorId: string,
+  request: ActorRuntimeSwitchRequest,
+): Promise<ApiResponse<ActorRuntimeSwitchResult>> {
+  invalidateGroupActorsReads(groupId);
+  try {
+    const response = runtimeSwitchUnknown(
+      await apiJson<ActorRuntimeSwitchResult>(
+        `/api/v1/groups/${encodeURIComponent(groupId)}/actors/${encodeURIComponent(actorId)}/runtime_switch`,
+        { method: "POST", body: JSON.stringify(request) },
+      ),
+    );
+    if (response.ok && !isRuntimeSwitchResult(response.result, groupId, actorId)) {
+      return {
+        ok: false,
+        error: {
+          code: "actor_switch_unknown",
+          message: "The result is unknown. Refresh the member before trying again.",
+        },
+      };
+    }
+    return response;
+  } finally {
+    invalidateGroupActorsReads(groupId);
+  }
+}
+
+export async function completeActorRuntimeSwitch(
+  groupId: string,
+  actorId: string,
+): Promise<ApiResponse<ActorRuntimeSwitchCompletion>> {
+  invalidateGroupActorsReads(groupId);
+  try {
+    const response = runtimeSwitchUnknown(
+      await apiJson<ActorRuntimeSwitchCompletion>(
+        `/api/v1/groups/${encodeURIComponent(groupId)}/actors/${encodeURIComponent(actorId)}/runtime_switch/complete`,
+        { method: "POST" },
+      ),
+    );
+    if (
+      response.ok &&
+      !(
+        response.result &&
+        response.result.group_id === groupId &&
+        response.result.actor_id === actorId &&
+        ((response.result.switched === false && response.result.completion === "done") ||
+          (response.result.switched === true &&
+            isRuntimeSwitchResult(response.result, groupId, actorId)))
+      )
+    ) {
+      return {
+        ok: false,
+        error: {
+          code: "actor_switch_unknown",
+          message: "The result is unknown. Refresh the member before trying again.",
+        },
+      };
+    }
+    return response;
+  } finally {
+    invalidateGroupActorsReads(groupId);
+  }
+}
+
 export async function newActorSession(groupId: string, actorId: string) {
   invalidateGroupActorsReads(groupId);
   try {
-    return await apiJson(
+    return await apiJson<ActorRuntimeActionResult>(
       `/api/v1/groups/${encodeURIComponent(groupId)}/actors/${encodeURIComponent(actorId)}/new_session?by=user`,
       { method: "POST" },
     );
@@ -422,7 +632,10 @@ export async function copyActorPrivateEnvToProfile(
   profileId: string,
   groupId: string,
   actorId: string,
-  opts?: ProfileLookupOptions,
+  opts?: ProfileLookupOptions & {
+    expectedActorGeneration?: string;
+    expectedActorUpdatedAt?: string;
+  },
 ) {
   return apiJson<{ profile_id: string; group_id: string; actor_id: string; keys: string[] }>(
     `/api/v1/actor_profiles/${encodeURIComponent(profileId)}/copy_actor_secrets`,
@@ -434,6 +647,8 @@ export async function copyActorPrivateEnvToProfile(
         owner_id: opts?.ownerId,
         group_id: groupId,
         actor_id: actorId,
+        expected_actor_generation: opts?.expectedActorGeneration,
+        expected_actor_updated_at: opts?.expectedActorUpdatedAt,
       }),
     },
   );

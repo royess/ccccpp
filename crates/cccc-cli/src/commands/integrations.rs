@@ -14,7 +14,7 @@ use crate::commands::common::{call, group, print};
 pub async fn prompt(client: &DaemonClient, home: &HomeLayout, args: PromptArgs) -> Result<()> {
     let actor_id = match (args.actor_id, args.legacy_actor_id) {
         (Some(actor_id), None) | (None, Some(actor_id)) if !actor_id.trim().is_empty() => actor_id,
-        (Some(_), Some(_)) => anyhow::bail!("pass actor id once, preferably with --actor-id"),
+        (Some(_), Some(_)) => anyhow::bail!("pass the agent ID once, preferably with --actor-id"),
         _ => anyhow::bail!("--actor-id is required"),
     };
     print(
@@ -175,7 +175,13 @@ async fn web_call(
     path: &str,
     value: Value,
 ) -> Result<Value> {
-    let client = reqwest::Client::new();
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if reqwest::Url::parse(endpoint)
+        .is_ok_and(|url| cccc_core::local_network::is_loopback_url(&url))
+    {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build()?;
     let mut request = client.request(method.clone(), format!("{endpoint}{path}"));
     if let Some(token) = AccessTokenStore::new(home.clone())?
         .list()?

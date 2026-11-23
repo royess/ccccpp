@@ -2,6 +2,10 @@ mod actor;
 mod group;
 mod integrations;
 mod messaging;
+mod sessions;
+pub use sessions::{SessionsAction, SessionsArgs};
+mod session_nodes;
+pub use session_nodes::SessionNodeAction;
 
 pub use actor::{ActorAction, ActorArgs, ActorTarget};
 pub use group::{GroupAction, GroupArgs};
@@ -10,8 +14,8 @@ pub use integrations::{
     SpaceCredentialAction, SpaceJobsAction,
 };
 pub use messaging::{
-    CancelReplyArgs, ConnectArgs, DeliverArgs, InboxArgs, LedgerAction, LedgerArgs, ReplyArgs,
-    SendArgs, TailArgs, TrackedSendArgs,
+    CancelReplyArgs, ConnectArgs, DeliverArgs, InboxArgs, InboxSummaryArgs, LedgerAction,
+    LedgerArgs, ReplyArgs, SendArgs, TailArgs, TrackedSendArgs,
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -24,8 +28,10 @@ pub enum WebModeArg {
 
 #[derive(Debug, Args)]
 pub struct WebArgs {
+    /// Web access mode: normal or exhibit.
     #[arg(long, value_enum)]
     pub mode: Option<WebModeArg>,
+    /// Serve a read-only Web UI.
     #[arg(long, conflicts_with = "mode")]
     pub exhibit: bool,
     /// Accepted for legacy CLI compatibility; the native server does not use a source reloader.
@@ -38,10 +44,13 @@ pub struct WebArgs {
 
 #[derive(Debug, Args)]
 pub struct SetupArgs {
+    /// Runtime to set up; omit to set up the supported runtimes.
     #[arg(long)]
     pub runtime: Option<String>,
+    /// Project directory whose MCP configuration to prepare.
     #[arg(long, default_value = ".")]
     pub path: String,
+    /// Runtime adapter mode: default or acp.
     #[arg(long,default_value="default",value_parser=["default","acp"])]
     pub runtime_mode: String,
     /// Complete the separate official Antigravity ACP login in this terminal.
@@ -51,6 +60,7 @@ pub struct SetupArgs {
 
 #[derive(Debug, Args)]
 pub struct UpdateArgs {
+    /// Release channel to check or install.
     #[arg(long, value_enum)]
     pub channel: Option<ReleaseChannelArg>,
     /// Check the latest channel release and installation without changing files.
@@ -59,6 +69,19 @@ pub struct UpdateArgs {
     /// Show local installation details without requesting release metadata.
     #[arg(long, requires = "check")]
     pub offline: bool,
+    /// Internal: print this program's update constants as JSON and exit.
+    #[arg(long, hide = true, conflicts_with_all = ["check", "channel", "resume", "recover"])]
+    pub self_check: bool,
+    /// Internal: exit 0 when an installer may replace the program while no
+    /// daemon runs, otherwise print why and exit 1.
+    #[arg(long, hide = true, conflicts_with_all = ["check", "channel", "self_check", "resume", "recover"])]
+    pub installer_check: bool,
+    /// Internal: finish an attended update after the program was replaced.
+    #[arg(long, hide = true, value_name = "TRANSACTION", conflicts_with_all = ["check", "channel", "recover"])]
+    pub resume: Option<std::path::PathBuf>,
+    /// Undo an interrupted attended update and release this home's startup.
+    #[arg(long, hide = true, value_name = "TRANSACTION", conflicts_with_all = ["check", "channel"])]
+    pub recover: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -69,58 +92,93 @@ pub enum ReleaseChannelArg {
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
+    /// Also list the custom runtime among the detected runtimes.
     #[arg(long)]
     pub all: bool,
+    /// Print the full report as JSON, as it always is when piped.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Parser)]
 #[command(
     name = "cccc",
     version = crate::PRODUCT_VERSION,
-    about = "Collaborative Code Coordination Center"
+    about = "Collaborative Code Coordination Center",
+    long_about = "Collaborative Code Coordination Center\n\nIn an interactive terminal, cccc starts the daemon and Web UI and opens a terminal\nstatus panel. Quitting it (/quit or Ctrl+C) stops the services it started.\n\ncccc --headless (or cccc web) starts the same services without the panel, for\nservers, containers, service managers and scripts. Without a terminal, cccc\nruns headless automatically."
 )]
 pub struct Cli {
+    /// Web UI host to bind (default: saved Web Access setting, CCCC_WEB_HOST, 127.0.0.1).
     #[arg(long, alias = "web-host", global = true)]
     pub host: Option<String>,
+    /// Web UI port (default: saved Web Access setting, CCCC_WEB_PORT, 8848).
     #[arg(long, alias = "web-port", global = true)]
     pub port: Option<u16>,
+    /// Start the daemon and Web UI without the terminal panel (same as cccc web).
+    #[arg(long)]
+    pub headless: bool,
     #[command(subcommand)]
     pub command: Option<CommandKind>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum CommandKind {
+    /// Create a Group for a project directory, or attach it to a selected Group.
     Attach {
+        /// Project directory.
         #[arg(default_value = ".")]
         path: String,
+        /// Existing Group to attach to; omit to create a new Group.
         #[arg(long = "group")]
         group_id: Option<String>,
     },
+    /// Create, show, start, stop and manage a Group.
     Group(GroupArgs),
+    /// List Groups.
     Groups,
+    /// Make a Group the active one for later commands.
     Use {
+        /// Group ID to make active for later commands.
         group_id: String,
     },
+    /// Show the active Group.
     Active,
+    /// Add, start, stop and manage agents in a Group.
     Actor(ActorArgs),
+    /// Work with user-owned native Codex, Claude, Pi and OpenCode sessions.
+    Sessions(SessionsArgs),
+    /// Show the session prompt CCCC gives an agent.
     Prompt(PromptArgs),
+    /// Manage a Group's IM bridge.
     Im(ImArgs),
+    /// Manage Group Space shared memory.
     Space(SpaceArgs),
-    /// Read and consume the next unread Mail batch for an actor.
+    /// Read and consume the next unread Mail batch for an agent.
     Inbox(InboxArgs),
-    /// Read cached same-account and Group connection directories. Does not connect or start Actors.
+    /// Summarize current awaiting Mail across a Group without consuming it.
+    InboxSummary(InboxSummaryArgs),
+    /// Read cached same-account and Group connection directories. Does not connect or start agents.
     Connect(ConnectArgs),
+    /// Send a message to a Group.
     Send(SendArgs),
+    /// Create a task and send one linked delegation message.
     TrackedSend(TrackedSendArgs),
+    /// Reply to a message.
     Reply(ReplyArgs),
+    /// Promote an existing Mail to Send, or retry a blocked or failed delivery.
     Deliver(DeliverArgs),
+    /// Cancel the open reply obligations of a Send + Reply message.
     CancelReply(CancelReplyArgs),
+    /// Show recent ledger events of a Group.
     Tail(TailArgs),
+    /// Snapshot or compact a Group's ledger.
     Ledger(LedgerArgs),
+    /// Start, stop or check the CCCC daemon.
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// List agent runtimes and prepare optional ones.
     Runtime {
         #[command(subcommand)]
         action: RuntimeAction,
@@ -129,6 +187,7 @@ pub enum CommandKind {
     Login,
     /// Remove local membership identity. The next login is a new hostname.
     Logout,
+    /// Publish this machine's Web UI through membership Reach (Linux/macOS preview).
     Reach {
         #[command(subcommand)]
         action: ReachAction,
@@ -138,75 +197,176 @@ pub enum CommandKind {
         #[command(subcommand)]
         action: DirectAction,
     },
+    /// Show the version, daemon state, active Group and available runtimes.
     Status,
+    /// Check the environment and diagnose problems.
     Doctor(DoctorArgs),
+    /// Prepare or report the MCP integration for an agent runtime.
     Setup(SetupArgs),
     /// Update CCCC through the installer that owns this executable.
     Update(UpdateArgs),
+    /// Print the CCCC version.
     Version,
+    /// Print the CCCC_HOME directory in use.
     Home,
-    Mcp,
+    /// Run the MCP server over stdio, for agent integration.
+    Mcp {
+        /// Bind this stdio port to an opted-in user-owned native session.
+        #[arg(long, value_parser = ["codex", "claude", "pi", "opencode"])]
+        local_session_runtime: Option<String>,
+        #[arg(long, hide = true, requires = "local_session_runtime")]
+        local_session_host_pid: Option<u32>,
+    },
+    /// Start the daemon and Web UI without the terminal status panel (headless).
     Web(WebArgs),
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
 pub enum ReachAction {
+    /// Enable membership Reach for this machine.
     On,
+    /// Disable membership Reach.
     Off,
+    /// Show membership Reach status.
     Status,
+    /// Install the optional Reach transport.
     Install,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum DirectAction {
+    /// Show standalone connections for a Group.
     Status {
+        /// Target Group ID.
         group_id: String,
     },
     /// Enable an encrypted collaboration listener (does not change Web Access).
     Listen {
+        /// Local listener bind address.
         #[arg(long)]
         bind: String,
+        /// Address to advertise to the other machine.
         #[arg(long)]
         address: String,
+        /// Display name for this listener.
         #[arg(long, default_value = "")]
         name: String,
     },
+    /// Stop the standalone collaboration listener.
     Stop,
+    /// Create a permanent invitation. Each joining Group requires approval.
     Invite {
+        /// Target Group ID.
         group_id: String,
     },
     /// Read the invitation from standard input, keeping it out of shell history.
     Join {
+        /// Target Group ID.
         group_id: String,
     },
+    /// Approve a pending standalone connection.
     Approve {
+        /// Target Group ID.
         group_id: String,
+        /// Connection or approval ID.
         id: String,
     },
+    /// Revoke a standalone invitation or approval.
     Revoke {
+        /// Target Group ID.
         group_id: String,
+        /// Connection or approval ID.
         id: String,
     },
+    /// Remove a standalone Group connection.
     Remove {
+        /// Target Group ID.
         group_id: String,
+        /// Connection or approval ID.
         id: String,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonAction {
+    /// Start the daemon in the background.
     Start,
-    Stop,
+    /// Stop the daemon. Running agents stop too unless --keep-agents is given.
+    Stop {
+        /// Keep running agents for a maintenance restart: only the daemon exits, and the
+        /// next start reattaches the agents. A daemon that cannot keep them refuses, and
+        /// nothing is stopped.
+        #[arg(long)]
+        keep_agents: bool,
+    },
+    /// Show whether the daemon is running.
     Status,
-    Run,
+    /// Run only the daemon in the foreground (no Web server or terminal panel).
+    Run {
+        /// Internal: start as the relay of this home's prepared update.
+        #[arg(long, hide = true, value_name = "TRANSACTION")]
+        update_resume: Option<std::path::PathBuf>,
+    },
+    /// Internal: hold managed agent sessions independently of the daemon's lifetime.
+    #[command(hide = true)]
+    SessionOwner {
+        #[arg(long)]
+        owner_id: String,
+    },
+    /// Review or resolve specific unconfirmed process-cleanup records.
+    ProcessRecovery {
+        /// Which process owner produced the evidence.
+        #[arg(long, global = true, value_enum, default_value = "daemon")]
+        owner: RecoveryOwner,
+        /// With `--owner session`: the session owner to review, as named by the error that
+        /// stopped CCCC from starting.
+        #[arg(long, global = true)]
+        owner_id: Option<String>,
+        #[command(subcommand)]
+        action: RecoveryAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RecoveryOwner {
+    Daemon,
+    Web,
+    /// A session owner that ended without confirming that its agents stopped.
+    Session,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoveryAction {
+    /// List redacted pending evidence and its current version.
+    List,
+    /// Retry cleanup for exactly one reviewed record.
+    Retry {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        version: String,
+    },
+    /// Continue despite one reviewed record; old work may still be running.
+    Accept {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        version: String,
+        /// Acknowledge that accepting does not stop or verify the old work.
+        #[arg(long, required = true)]
+        accept_risk: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum RuntimeAction {
+    /// List supported agent runtimes and their availability.
     List {
+        /// Also include the custom runtime.
         #[arg(long)]
         all: bool,
     },
+    /// Check Hermes setup for CCCC members.
     Hermes {
         #[command(subcommand)]
         action: HermesAction,
@@ -215,29 +375,36 @@ pub enum RuntimeAction {
 
 #[derive(Debug, Subcommand)]
 pub enum HermesAction {
+    /// Show the Hermes installation and the profile's cccc MCP entry.
     Status,
+    /// Remove the cccc MCP server earlier CCCC versions saved in the Hermes
+    /// profile; members get CCCC's server in their own sessions.
     Prepare {
+        /// Directory to run Hermes in.
         #[arg(long = "path", default_value = ".")]
         cwd: String,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        force: bool,
     },
+    /// Explain how to check a Hermes member's CCCC tools.
     #[command(name = "mcp-test")]
-    McpTest {
-        #[arg(long = "path", default_value = ".")]
-        cwd: String,
-        #[arg(long, default_value = "g_probe")]
-        group_id: String,
-        #[arg(long, default_value = "hermes-probe")]
-        actor_id: String,
-    },
+    McpTest,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_and_port_option_launch_without_a_subcommand() {
+        let bare = Cli::try_parse_from(["cccc"]).expect("bare launch");
+        assert!(bare.command.is_none());
+        assert!(!bare.headless);
+        assert_eq!(bare.port, None);
+
+        let port = Cli::try_parse_from(["cccc", "--port", "0"]).expect("port launch");
+        assert!(port.command.is_none());
+        assert!(!port.headless);
+        assert_eq!(port.port, Some(0));
+    }
 
     #[test]
     fn parses_membership_verbs() {
@@ -306,8 +473,33 @@ mod tests {
                 check: true,
                 channel: None,
                 offline: false,
+                self_check: false,
+                installer_check: false,
+                resume: None,
+                recover: None,
             }))
         ));
+    }
+
+    #[test]
+    fn the_installer_check_stands_alone() {
+        let cli =
+            Cli::try_parse_from(["cccc", "update", "--installer-check"]).expect("installer check");
+        assert!(matches!(
+            cli.command,
+            Some(CommandKind::Update(UpdateArgs {
+                installer_check: true,
+                check: false,
+                self_check: false,
+                ..
+            }))
+        ));
+        for other in ["--check", "--self-check"] {
+            assert!(
+                Cli::try_parse_from(["cccc", "update", "--installer-check", other]).is_err(),
+                "{other}"
+            );
+        }
     }
 
     #[test]
@@ -449,5 +641,111 @@ mod tests {
             panic!("wrong command");
         };
         assert_eq!(args.event_id, "event-2");
+    }
+
+    #[test]
+    fn parses_the_actor_model_label_on_add_and_update() {
+        let cli = Cli::try_parse_from([
+            "cccc",
+            "actor",
+            "add",
+            "peer1",
+            "--runtime",
+            "codex",
+            "--model-label",
+            "gpt-5-codex",
+        ])
+        .expect("actor add");
+        let Some(CommandKind::Actor(ActorArgs {
+            action: ActorAction::Add { model_label, .. },
+        })) = cli.command
+        else {
+            panic!("wrong command");
+        };
+        assert_eq!(model_label, "gpt-5-codex");
+
+        let cli = Cli::try_parse_from(["cccc", "actor", "update", "peer1", "--model-label", ""])
+            .expect("actor update");
+        let Some(CommandKind::Actor(ActorArgs {
+            action: ActorAction::Update { model_label, .. },
+        })) = cli.command
+        else {
+            panic!("wrong command");
+        };
+        assert_eq!(model_label.as_deref(), Some(""));
+        for action in ["add", "update"] {
+            assert!(
+                Cli::try_parse_from(["cccc", "actor", action, "peer1", "--model", "label"])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_switch_refuses_options_its_target_would_ignore() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["cccc", "actor", "switch", "x"].iter().chain(args).copied())
+        };
+        assert!(parse(&["--session", "codex:a"]).is_ok());
+        assert!(parse(&["--runtime", "claude", "--no-start"]).is_ok());
+        assert!(parse(&["--profile", "shared", "--scope", "/repo"]).is_ok());
+        assert!(parse(&["--finish"]).is_ok());
+        for rejected in [
+            &["--session", "codex:a", "--no-start"][..],
+            &["--session", "codex:a", "--command", "codex"],
+            &["--session", "codex:a", "--scope", "/repo"],
+            &["--profile", "shared", "--runtime", "claude"],
+            &["--profile", "shared", "--env", "A=1"],
+            &["--finish", "--no-start"],
+            &["--finish", "--runtime", "claude"],
+        ] {
+            assert!(parse(rejected).is_err(), "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn process_recovery_names_a_session_owner_by_id() {
+        let cli = Cli::try_parse_from([
+            "cccc",
+            "daemon",
+            "process-recovery",
+            "--owner",
+            "session",
+            "--owner-id",
+            "597d730d8e974b2eb9d7b670f994d0a1",
+            "list",
+        ])
+        .expect("session owner review");
+        let Some(CommandKind::Daemon {
+            action:
+                DaemonAction::ProcessRecovery {
+                    owner,
+                    owner_id,
+                    action,
+                },
+        }) = cli.command
+        else {
+            panic!("expected process recovery");
+        };
+        assert!(matches!(owner, RecoveryOwner::Session));
+        assert_eq!(
+            owner_id.as_deref(),
+            Some("597d730d8e974b2eb9d7b670f994d0a1")
+        );
+        assert!(matches!(action, RecoveryAction::List));
+
+        // The existing owners keep their default and need no id.
+        let cli = Cli::try_parse_from(["cccc", "daemon", "process-recovery", "list"])
+            .expect("daemon owner review");
+        assert!(matches!(
+            cli.command,
+            Some(CommandKind::Daemon {
+                action: DaemonAction::ProcessRecovery {
+                    owner: RecoveryOwner::Daemon,
+                    owner_id: None,
+                    ..
+                },
+            })
+        ));
     }
 }

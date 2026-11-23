@@ -3,16 +3,37 @@ import { useTranslation } from "react-i18next";
 import { classNames } from "../../utils/classNames";
 import { useModalA11y } from "../../hooks/useModalA11y";
 import { ModalFrame } from "./ModalFrame";
+import { CHET_PRINCIPAL } from "../../utils/chetIdentity";
 
 export interface RecipientEntry {
   id: string;
   label?: string;
   cleared: boolean;
   deliveryState: string;
+  deliveryReason?: string;
+  deliveryEvidence?: string;
+  waitingReason?: string;
   read: boolean;
   replied: boolean;
   replyRequested: boolean;
   cancelled: boolean;
+}
+
+function waitingReasonKey(reason: string): string {
+  switch (reason) {
+    case "group_paused":
+      return "recipients.waitingReason.groupPaused";
+    case "group_stopped":
+      return "recipients.waitingReason.groupStopped";
+    case "member_disabled":
+      return "recipients.waitingReason.memberDisabled";
+    case "runtime_switch":
+      return "recipients.waitingReason.runtimeSwitch";
+    case "not_submitted":
+      return "recipients.waitingReason.notSubmitted";
+    default:
+      return "recipients.deliveryWaiting";
+  }
 }
 
 export interface RecipientsModalProps {
@@ -60,16 +81,29 @@ export function RecipientsModal({
 
   const deliveryLabel = (entry: RecipientEntry): string => {
     if (remoteDelivery) return t(`chat:connectDelivery.${remoteDelivery.state}`);
-    if (entry.deliveryState === "accepted") return t("recipients.deliveryAccepted");
+    if (entry.deliveryState === "accepted") {
+      if (entry.deliveryEvidence === "terminal_written") {
+        return t("recipients.deliveryTerminalWritten");
+      }
+      if (entry.deliveryEvidence === "channel_accepted") {
+        return t("recipients.deliveryChannelAccepted");
+      }
+      return t("recipients.deliveryAccepted");
+    }
     if (entry.deliveryState === "claimed") return t("recipients.deliveryClaimed");
-    if (entry.deliveryState === "failed") return t("recipients.deliveryFailed");
     if (entry.deliveryState === "ambiguous") return t("recipients.deliveryAmbiguous");
+    if (entry.waitingReason && !(messageMode === "mail" && entry.read)) {
+      return t(waitingReasonKey(entry.waitingReason));
+    }
+    if (entry.deliveryState === "failed" && !(messageMode === "mail" && entry.read)) {
+      return t("recipients.deliveryFailed");
+    }
     if (messageMode === "mail") return t("recipients.inInbox");
     return t("recipients.notDelivered");
   };
 
   const deliverLabel = (entry: RecipientEntry): string => {
-    if (entry.deliveryState === "failed") return t("recipients.retry");
+    if (entry.deliveryState === "failed" && !entry.waitingReason) return t("recipients.retry");
     if (entry.deliveryState === "ambiguous") return t("recipients.retryAnyway");
     return t("recipients.sendNow");
   };
@@ -81,6 +115,7 @@ export function RecipientsModal({
       </div>
       <div
         className="text-[11px] truncate text-[var(--color-text-muted)] mt-0.5"
+        data-recipient-destination
         title={t("recipients.toLabel", { label: toLabel })}
       >
         {t("recipients.toLabel", { label: toLabel })}
@@ -103,28 +138,77 @@ export function RecipientsModal({
         {entries.length > 0 ? (
           <div className="rounded-xl border divide-y border-[var(--glass-border-subtle)] divide-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)]">
             {entries.map((entry) => {
+              // Chet's intake is not a Group delivery.
+              const chet = entry.id === CHET_PRINCIPAL;
               const canDeliver =
                 !remoteDelivery &&
                 entry.id !== "user" &&
+                !chet &&
                 (messageMode !== "mail" || !entry.read) &&
                 !entry.replied &&
                 !entry.cancelled &&
+                entry.waitingReason !== "member_disabled" &&
                 !["accepted", "claimed"].includes(entry.deliveryState);
               const actionKey = `deliver:${entry.id}`;
+              // An ambiguous delivery counts as handled, but it is not a confirmed success.
+              const deliveryUncertain =
+                !isReply && !isRead && !remoteDelivery && entry.deliveryState === "ambiguous";
+              const confirmedSuccess = entry.cleared && !entry.cancelled && !deliveryUncertain;
+              // A symbol needs an image role to carry its name; the cancelled text reads as itself.
+              const statusSymbol = entry.cancelled
+                ? null
+                : isReply
+                  ? entry.cleared
+                    ? "↩"
+                    : "○"
+                  : isRead
+                    ? entry.cleared
+                      ? "✓✓"
+                      : "✓"
+                    : deliveryUncertain
+                      ? "?"
+                      : entry.cleared
+                        ? "✓"
+                        : "○";
+              const statusName = isReply
+                ? t(entry.cleared ? "recipients.statusReplied" : "recipients.statusReplyPending")
+                : isRead
+                  ? t(entry.cleared ? "recipients.statusRead" : "recipients.statusReadPending")
+                  : deliveryLabel(entry);
               return (
-                <div key={entry.id} className="flex items-center justify-between gap-3 px-4 py-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-medium text-[var(--color-text-primary)]">
+                <div
+                  key={entry.id}
+                  data-recipient-row
+                  data-recipient-result={confirmedSuccess ? "success" : undefined}
+                  className="flex items-center justify-between gap-3 px-4 py-3"
+                >
+                  <div className="min-w-0" data-recipient-summary>
+                    <div
+                      className="truncate text-sm font-medium text-[var(--color-text-primary)]"
+                      data-recipient-name
+                    >
                       {entry.label || entry.id}
                     </div>
-                    <div className="mt-0.5 text-[11px] text-[var(--color-text-muted)]">
-                      {deliveryLabel(entry)}
-                    </div>
+                    {chet ? null : (
+                      <div className="mt-0.5 text-[11px] text-[var(--color-text-muted)]">
+                        {deliveryLabel(entry)}
+                      </div>
+                    )}
+                    {entry.deliveryReason &&
+                    ["failed", "ambiguous"].includes(entry.deliveryState) ? (
+                      <p
+                        className="mt-1 text-[11px] break-words text-[var(--color-text-secondary)]"
+                        data-recipient-reason
+                      >
+                        {entry.deliveryReason}
+                      </p>
+                    ) : null}
                   </div>
-                  <div className="flex shrink-0 items-center gap-2">
+                  <div className="flex shrink-0 items-center gap-2" data-recipient-controls>
                     {canDeliver ? (
                       <button
                         type="button"
+                        data-lcd-key
                         className="rounded-lg border border-[var(--glass-border-subtle)] px-2.5 py-1.5 text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--glass-tab-bg-hover)] disabled:opacity-50"
                         disabled={Boolean(busyAction)}
                         onClick={() => {
@@ -141,35 +225,14 @@ export function RecipientsModal({
                     <div
                       className={classNames(
                         "text-sm font-semibold tracking-tight",
-                        entry.cleared
+                        confirmedSuccess
                           ? "text-emerald-600 dark:text-emerald-400"
                           : "text-[var(--color-text-muted)]",
                       )}
-                      aria-label={
-                        entry.cancelled
-                          ? t("recipients.cancelled")
-                          : entry.cleared
-                            ? isReply
-                              ? "replied"
-                              : isRead
-                                ? "read"
-                                : "delivered"
-                            : "pending"
-                      }
+                      role={statusSymbol ? "img" : undefined}
+                      aria-label={statusSymbol ? statusName : undefined}
                     >
-                      {entry.cancelled
-                        ? t("recipients.cancelled")
-                        : isReply
-                          ? entry.cleared
-                            ? "↩"
-                            : "○"
-                          : isRead
-                            ? entry.cleared
-                              ? "✓✓"
-                              : "✓"
-                            : entry.cleared
-                              ? "✓"
-                              : "○"}
+                      {statusSymbol ?? t("recipients.cancelled")}
                     </div>
                   </div>
                 </div>
@@ -203,6 +266,7 @@ export function RecipientsModal({
           <div className="mt-4 border-t border-[var(--glass-border-subtle)] pt-4">
             <button
               type="button"
+              data-lcd-key
               className="rounded-lg px-3 py-2 text-sm font-medium text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--glass-tab-bg-hover)] disabled:opacity-50"
               disabled={Boolean(busyAction)}
               onClick={() => {

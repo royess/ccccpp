@@ -280,7 +280,9 @@ async fn antigravity_permissions_and_fifo_use_one_shared_adapter_without_termina
     let requests = std::fs::read_to_string(temp.path().join("fixture_requests.jsonl"))
         .expect("fixture operation");
     assert_eq!(
-        requests.matches("CCCC Realtime Voice").count(),
+        requests
+            .matches("You are Chet, CCCC's global assistant")
+            .count(),
         1,
         "host instructions injected only once"
     );
@@ -522,6 +524,8 @@ fn antigravity_supervisor_keeps_actual_acp_surface_after_a_pending_mode_edit() {
         group: group.clone(),
         actor: pending.clone(),
         event,
+        claimed: true,
+        transport: "managed_session",
     };
     assert!(
         matches!(
@@ -575,6 +579,79 @@ fn antigravity_supervisor_keeps_actual_acp_surface_after_a_pending_mode_edit() {
     assert!(journal.contains("headless.message.delta"));
     assert!(!journal.contains("FOREIGN"));
     assert!(!journal.contains("REPLAY"));
+}
+
+#[test]
+fn antigravity_supervisor_tells_the_user_once_that_a_start_left_the_saved_conversation() {
+    use crate::ops::{local_headless as supervisor, runtime_session};
+    let (temp, home) = fixture();
+    let store = cccc_core::GroupStore::new(home.clone()).expect("store");
+    let mut group = store
+        .create("ACP replaced conversation", "")
+        .expect("group");
+    group.scopes.push(cccc_core::Scope {
+        scope_key: "fixture".into(),
+        url: temp.path().to_string_lossy().into_owned(),
+        label: "fixture".into(),
+        git_remote: String::new(),
+    });
+    group.active_scope_key = "fixture".into();
+    let mut actor = cccc_contracts::Actor::new("alpha");
+    actor.runtime = ActorRuntime::Antigravity;
+    actor.runtime_mode = RuntimeMode::Acp;
+    actor.command = vec!["agy".into()];
+    actor
+        .env
+        .insert("AGY_FIXTURE_CLI".into(), "/bin/true".into());
+    let mut actor = cccc_core::actors::add(&mut group, actor).expect("actor");
+    store.save(&group).expect("persist");
+    struct Stop(String);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = crate::ops::local_headless::stop(&self.0, "alpha");
+        }
+    }
+    let _stop = Stop(group.group_id.clone());
+    let ledger = store.ledger_path(&group.group_id).expect("ledger");
+    // One start and stop of the member, then what the ledger tells the user so far.
+    let told_after_a_run = |group: &cccc_core::GroupDoc, actor: &cccc_contracts::Actor| {
+        supervisor::start(&home, group, actor).expect("start");
+        supervisor::stop(&group.group_id, "alpha").expect("stop");
+        cccc_core::ledger::read_all(&ledger)
+            .expect("ledger")
+            .into_iter()
+            .filter(|event| {
+                event.data.get("context").map(|context| &context["kind"])
+                    == Some(&json!("runtime_session_replaced"))
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(told_after_a_run(&group, &actor).is_empty(), "first start");
+    assert!(told_after_a_run(&group, &actor).is_empty(), "resumed");
+
+    actor.command.push("--model=gemini-fixture".into());
+    group.actors[0] = actor.clone();
+    store.save(&group).expect("changed launch command");
+    let told = told_after_a_run(&group, &actor);
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].kind, "system.notify");
+    assert_eq!(told[0].data["context"]["member"], "alpha");
+    assert_eq!(told[0].data["context"]["reasons"], json!(["command"]));
+    let listed = runtime_session::actor_fields(&home, &group.group_id, "alpha");
+    assert_eq!(
+        listed["runtime_session_replaced_reasons"],
+        json!(["command"])
+    );
+    assert_eq!(
+        listed["runtime_session_replaced_at"],
+        told[0].data["context"]["replaced_at"]
+    );
+
+    assert_eq!(
+        told_after_a_run(&group, &actor).len(),
+        1,
+        "the new conversation resumes"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -891,7 +968,9 @@ fn antigravity_admitted_failure_exposes_provider_error_in_headless_journal() {
             &[failed],
             &std::sync::atomic::AtomicBool::new(false)
         ),
-        supervisor::BatchSubmission::Accepted
+        supervisor::BatchSubmission::Accepted(Some(
+            cccc_contracts::event::DeliveryEvidence::ChannelAccepted
+        ))
     );
     let journal = store
         .state_dir(&group.group_id)

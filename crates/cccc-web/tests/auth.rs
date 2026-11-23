@@ -470,7 +470,7 @@ async fn scoped_token_cannot_open_another_group() {
 }
 
 #[tokio::test]
-async fn scoped_token_cannot_delegate_into_another_group() {
+async fn scoped_token_cannot_send_into_another_group() {
     let (_temp, home) = home();
     let token = AccessTokenStore::new(home.clone())
         .expect("store")
@@ -478,7 +478,7 @@ async fn scoped_token_cannot_delegate_into_another_group() {
         .expect("token");
     let response = cccc_web::app(home)
         .oneshot(
-            Request::post("/api/v1/groups/g_allowed/delegate_contact")
+            Request::post("/api/v1/groups/g_allowed/send_cross_group")
                 .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"dst_group_id":"g_denied","text":"hello"}"#))
@@ -487,6 +487,31 @@ async fn scoped_token_cannot_delegate_into_another_group() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn retired_delegation_route_is_not_found() {
+    let (_temp, home) = home();
+    let store = AccessTokenStore::new(home.clone()).expect("store");
+    let token = store
+        .create(
+            "member",
+            vec!["g_source".into(), "g_target".into()],
+            false,
+            None,
+        )
+        .expect("token");
+    let response = cccc_web::app(home)
+        .oneshot(
+            Request::post("/api/v1/groups/g_source/delegate_contact")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"dst_group_id":"g_target","text":"hello"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -534,6 +559,7 @@ async fn scoped_token_cannot_access_global_management_routes() {
         ("GET", "/api/v1/capabilities/allowlist"),
         ("POST", "/api/v1/capabilities/allowlist/validate"),
         ("POST", "/api/v1/capabilities/block"),
+        ("POST", "/api/v1/capabilities/update"),
     ] {
         let response = cccc_web::app(home.clone())
             .oneshot(
@@ -631,35 +657,51 @@ async fn long_lived_query_token_is_rejected_for_event_streams() {
 }
 
 #[tokio::test]
-async fn scoped_token_cannot_snapshot_a_query_selected_group() {
+async fn scoped_token_cannot_read_a_query_selected_group_outside_its_scope() {
     let (_temp, home) = home();
     let token = AccessTokenStore::new(home.clone())
         .expect("store")
         .create("member", vec!["g_allowed".into()], false, None)
         .expect("token");
     let app = cccc_web::app(home);
-    let response = app
-        .clone()
-        .oneshot(
-            Request::get("/api/v1/debug/snapshot?group%5Fid=g%5Fdenied")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    let response = app
-        .oneshot(
-            Request::get("/api/v1/debug/snapshot?group_id=g_allowed&group_id=g_denied")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    for path in ["/api/v1/debug/snapshot", "/api/v1/capabilities/overview"] {
+        for query in [
+            "group%5Fid=g%5Fdenied",
+            "group_id=g_allowed&group_id=g_denied",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("{path}?{query}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}?{query}");
+        }
+    }
+    for path in [
+        "/api/v1/capabilities/overview",
+        "/api/v1/capabilities/overview?group_id=g_allowed",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authorized request reaches daemon: {path}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -874,9 +916,58 @@ async fn cannot_demote_the_last_admin_while_scoped_tokens_remain() {
     );
 }
 
+#[tokio::test]
+async fn native_recovery_is_denied_to_group_principals_and_exhibit_even_with_a_known_actor() {
+    let (_temp, home) = home();
+    let tokens = AccessTokenStore::new(home.clone()).expect("token store");
+    let admin = tokens
+        .create("admin", Vec::new(), true, None)
+        .expect("admin");
+    let member = tokens
+        .create("member", vec!["g_native".into()], false, None)
+        .expect("Group member");
+    for (mode, token) in [
+        (cccc_web::WebMode::Normal, member.token),
+        (cccc_web::WebMode::Exhibit, admin.token),
+    ] {
+        for request in [
+            Request::get("/api/v1/local_sessions/recovery/g_native/claude-1"),
+            Request::post("/api/v1/local_sessions/recovery/g_native/claude-1/refresh"),
+        ] {
+            let response = cccc_web::app_with_mode(home.clone(), mode)
+                .oneshot(
+                    request
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let payload: Value = serde_json::from_slice(
+                &response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes(),
+            )
+            .expect("JSON");
+            assert_eq!(payload["ok"], false);
+            assert!(
+                payload
+                    .get("result")
+                    .is_none_or(|result| result.get("recovery").is_none())
+            );
+        }
+    }
+}
+
 fn home() -> (tempfile::TempDir, HomeLayout) {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = HomeLayout::from_path(temp.path().join("rust-home")).expect("home");
     home.initialize().expect("initialize");
     (temp, home)
 }
+
+cccc_daemon::session_owner_test_entry!();

@@ -106,6 +106,16 @@ async fn actor_catalog_keeps_core_routes_with_and_without_a_daemon() {
             .iter()
             .find(|t| t["name"] == "cccc_message_reply")
             .expect("reply");
+        // The Claude API rejects combinations at a tool schema's root. The
+        // daemon validates the reply arguments.
+        for unsupported in ["oneOf", "allOf", "anyOf"] {
+            assert!(reply["inputSchema"].get(unsupported).is_none());
+        }
+        assert_eq!(reply["inputSchema"]["properties"]["text"]["type"], "string");
+        assert_eq!(
+            reply["inputSchema"]["properties"]["answer"]["type"],
+            "object"
+        );
         for obsolete in ["priority", "reply_required"] {
             assert!(reply["inputSchema"]["properties"].get(obsolete).is_none());
         }
@@ -113,3 +123,5 @@ async fn actor_catalog_keeps_core_routes_with_and_without_a_daemon() {
     assert_eq!(names(&before), names(&peer));
     assert!(!names(&peer).contains("cccc_actor"));
 }
+
+cccc_daemon::session_owner_test_entry!();

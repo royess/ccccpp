@@ -35,8 +35,10 @@ If build fails, check: Docker version >= 20.10, sufficient disk space, network a
 Ask each one individually:
 1. "What port do you want the Web UI on? (default: 8848)"
 2. "Where are your project files? (absolute path, will be mounted to /workspace)"
-3. "Which AI agent API keys do you have? (ANTHROPIC_AUTH_TOKEN / OPENAI_API_KEY)"
+3. "Which AI providers will you use, and which environment variable names will you configure?"
 4. "Will this stay localhost-only until you create an Admin Access Token in Web Access?"
+Do not ask the user to paste credentials into this conversation. Have them set
+and export the needed variables privately in their own shell.
 
 ## Step 4: Run the container
 Build the docker run command from the user's answers:
@@ -44,9 +46,12 @@ Build the docker run command from the user's answers:
     -p 127.0.0.1:{port}:8848 \
     -v cccc-data:/data \
     -v {project_path}:/workspace \
-    -e {API_KEY_ENV}={api_key} \
+    -e {API_KEY_ENV} \
     --name cccc \
     cccc
+Replace {API_KEY_ENV} with a configured variable name, such as
+ANTHROPIC_AUTH_TOKEN, and repeat -e for each variable needed. Do not include
+credential values in the command.
 
 ## Step 5: Verify
 Run these and report results:
@@ -64,6 +69,7 @@ Run these and report results:
 If user prefers Compose, point them to the bundled docker/docker-compose.yml:
   cp docker/.env.example docker/.env
   # Edit docker/.env with port, API keys, workspace path, proxy, then create an Admin Access Token in Web Access before non-local exposure.
+  docker volume create cccc-data
   # From project root:
   docker compose --env-file docker/.env -f docker/docker-compose.yml up -d --build
   # Or from docker directory:
@@ -109,18 +115,21 @@ not contain the CCCC Python product.
 
 ### 2. Run the Container
 
+Set and export `ANTHROPIC_AUTH_TOKEN` in your shell before running this example.
+Docker passes its value by name; the command need not contain the credential.
+
 ```bash
 docker run -d \
   --init \
   -p 127.0.0.1:8848:8848 \
   -v cccc-data:/data \
   -v /path/to/your/projects:/workspace \
-  -e ANTHROPIC_AUTH_TOKEN=sk-ant-xxx \
+  -e ANTHROPIC_AUTH_TOKEN \
   --name cccc \
   cccc
 ```
 
-Open `http://localhost:8848` in your browser. The sample command binds the host port to `127.0.0.1` on purpose, so you can safely create an **Admin Access Token** in **Settings > Web Access** before any broader exposure.
+Open `http://localhost:8848` in your browser. The sample command binds the host port to `127.0.0.1` on purpose, so you can safely create an **Admin Access Token** in **Settings > This instance > Web Access** before any broader exposure.
 
 The image includes Chromium, the required shared libraries, and `Xvfb` for
 projected browser surfaces such as NotebookLM sign-in and Presentation browser
@@ -154,7 +163,7 @@ docker exec cccc cccc doctor
 | `ANTHROPIC_AUTH_TOKEN` | _(none)_ | Auth token for Claude Code runtime (do not set together with `ANTHROPIC_API_KEY`) |
 | `ANTHROPIC_BASE_URL` | _(none)_ | Custom API endpoint for Claude Code |
 | `OPENAI_API_KEY` | _(none)_ | API key for Codex runtime |
-| `OPENAI_BASE_URL` | _(none)_ | CCCC compatibility entry for Codex custom endpoints. CCCC maps this to Codex CLI's `openai_base_url` runtime config when launching Codex actors. |
+| `OPENAI_BASE_URL` | _(none)_ | CCCC compatibility entry for Codex custom endpoints. CCCC maps this to Codex CLI's `openai_base_url` runtime config when launching Codex agents. |
 
 ### Volume Mounts
 

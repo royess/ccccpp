@@ -2,14 +2,16 @@ use super::operation::{
     Operation,
     Policy::{Read, Write},
 };
-use cccc_contracts::{ActorRole, DaemonRequest, Event, utc_now};
+use cccc_contracts::{ActorRole, DaemonRequest, Event, GroupState, utc_now};
 use cccc_core::automation::STANDUP_SNIPPET;
 use cccc_core::fs::read_json;
-use cccc_core::permissions;
 use cccc_core::{GroupDoc, HomeLayout};
 use serde_json::{Map, Value, json};
 
-use super::automation_rule_access::{expected_version, validate as validate_rule};
+use super::automation_manage::{Ruleset, split_snippets};
+use super::automation_rule_access::{
+    authorize_change, authorize_run, expected_version, validate as validate_rule,
+};
 use crate::dispatch::{OpError, OpResult, object, required_arg, store, string_arg};
 
 pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
@@ -17,6 +19,7 @@ pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
         "group_automation_update" => Operation::new(Write, update),
         "group_automation_state" => Operation::new(Read, state),
         "group_automation_manage" => Operation::new(Write, manage),
+        "group_automation_run_now" => Operation::new(Write, run_now),
         "group_automation_reset_baseline" => Operation::new(Write, reset),
         _ => return None,
     })
@@ -24,7 +27,8 @@ pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
 
 fn update(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let group = load(home, request)?;
-    authorize(&group, request)?;
+    let by = caller(request);
+    let role = caller_role(&group, &by)?;
     let ruleset = request
         .args
         .get("ruleset")
@@ -32,7 +36,7 @@ fn update(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         .cloned()
         .ok_or_else(|| OpError::new("invalid_args", "ruleset must be an object"))?;
     let stored = group.automation.get("rules").and_then(Value::as_array);
-    let (rules, snippets) = normalize_ruleset(&ruleset, &caller(request), stored)?;
+    let (rules, snippets) = normalize_ruleset(&ruleset, &by, role, stored)?;
     let expected = expected_version(&request.args)?;
     let current = group
         .automation
@@ -45,22 +49,32 @@ fn update(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
             format!("automation version changed: expected {expected:?}, current {current}"),
         ));
     }
+    let (custom, overrides) = split_snippets(snippets);
+    if let Some(role) = role {
+        let saved = saved_ruleset(&group)?;
+        authorize_change(
+            &saved.rules,
+            &rules,
+            custom != saved.snippets || overrides != saved.overrides,
+            &by,
+            role,
+        )?;
+    }
     let updated = mutate_automation(home, &group.group_id, |doc| {
         doc.automation.insert("rules".into(), Value::Array(rules));
-        let mut custom = snippets;
-        let mut overrides = Map::new();
-        if let Some(standup) = custom.remove("standup")
-            && standup.as_str() != Some(STANDUP_SNIPPET)
-        {
-            overrides.insert("standup".into(), standup);
-        }
         doc.automation
             .insert("snippets".into(), Value::Object(custom));
         doc.automation
             .insert("snippet_overrides".into(), Value::Object(overrides));
         doc.automation.insert("version".into(), json!(current + 1));
     })?;
-    let event = append_event(home, &group.group_id, request, "group.automation_update")?;
+    let event = append_event(
+        home,
+        &group.group_id,
+        request,
+        "group.automation_update",
+        change_data(&group.automation, &updated.automation),
+    )?;
     let mut result = payload(home, &updated, &caller(request))?;
     result["event"] = json!(event);
     object(result)
@@ -70,25 +84,140 @@ fn state(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     object(payload(home, &load(home, request)?, &caller(request))?)
 }
 
+fn run_now(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
+    let group = load(home, request)?;
+    let by = caller(request);
+    let role = caller_role(&group, &by)?;
+    let rule_id = required_arg(request, "rule_id")?;
+    let saved = saved_ruleset(&group)?;
+    let rule = saved
+        .rules
+        .iter()
+        .find(|rule| rule.get("id").and_then(Value::as_str) == Some(rule_id.as_str()))
+        .ok_or_else(|| OpError::new("not_found", "automation rule not found"))?;
+    if role == Some(ActorRole::Peer)
+        && rule.get("scope").and_then(Value::as_str) == Some("personal")
+        && rule.get("owner_actor_id").and_then(Value::as_str) != Some(by.as_str())
+    {
+        return Err(OpError::new("not_found", "automation rule not found"));
+    }
+    authorize_run(rule, &by, role)?;
+    let kind = rule
+        .get("action")
+        .and_then(|action| action.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("notify");
+    if kind != "notify" {
+        return Err(OpError::new(
+            "unsupported_action",
+            "only notification rules can be run now",
+        ));
+    }
+    let current = group
+        .automation
+        .get("version")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    if expected_version(&request.args)?.is_some_and(|expected| expected != current) {
+        return Err(OpError::new(
+            "version_conflict",
+            "automation version changed; reload before running",
+        ));
+    }
+    match group.state {
+        GroupState::Paused => {
+            return Err(OpError::new(
+                "group_paused",
+                "resume the Group before running a rule",
+            ));
+        }
+        GroupState::Stopped => {
+            return Err(OpError::new(
+                "group_stopped",
+                "start the Group before running a rule",
+            ));
+        }
+        _ => {}
+    }
+    let rule = rule
+        .as_object()
+        .ok_or_else(|| OpError::new("group_automation_state_invalid", "rule must be an object"))?;
+    let outcome = cccc_core::automation::notify_rule_now(home, &group, &rule_id, rule)
+        .map_err(OpError::io)?;
+    let notified = outcome
+        .notifications
+        .iter()
+        .filter_map(|event| {
+            event
+                .data
+                .get("target_actor_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let run_at = outcome.notifications.first().map(|event| event.ts.clone());
+    for event in &outcome.notifications {
+        super::actor_delivery::dispatch(home, &group, event);
+    }
+    if let Some(error) = outcome.failure {
+        let message = if notified.is_empty() {
+            format!("could not write notification: {error}")
+        } else {
+            format!("notifications may already have been created for some recipients: {error}")
+        };
+        return Err(OpError::new("io_error", message));
+    }
+    let run_at = run_at.ok_or_else(|| {
+        OpError::new(
+            "no_notification",
+            "no enabled recipient or nonempty message",
+        )
+    })?;
+    object(json!({"rule_id":rule_id, "run_at":run_at, "notified":notified}))
+}
+
 fn manage(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let group = load(home, request)?;
-    authorize(&group, request)?;
-    let outcome = super::automation_manage::apply(&group, request)?;
+    let by = caller(request);
+    let role = caller_role(&group, &by)?;
+    let saved = saved_ruleset(&group)?;
+    let outcome = super::automation_manage::apply(&group, request, role, &saved)?;
+    if let Some(role) = role {
+        let after = &outcome.ruleset;
+        authorize_change(
+            &saved.rules,
+            &after.rules,
+            after.snippets != saved.snippets || after.overrides != saved.overrides,
+            &by,
+            role,
+        )?;
+    }
     let updated = if outcome.changed {
         let current = group
             .automation
             .get("version")
             .and_then(Value::as_u64)
             .unwrap_or(1);
-        let rules = outcome.rules.clone();
-        let snippets = outcome.snippets.clone();
+        let Ruleset {
+            rules,
+            snippets,
+            overrides,
+        } = outcome.ruleset.clone();
         let updated = mutate_automation(home, &group.group_id, |doc| {
             doc.automation.insert("rules".into(), Value::Array(rules));
             doc.automation
                 .insert("snippets".into(), Value::Object(snippets));
+            doc.automation
+                .insert("snippet_overrides".into(), Value::Object(overrides));
             doc.automation.insert("version".into(), json!(current + 1));
         })?;
-        let event = append_event(home, &group.group_id, request, "group.automation_update")?;
+        let event = append_event(
+            home,
+            &group.group_id,
+            request,
+            "group.automation_update",
+            change_data(&group.automation, &updated.automation),
+        )?;
         (updated, Some(event))
     } else {
         (group, None)
@@ -103,7 +232,8 @@ fn manage(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
 
 fn reset(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let group = load(home, request)?;
-    authorize(&group, request)?;
+    let by = caller(request);
+    let role = caller_role(&group, &by)?;
     let current = group
         .automation
         .get("version")
@@ -117,10 +247,20 @@ fn reset(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
             format!("automation version mismatch: expected {expected}, current {current}"),
         ));
     }
+    if let Some(role) = role {
+        let saved = saved_ruleset(&group)?;
+        authorize_change(
+            &saved.rules,
+            &baseline_rules(),
+            !saved.snippets.is_empty() || !saved.overrides.is_empty(),
+            &by,
+            role,
+        )?;
+    }
     let updated = mutate_automation(home, &group.group_id, |doc| {
         doc.automation = json!({
             "version":current + 1,
-            "rules":default_rules(),
+            "rules":baseline_rules(),
             "snippets":{},
             "snippet_overrides":{}
         })
@@ -128,7 +268,13 @@ fn reset(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         .cloned()
         .unwrap_or_default();
     })?;
-    let event = append_event(home, &group.group_id, request, "group.automation_update")?;
+    let event = append_event(
+        home,
+        &group.group_id,
+        request,
+        "group.automation_update",
+        change_data(&group.automation, &updated.automation),
+    )?;
     let mut result = payload(home, &updated, &caller(request))?;
     result["event"] = json!(event);
     object(result)
@@ -136,12 +282,14 @@ fn reset(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
 
 fn payload(home: &HomeLayout, group: &GroupDoc, by: &str) -> Result<Value, OpError> {
     let peer = caller_role(group, by)? == Some(ActorRole::Peer);
+    // A malformed saved list reads as the baseline, so the user can still open
+    // and replace it; writes that start from the saved list report it instead.
     let mut rules = group
         .automation
         .get("rules")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_else(|| default_rules().as_array().cloned().unwrap_or_default());
+        .unwrap_or_else(baseline_rules);
     let custom = group
         .automation
         .get("snippets")
@@ -177,10 +325,10 @@ fn payload(home: &HomeLayout, group: &GroupDoc, by: &str) -> Result<Value, OpErr
     let mut status = rules
         .iter()
         .filter_map(|rule| {
-            let id = rule.get("id").and_then(Value::as_str)?.trim();
-            if id.is_empty() {
-                return None;
-            }
+            let id = rule
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())?;
             let entry = runtime_rules.get(id).and_then(Value::as_object);
             let last_fired_at = entry
                 .and_then(|entry| entry.get("last_fired_at"))
@@ -195,26 +343,56 @@ fn payload(home: &HomeLayout, group: &GroupDoc, by: &str) -> Result<Value, OpErr
                 .and_then(Value::as_str)
                 .unwrap_or("interval");
             let enabled = rule.get("enabled").and_then(Value::as_bool) != Some(false);
-            let next_fire_at = enabled
-                .then(|| cccc_core::automation::next_rule_fire_at(trigger, last_fired, now))
-                .flatten()
-                .map(|value| value.to_rfc3339())
-                .unwrap_or_default();
-            let completed = trigger_kind == "at"
+            let fired_count = entry
+                .and_then(|entry| entry.get("fired_count"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let completed = (trigger_kind == "at"
                 && (last_fired.is_some()
                     || entry
                         .and_then(|entry| entry.get("at_fired"))
                         .and_then(Value::as_bool)
-                        .unwrap_or(false));
+                        .unwrap_or(false)))
+                || trigger
+                    .and_then(|trigger| trigger.get("max_runs"))
+                    .and_then(Value::as_u64)
+                    .is_some_and(|limit| fired_count >= limit);
+            let suppressed_reason = if enabled && !completed {
+                match group.state {
+                    GroupState::Paused => Some("group_paused"),
+                    GroupState::Stopped => Some("group_stopped"),
+                    GroupState::Idle if id == "standup" => Some("idle_standup"),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let next_fire_at = (enabled && !completed && suppressed_reason.is_none())
+                .then(|| cccc_core::automation::next_rule_fire_at(trigger, last_fired, now))
+                .flatten()
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_default();
+            let is_notify = rule.get("action").and_then(|action| action.get("kind"))
+                .and_then(Value::as_str).unwrap_or("notify") == "notify";
+            let last_run = is_notify.then_some(entry).flatten().and_then(|entry| {
+                let at = entry.get("last_run_at")?.as_str()?;
+                chrono::DateTime::parse_from_rfc3339(at).ok()?;
+                let kind = entry.get("last_run_kind")?.as_str()?;
+                matches!(kind, "manual" | "scheduled").then_some((at, kind))
+            });
             Some((
                 id.to_owned(),
                 json!({
                     "last_fired_at":last_fired_at,
+                    "last_run_at":last_run.map(|(at, _)| at),
+                    "last_run_kind":last_run.map(|(_, kind)| kind),
+                    "suppressed_reason":suppressed_reason,
                     "last_error_at":entry.and_then(|entry|entry.get("last_error_at")).and_then(Value::as_str).unwrap_or_default(),
                     "last_error":entry.and_then(|entry|entry.get("last_error")).and_then(Value::as_str).unwrap_or_default(),
                     "next_fire_at":next_fire_at,
+                    "fired_count":fired_count,
                     "completed":completed,
-                    "completed_at":if completed { last_fired_at } else { "" },
+                    "completed_at":"",
                 }),
             ))
         })
@@ -273,18 +451,64 @@ fn payload(home: &HomeLayout, group: &GroupDoc, by: &str) -> Result<Value, OpErr
     }))
 }
 
-fn default_rules() -> Value {
-    json!([{
+fn baseline_rules() -> Vec<Value> {
+    vec![json!({
         "id":"standup","enabled":false,"scope":"group","owner_actor_id":null,
-        "to":["@foreman"],"trigger":{"kind":"interval","every_seconds":900},
+        "to":["@foreman"],"trigger":{"kind":"interval","every_seconds":7200},
         "action":{"kind":"notify","priority":"normal",
-            "title":"Stand-up reminder","snippet_ref":"standup","message":""}
-    }])
+            "title":"Team stand-up","snippet_ref":"standup","message":""}
+    })]
+}
+
+/// The ruleset in force: the saved rules, or the built-in baseline while the
+/// Group has never saved a list. A saved empty list stays empty. A saved value
+/// that a change could not carry over intact (the wrong type, or a rule that
+/// is not an object or lacks a distinct id) is reported, not dropped.
+fn saved_ruleset(group: &GroupDoc) -> Result<Ruleset, OpError> {
+    let invalid = |problem: &str| {
+        OpError::new(
+            "group_automation_state_invalid",
+            format!(
+                "the saved automation {problem}; \
+                 the user can replace it by saving or resetting the rules"
+            ),
+        )
+    };
+    let map = |key: &str| match group.automation.get(key) {
+        None => Ok(Map::new()),
+        Some(Value::Object(map)) => Ok(map.clone()),
+        Some(_) => Err(invalid(&format!("{key} has the wrong type"))),
+    };
+    let rules = match group.automation.get("rules") {
+        None => baseline_rules(),
+        Some(Value::Array(rules)) => {
+            let mut ids = std::collections::BTreeSet::new();
+            for rule in rules {
+                let id = rule
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty());
+                if !id.is_some_and(|id| ids.insert(id)) {
+                    return Err(invalid(
+                        "rules include one without an id or with the id of another",
+                    ));
+                }
+            }
+            rules.clone()
+        }
+        Some(_) => return Err(invalid("rules have the wrong type")),
+    };
+    Ok(Ruleset {
+        rules,
+        snippets: map("snippets")?,
+        overrides: map("snippet_overrides")?,
+    })
 }
 
 fn normalize_ruleset(
     ruleset: &Map<String, Value>,
     by: &str,
+    role: Option<ActorRole>,
     stored: Option<&Vec<Value>>,
 ) -> Result<(Vec<Value>, Map<String, Value>), OpError> {
     if let Some(key) = ruleset
@@ -330,7 +554,7 @@ fn normalize_ruleset(
             )
         })?;
         let previous = stored_rule(stored, rule.get("id"));
-        validate_rule(&mut rule, by, false, previous)?;
+        validate_rule(&mut rule, by, role, previous)?;
         let id = rule
             .get("id")
             .and_then(Value::as_str)
@@ -397,26 +621,46 @@ fn load(home: &HomeLayout, request: &DaemonRequest) -> Result<GroupDoc, OpError>
         .map_err(OpError::not_found)
 }
 
-fn authorize(group: &GroupDoc, request: &DaemonRequest) -> Result<(), OpError> {
-    permissions::require_group(
-        group,
-        &string_arg(request, "by").unwrap_or_else(|| "user".into()),
-    )
-    .map_err(OpError::invalid)
-}
-
 fn caller(request: &DaemonRequest) -> String {
     string_arg(request, "by").unwrap_or_else(|| "user".into())
 }
 
+/// The caller is the Actor named exactly: rules are validated and owned
+/// under the same `by`, so a padded name is not that Actor.
 fn caller_role(group: &GroupDoc, by: &str) -> Result<Option<ActorRole>, OpError> {
-    let who = by.trim();
-    if who.is_empty() || matches!(who, "user" | "system") {
+    if by.is_empty() || matches!(by, "user" | "system") {
         return Ok(None);
     }
-    cccc_core::actors::effective_role(group, who)
+    cccc_core::actors::effective_role(group, by)
         .map(Some)
-        .ok_or_else(|| OpError::new("permission_denied", format!("unknown actor: {who}")))
+        .ok_or_else(|| OpError::new("permission_denied", format!("unknown actor: {by}")))
+}
+
+/// What a saved change did, for its ledger event: the version step and which
+/// parts of the ruleset changed. Rule IDs, bodies and snippet text stay in the
+/// group document.
+fn change_data(before: &Map<String, Value>, after: &Map<String, Value>) -> Value {
+    let version =
+        |doc: &Map<String, Value>| doc.get("version").and_then(Value::as_u64).unwrap_or(1);
+    // A part never saved reads as its default, as saved_ruleset reads it.
+    let part = |doc: &Map<String, Value>, key: &str| {
+        doc.get(key).cloned().unwrap_or_else(|| {
+            if key == "rules" {
+                Value::Array(baseline_rules())
+            } else {
+                Value::Object(Map::new())
+            }
+        })
+    };
+    let changed = ["rules", "snippets", "snippet_overrides"]
+        .into_iter()
+        .filter(|key| part(before, key) != part(after, key))
+        .collect::<Vec<_>>();
+    json!({
+        "previous_version": version(before),
+        "version": version(after),
+        "changed": changed,
+    })
 }
 
 fn append_event(
@@ -424,9 +668,11 @@ fn append_event(
     group_id: &str,
     request: &DaemonRequest,
     kind: &str,
+    data: Value,
 ) -> Result<Event, OpError> {
     let mut event = Event::new(kind, group_id);
     event.by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    event.data = data.as_object().cloned().unwrap_or_default();
     cccc_core::ledger::append(
         &store(home)?.ledger_path(group_id).map_err(OpError::io)?,
         &event,

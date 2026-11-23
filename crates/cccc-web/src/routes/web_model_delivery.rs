@@ -9,8 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::AppState;
 use crate::api::ApiError;
 use crate::browser_surface::{
-    BOUND_CONVERSATION_ERROR_MARKER, PromptSubmissionOutcome, conversation_url_for_target,
-    is_chatgpt_url,
+    BOUND_CONVERSATION_ERROR_MARKER, PromptSubmissionOutcome, is_chatgpt_url,
 };
 
 use super::web_model_browser::key;
@@ -139,84 +138,60 @@ fn spawn_worker(state: AppState, group_id: String, actor_id: String) {
         let Some(exhausted_turn_id) = exhausted_turn_id else {
             return;
         };
-        if let Ok(target) = load_target(&state, &group_id, &actor_id) {
-            let message =
-                "browser model remained unavailable after the bounded automatic retry budget";
-            let _ = update_target(
-                &state,
-                &group_id,
-                &actor_id,
-                json!({"last_delivery_status":"failed","last_error":message}),
-            );
-            if let (Some(delivery_id), Some(event_ids)) = (
-                target["last_delivery_id"].as_str(),
-                target["last_delivery_event_ids"].as_array(),
-            ) {
-                record_delivery(
-                    &state,
-                    &group_id,
-                    &actor_id,
-                    &exhausted_turn_id,
-                    Value::Array(event_ids.clone()),
+        {
+            // Closing this batch is browser work like any attempt. Refused, the
+            // batch stays deferred and the next worker takes it back.
+            let Ok(Some(_work)) = browser_work(&state, &group_id, &actor_id) else {
+                return;
+            };
+            // The composer may still hold this batch, so it is never offered again.
+            if let Ok(target) = load_target(&state, &group_id, &actor_id)
+                && let Some(delivery_id) = target["last_delivery_id"].as_str()
+            {
+                let message = "browser model remained unavailable after the bounded automatic retry budget; this message may still be staged in the conversation";
+                let attempt = DeliveryAttempt {
+                    turn_id: &exhausted_turn_id,
+                    event_ids: target["last_delivery_event_ids"].clone(),
                     delivery_id,
-                    "failed",
-                    message,
-                    json!({"target_url":target["url"]}),
+                };
+                let evidence = json!({
+                    "submitted":false,
+                    "submission_evidence":"deferred_retry_budget_exhausted",
+                    "error":message
+                });
+                if let Err(error) = complete_ambiguous_attempt(
+                    &state, &group_id, &actor_id, attempt, evidence, message,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(group_id, actor_id, %error, "Web-model browser batch could not be closed");
+                }
             }
         }
-        match fresh_turn_after_exhaustion(&state, &group_id, &actor_id, &exhausted_turn_id).await {
-            Ok(Some(fresh_turn_id)) => {
-                tracing::debug!(
-                    group_id,
-                    actor_id,
-                    exhausted_turn_id,
-                    fresh_turn_id,
-                    "Rescheduling Web-model browser delivery for fresh direct work"
-                );
-                spawn_worker(state, group_id, actor_id);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    group_id,
-                    actor_id,
-                    %error,
-                    "Web-model browser fresh unread check failed"
-                );
-            }
-        }
+        // Work that arrived during the last attempt found this worker running.
+        spawn_worker(state, group_id, actor_id);
     });
 }
 
-async fn fresh_turn_after_exhaustion(
-    state: &AppState,
-    group_id: &str,
-    actor_id: &str,
-    exhausted_turn_id: &str,
-) -> Result<Option<String>, ApiError> {
-    if !super::web_model_supervisor::actor_delivery_enabled(state, group_id, actor_id) {
-        return Ok(None);
+/// Waits until no delivery or browser control in this process holds an
+/// Actor's browser work, or `timeout` passes. Returns whether all had ended.
+pub(crate) async fn wait_for_browser_work(timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let idle = IN_FLIGHT.get().is_none_or(|sessions| {
+            sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        });
+        if idle {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let wait = daemon_call(
-        state,
-        "runtime_wait_next_turn",
-        browser_wait_args(group_id, actor_id),
-    )
-    .await?;
-    Ok(replacement_turn_id(exhausted_turn_id, &wait))
-}
-
-fn replacement_turn_id(exhausted_turn_id: &str, wait: &Value) -> Option<String> {
-    if wait["status"] != "work_available" {
-        return None;
-    }
-    wait["turn"]["turn_id"]
-        .as_str()
-        .map(str::trim)
-        .filter(|turn_id| !turn_id.is_empty() && *turn_id != exhausted_turn_id)
-        .map(str::to_owned)
 }
 
 pub(super) async fn deliver_pending(
@@ -225,10 +200,43 @@ pub(super) async fn deliver_pending(
     actor_id: &str,
 ) -> Result<DeliveryOutcome, ApiError> {
     let session_key = key(group_id, actor_id);
-    let Some(_delivery) = SessionGuard::acquire(&IN_FLIGHT, session_key.clone()) else {
+    let Some(_work) = browser_work(state, group_id, actor_id)? else {
         return Ok(DeliveryOutcome::Idle);
     };
     deliver_once(state, group_id, actor_id, &session_key).await
+}
+
+/// One Actor's browser work, from its claim to its last write. The file lock is
+/// the one a runtime switch takes, so that work falls wholly before or after the
+/// switch; the session guard keeps this process's own tasks apart.
+pub(super) struct BrowserWork {
+    _session: SessionGuard,
+    _lock: std::fs::File,
+}
+
+fn browser_work(
+    state: &AppState,
+    group_id: &str,
+    actor_id: &str,
+) -> Result<Option<BrowserWork>, ApiError> {
+    browser_work_in(&state.home, group_id, actor_id)
+}
+
+fn browser_work_in(
+    home: &cccc_core::HomeLayout,
+    group_id: &str,
+    actor_id: &str,
+) -> Result<Option<BrowserWork>, ApiError> {
+    let Some(session) = SessionGuard::acquire(&IN_FLIGHT, key(group_id, actor_id)) else {
+        return Ok(None);
+    };
+    let path = cccc_core::web_model_connectors::browser_work_lock(home, group_id, actor_id);
+    let lock = cccc_core::fs::try_exclusive_lock(&path)
+        .map_err(super::web_model_connector_store::io_error)?;
+    Ok(lock.map(|lock| BrowserWork {
+        _session: session,
+        _lock: lock,
+    }))
 }
 
 pub(super) struct SessionGuard {
@@ -238,6 +246,17 @@ pub(super) struct SessionGuard {
 
 pub(super) fn control_guard(group: &str, actor: &str) -> Result<SessionGuard, ApiError> {
     SessionGuard::acquire(&IN_FLIGHT, key(group, actor))
+        .ok_or_else(|| ApiError::bad("Actor browser delivery is busy; retry after it completes"))
+}
+
+/// For a control that writes the Actor's target directly. Pairing does not need
+/// this: it writes through the daemon, which refuses it once its route is gone.
+pub(super) fn control_work(
+    state: &AppState,
+    group: &str,
+    actor: &str,
+) -> Result<BrowserWork, ApiError> {
+    browser_work(state, group, actor)?
         .ok_or_else(|| ApiError::bad("Actor browser delivery is busy; retry after it completes"))
 }
 
@@ -448,8 +467,9 @@ async fn deliver_once(
             json!({"last_delivery_status":"resolved","last_error":""}),
         )?;
     }
-    if target["kind"] == "existing_chat" && is_chatgpt_url(target_url) {
-        if let Err(error) = state
+    if target["kind"] == "existing_chat"
+        && is_chatgpt_url(target_url)
+        && let Err(error) = state
             .browser_surfaces
             .align_chatgpt_conversation_target(
                 session_key,
@@ -457,32 +477,63 @@ async fn deliver_once(
                 std::time::Duration::from_secs(5),
             )
             .await
-        {
-            let message = error.to_string();
-            update_target(
-                state,
-                group_id,
-                actor_id,
-                json!({
-                    "last_delivery_status":"failed",
-                    "last_submission_evidence":{
-                        "submitted":false,
-                        "submission_evidence":"bound_conversation_unavailable",
-                        "error":message.as_str()
-                    },
-                    "last_error":message.as_str()
-                }),
-            )?;
-            record_connector(state, group_id, actor_id, "failed", "", &message)?;
-            return Ok(DeliveryOutcome::Stopped);
-        }
+    {
+        let message = error.to_string();
+        update_target(
+            state,
+            group_id,
+            actor_id,
+            json!({
+                "last_delivery_status":"failed",
+                "last_submission_evidence":{
+                    "submitted":false,
+                    "submission_evidence":"bound_conversation_unavailable",
+                    "error":message.as_str()
+                },
+                "last_error":message.as_str()
+            }),
+        )?;
+        record_connector(state, group_id, actor_id, "failed", "", &message)?;
+        return Ok(DeliveryOutcome::Stopped);
     }
-    let wait = daemon_call(
-        state,
-        "runtime_wait_next_turn",
-        browser_wait_args(group_id, actor_id),
-    )
-    .await?;
+    // A stopping Web claims nothing more; what it holds finishes first.
+    if state.browser_surfaces.stopping() {
+        return Ok(DeliveryOutcome::Idle);
+    }
+    let mut wait_args = browser_wait_args(group_id, actor_id);
+    if target["last_delivery_status"] == "deferred" {
+        // The batch is staged in this composer; only the same batch matches it.
+        wait_args.insert(
+            "resume_turn_id".into(),
+            target["last_delivery_turn_id"].clone(),
+        );
+    }
+    let wait = daemon_call(state, "runtime_wait_next_turn", wait_args).await?;
+    if wait["status"] == "turn_in_progress" && wait["browser_recovery_required"] == true {
+        // The daemon settled this browser's old claims after a restart, or
+        // inherited a failed turn from an older version. Keep the same batch
+        // out of the queue and let the user review the conversation.
+        let turn_id = required(&wait, "active_turn_id")?;
+        let event_ids = wait["event_ids"].clone();
+        if event_ids.as_array().is_none_or(Vec::is_empty) {
+            return Err(ApiError::bad("browser recovery is missing event IDs"));
+        }
+        let delivery_id = browser_delivery_id(actor_id, turn_id);
+        let message = "browser delivery was interrupted and could not be confirmed; check the conversation before resuming. This batch will not be redelivered automatically";
+        return complete_ambiguous_attempt(
+            state,
+            group_id,
+            actor_id,
+            DeliveryAttempt {
+                turn_id,
+                event_ids,
+                delivery_id: &delivery_id,
+            },
+            json!({"submitted":false,"submission_evidence":"interrupted_browser_turn","error":message}),
+            message,
+        )
+        .await;
+    }
     if wait["status"] != "work_available" {
         return Ok(DeliveryOutcome::Idle);
     }
@@ -799,6 +850,7 @@ async fn complete_ambiguous_attempt(
         actor_id,
         json!({
             "last_delivery_status":"submission_ambiguous_completion_pending",
+            "last_delivery_id":attempt.delivery_id,
             "last_delivery_turn_id":attempt.turn_id,
             "last_delivery_event_ids":attempt.event_ids.clone(),
             "last_delivery_reconcile_attempts":0,
@@ -878,7 +930,7 @@ pub(super) async fn resume_after_review(
     delivery_id: &str,
 ) -> Result<(), ApiError> {
     let session_key = key(group_id, actor_id);
-    let _guard = SessionGuard::acquire(&IN_FLIGHT, session_key.clone())
+    let _work = browser_work(state, group_id, actor_id)?
         .ok_or_else(|| ApiError::bad("Delivery is busy; try again after it settles."))?;
     let target = load_target(state, group_id, actor_id)?;
     if target["kind"] != "existing_chat" || target["last_delivery_status"] != "submission_ambiguous"
@@ -983,8 +1035,6 @@ async fn recover_verified_ambiguous_submission(
     );
     let recovered = daemon_call(state, "web_model_runtime_recover_turn", recover_args).await?;
     let turn = &recovered["turn"];
-    let observed_url = submission["observed"]["url"].as_str().unwrap_or("");
-    let conversation_url = conversation_url_for_target(target_url, observed_url);
     let (_, bootstrap_seed) = build_browser_prompt(
         turn,
         target,
@@ -1015,13 +1065,8 @@ async fn recover_verified_ambiguous_submission(
     )
     .await?;
     if let Some(seed) = &bootstrap_seed {
-        mark_bootstrap_seed_delivered(
-            state,
-            group_id,
-            actor_id,
-            conversation_url.as_deref().unwrap_or(target_url),
-            seed,
-        )?;
+        // The receipt proved the bound conversation, even when its Project route changed.
+        mark_bootstrap_seed_delivered(state, group_id, actor_id, target_url, seed)?;
     }
     let mut recovered_submission = submission.clone();
     if let Some(object) = recovered_submission.as_object_mut() {
@@ -1046,7 +1091,6 @@ async fn recover_verified_ambiguous_submission(
         actor_id,
         turn_id,
         submission_evidence,
-        conversation_bound = conversation_url.is_some(),
         "Recovered a browser submission from direct delivery evidence"
     );
     Ok(true)
@@ -1515,7 +1559,9 @@ mod login_tests {
         if crate::system_browser_path().is_none() {
             return;
         }
-        let _chrome_guard = crate::browser_surface::chrome_test_guard().await;
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
         let temp = tempfile::tempdir().expect("fixture");
         let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
         let store = GroupStore::new(home.clone()).expect("store");
@@ -1654,7 +1700,9 @@ mod login_tests {
         if crate::system_browser_path().is_none() {
             return;
         }
-        let _chrome_guard = crate::browser_surface::chrome_test_guard().await;
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
         let temp = tempfile::tempdir().expect("tempdir");
         let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
         let store = GroupStore::new(home.clone()).expect("store");

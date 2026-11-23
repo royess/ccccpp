@@ -40,7 +40,7 @@ cd cccc
 ./target/release/cccc --version
 ```
 
-The source package helper requires Rust 1.88+, Node.js 24 with npm, and Python
+The source package helper requires Rust 1.91+, Node.js 24 with npm, and Python
 3.11+ for archive assembly only; the resulting CCCC executable has no Python
 runtime dependency.
 
@@ -95,7 +95,7 @@ upgrading server-side metadata cannot change that already installed code.
 ### Why does `cccc` still start an older installation after an upgrade?
 
 CCCC does not delete commands owned by another Python environment or installer.
-Run `cccc doctor` and inspect the `Installation` section. It shows the current
+Run `cccc doctor --json` and inspect the `installation` section. It shows the current
 launcher, the first command selected by PATH, and every duplicate. The standalone
 installer never infers ownership from version output. Rust self-update identifies
 its exact current executable only when the containing directory has the complete
@@ -202,7 +202,7 @@ fails browser startup when Xvfb is missing instead of silently falling back to t
 
 ### What's the difference between Foreman and Peer?
 
-- **Foreman**: The first enabled actor. Coordinates work, receives system notifications, can manage other actors.
+- **Foreman**: The first enabled agent. Coordinates work, receives system notifications, can manage other agents.
 - **Peer**: Independent expert. Has their own judgment, can only manage themselves.
 
 ### How do I add a custom agent?
@@ -227,6 +227,13 @@ cccc send "Please do X" --to agent-name
 ```
 
 Or in the Web UI, type `@agent-name` in your message.
+
+### A message shows "Delivery failed"?
+
+Open the message's recipients to see why. If the agent would not stay up, CCCC stopped trying
+after a few starts: its terminal tab shows what it printed. After fixing the cause, press
+**Retry** or start the agent, which offers the failed message again. A new message also tries
+again.
 
 ### Agent isn't responding to my messages?
 
@@ -263,7 +270,7 @@ CCCC_WEB_HOST=$(tailscale ip -4) cccc
 
 ### Is it safe to expose the Web UI?
 
-Before exposing the Web UI, create an **Admin Access Token** in **Settings > Web Access** and then sign in with that token.
+Before exposing the Web UI, create an **Admin Access Token** in **Settings > This instance > Web Access** and then sign in with that token.
 
 Use Cloudflare Access or Tailscale for additional security.
 
@@ -287,9 +294,15 @@ CCCC supports snapshot/compaction. Large blobs are stored separately in the `blo
 
 ## Troubleshooting
 
-### Why do git worktrees remain after an Actor stops?
+### What does a daemon restart keep?
 
-CCCC does not manage worktree cleanup. Agents or custom native launch commands can create worktrees, and stopping an Actor does not guarantee the runtime's cleanup flow. See [Git worktrees and long-lived Actors](runtimes.md#git-worktrees-and-long-lived-actors) for ownership and manual cleanup steps.
+Groups, messages and tasks are kept. Agents that CCCC started stop with the daemon, and CCCC tries
+to start a running Group's agents again, but a turn that was running does not continue. Sessions you
+started yourself keep running. See [What a daemon restart keeps](operations.md#what-a-daemon-restart-keeps).
+
+### Why do git worktrees remain after an agent stops? {#why-do-git-worktrees-remain-after-an-actor-stops}
+
+CCCC does not manage worktree cleanup. Agents or custom native launch commands can create worktrees, and stopping an agent does not guarantee the runtime's cleanup flow. See [Git worktrees and long-lived agents](runtimes.md#git-worktrees-and-long-lived-actors) for ownership and manual cleanup steps.
 
 ### Daemon won't start
 
@@ -339,7 +352,7 @@ cccc doctor                  # Check configuration
 
 A working group is like an IM group chat with execution capabilities. It includes:
 - An append-only ledger (message history)
-- One or more actors (agents)
+- One or more agents
 - Optional scopes (project directories)
 
 ### What is the Ledger?

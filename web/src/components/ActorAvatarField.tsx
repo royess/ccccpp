@@ -1,7 +1,22 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ActorAvatar } from "./ActorAvatar";
 import { CameraIcon } from "./Icons";
+
+// The Group blob endpoint serves active formats, including SVG, as binary data
+// rather than same-origin documents. Offer only formats browsers can render.
+const AVATAR_ACCEPT = ".png,.jpg,.jpeg,.gif,.webp,.bmp,.avif,.ico";
+const AVATAR_EXTENSION = /\.(?:png|jpe?g|gif|webp|bmp|avif|ico)$/i;
+const AVATAR_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/bmp",
+  "image/avif",
+  "image/x-icon",
+  "image/vnd.microsoft.icon",
+]);
 
 type ActorAvatarFieldProps = {
   label?: string | null;
@@ -36,6 +51,7 @@ export function ActorAvatarField({
 }: ActorAvatarFieldProps) {
   const { t } = useTranslation("actors");
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const [formatError, setFormatError] = useState(false);
   const effectiveLabel = label === undefined ? t("avatarTitle") : label;
   const showReset = !resetDisabled || resetBusy;
 
@@ -63,8 +79,12 @@ export function ActorAvatarField({
             isDark={isDark}
             sizeClassName={sizeClassName}
             textClassName="text-sm"
+            className="lcd-tile"
           />
-          <span className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-full bg-black/0 text-white opacity-0 transition-all duration-150 group-hover:bg-black/45 group-hover:opacity-100 group-focus-visible:bg-black/45 group-focus-visible:opacity-100">
+          <span
+            className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-full bg-black/0 text-white opacity-0 transition-all duration-150 group-hover:bg-black/45 group-hover:opacity-100 group-focus-visible:bg-black/45 group-focus-visible:opacity-100"
+            data-avatar-scrim
+          >
             <CameraIcon
               aria-hidden="true"
               className="h-5 w-5 drop-shadow-[0_1px_2px_rgba(0,0,0,0.45)]"
@@ -76,10 +96,18 @@ export function ActorAvatarField({
         <input
           ref={inputRef}
           type="file"
-          accept=".svg,.png,.jpg,.jpeg,.webp,.gif,.avif,.ico,image/*"
+          accept={AVATAR_ACCEPT}
           className="hidden"
           onChange={(e) => {
-            onSelectFile(e.target.files?.[0] || null);
+            const file = e.target.files?.[0] || null;
+            const supported =
+              !file ||
+              (!/\.svg$/i.test(file.name) &&
+                file.type.toLowerCase() !== "image/svg+xml" &&
+                (AVATAR_EXTENSION.test(file.name) ||
+                  AVATAR_MIME_TYPES.has(file.type.toLowerCase())));
+            setFormatError(!supported);
+            onSelectFile(supported ? file : null);
             if (inputRef.current) inputRef.current.value = "";
           }}
         />
@@ -105,6 +133,11 @@ export function ActorAvatarField({
           ) : null}
         </div>
       </div>
+      {formatError ? (
+        <p role="alert" className="mt-2 text-xs text-rose-600 dark:text-rose-400">
+          {t("avatarUnsupportedFormat")}
+        </p>
+      ) : null}
     </div>
   );
 }

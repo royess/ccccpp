@@ -7,6 +7,7 @@ import type { CodexVoiceAnalystInfo } from "../../services/api/codexVoice";
 import { CodexVoiceAnalystModal } from "../../components/modals/CodexVoiceAnalystModal";
 vi.mock("./CodexVoiceMessageSources", () => ({ CodexVoiceMessageSources: () => null }));
 import { useCodexVoiceSessionController } from "./useCodexVoiceSessionController";
+import { chetConversationStub } from "../chet/chetTestSupport";
 
 const fixture = vi.hoisted(() => ({
   analyst: null as CodexVoiceAnalystInfo | null,
@@ -16,6 +17,10 @@ const fixture = vi.hoisted(() => ({
   control: vi.fn(),
   capture: vi.fn(async (_device: string) => ({ getTracks: () => [], getAudioTracks: () => [] })),
   t: (key: string) => key,
+}));
+vi.mock("../../services/api/chet", async (original) => ({
+  ...(await original<typeof import("../../services/api/chet")>()),
+  fetchChetUnattended: vi.fn(async () => ({ ok: true, result: { enabled: false, since: null } })),
 }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: fixture.t }) }));
 vi.mock("../../services/api", () => ({
@@ -150,6 +155,7 @@ it("surfaces a new ACP approval while the owned-call Analyst is collapsed", asyn
         <audio ref={controller.audioRef} />
         <button onClick={() => void controller.start()}>start</button>
         <CodexVoiceAnalystModal
+          chet={chetConversationStub()}
           isOpen
           isDark={false}
           isSmallScreen={false}
@@ -198,7 +204,11 @@ it("surfaces a new ACP approval while the owned-call Analyst is collapsed", asyn
       "codexVoiceAnalystNeedsInput",
     );
     expect(
-      host.querySelector("[data-codex-voice-analyst-bar] button")?.getAttribute("aria-expanded"),
+      host
+        .querySelector(
+          '[data-codex-voice-analyst-bar] button[aria-controls="codex-voice-analyst-pane"]',
+        )
+        ?.getAttribute("aria-expanded"),
     ).toBe("false");
     expect(
       current.analyst?.permissions?.length,

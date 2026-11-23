@@ -1,5 +1,4 @@
 use cccc_contracts::{DaemonRequest, GroupState};
-use cccc_core::group::AUTOMATION_TIMING_KEYS;
 use cccc_core::{GroupDoc, GroupStore, HomeLayout, Registry, active, permissions};
 use serde_json::{Map, Value, json};
 
@@ -20,6 +19,12 @@ pub(super) fn reset(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         &string_arg(request, "by").unwrap_or_else(|| "user".into()),
     )
     .map_err(OpError::invalid)?;
+    // An unfinished switch still writes into this Group's ledger, and its
+    // Retry starts the member: it is completed before a reset.
+    for actor in &old.actors {
+        super::actor_switch::refuse_pending(home, &group_id, &actor.id)?;
+    }
+    let browser_work = super::actor_runtime::hold_group_browser_work(home, &old)?;
     let was_active = active::get(home).map_err(OpError::io)?.as_deref() == Some(&group_id);
     let created = store.create(&old.title, &old.topic).map_err(OpError::io)?;
     let replacement = prepare_replacement(&store, &old, &created)
@@ -61,8 +66,12 @@ pub(super) fn reset(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     }
     let old_delete_error = settle_old_delete(&store, &old, store.delete(&old.group_id));
     if old_delete_error.is_none() {
+        super::local_headless::clear_group_confirmation_pauses(&old.group_id)
+            .map_err(OpError::io)?;
         super::actor_secrets::remove_group(home, &old.group_id)?;
         super::voice_secretary::purge_deleted_group(home, &old.group_id).map_err(OpError::io)?;
+        drop(browser_work);
+        cccc_core::web_model_connectors::remove_browser_work_locks(home, &old.group_id);
     }
     object(json!({
         "old_group_id":old.group_id,
@@ -72,7 +81,7 @@ pub(super) fn reset(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         "old_delete_error":old_delete_error,
         "old_reaped_processes":old_reaped_processes,
         "active_group_id":was_active.then_some(&replacement.group_id),
-        "group":super::group_runtime::group(replacement),
+        "group":super::group_runtime::group(home, replacement),
     }))
 }
 
@@ -102,6 +111,31 @@ fn prepare_replacement(
             document.scopes.clone_from(&old.scopes);
             document.actors.clone_from(&old.actors);
             document.automation = reset_automation(old);
+            if let Some(conversation) = old
+                .extra
+                .get("local_session_conversation")
+                .and_then(Value::as_object)
+            {
+                let configuration = ["direct", "source_ids"]
+                    .into_iter()
+                    .filter_map(|key| {
+                        conversation
+                            .get(key)
+                            .map(|value| (key.into(), value.clone()))
+                    })
+                    .collect::<Map<String, Value>>();
+                if !configuration.is_empty() {
+                    document.extra.insert(
+                        "local_session_conversation".into(),
+                        Value::Object(configuration),
+                    );
+                }
+            }
+            // Native sources members left still must not reclaim them.
+            cccc_core::runtime_switches::set_records(
+                document,
+                &cccc_core::runtime_switches::for_copy(old),
+            );
             for actor in &mut document.actors {
                 actor.avatar_asset_path.clear();
             }
@@ -113,10 +147,10 @@ fn prepare_replacement(
             meta.default_scope_key
                 .clone_from(&replacement.active_scope_key);
         }
-        for scope in &replacement.scopes {
-            registry
-                .defaults
-                .insert(scope.scope_key.clone(), new_group_id.clone());
+        for owner in registry.defaults.values_mut() {
+            if owner == &old.group_id {
+                owner.clone_from(&new_group_id);
+            }
         }
         Ok(())
     })
@@ -131,17 +165,6 @@ fn reset_automation(group: &GroupDoc) -> Map<String, Value> {
             automation.insert(key.into(), value.clone());
         }
     }
-    for key in AUTOMATION_TIMING_KEYS {
-        if let Some(value) = group.automation.get(*key).or_else(|| {
-            group
-                .extra
-                .get("settings")
-                .and_then(Value::as_object)
-                .and_then(|settings| settings.get(*key))
-        }) {
-            automation.insert((*key).into(), value.clone());
-        }
-    }
     automation
 }
 
@@ -150,18 +173,20 @@ fn rollback_new(store: &GroupStore, old: &GroupDoc, group_id: &str, original: Op
     if let Err(error) = super::actor_secrets::remove_group(store.home(), group_id) {
         failures.push(format!("private_env: {}", error.message));
     }
-    if let Err(error) = store.delete(group_id) {
-        failures.push(format!("group: {error}"));
-    }
+    // Restore only transferred defaults, before deleting the replacement
+    // unregisters them. Attached scopes may be unowned or owned by other Groups.
     if let Err(error) = Registry::mutate(store.home(), |registry| {
-        for scope in &old.scopes {
-            registry
-                .defaults
-                .insert(scope.scope_key.clone(), old.group_id.clone());
+        for owner in registry.defaults.values_mut() {
+            if owner == group_id {
+                owner.clone_from(&old.group_id);
+            }
         }
         Ok(())
     }) {
         failures.push(format!("scope_registry: {error}"));
+    }
+    if let Err(error) = store.delete(group_id) {
+        failures.push(format!("group: {error}"));
     }
     if failures.is_empty() {
         original
@@ -209,6 +234,14 @@ mod tests {
                         "default_send_to":"broadcast"
                     }),
                 );
+                group.extra.insert(
+                    "local_session_conversation".into(),
+                    json!({
+                        "direct":false,
+                        "source_ids":["claude:fixture"],
+                        "runtime_receiver":{"drop":true}
+                    }),
+                );
                 for key in [
                     "runtime_states",
                     "assistants",
@@ -231,12 +264,19 @@ mod tests {
         assert_eq!(replacement.automation["version"], json!(7));
         assert_eq!(replacement.automation["rules"], json!([{"id":"keep-rule"}]));
         assert!(!replacement.automation.contains_key("nudge_after_seconds"));
-        assert_eq!(
-            replacement.automation["help_nudge_interval_seconds"],
-            json!(777)
+        assert!(
+            !replacement
+                .automation
+                .contains_key("help_nudge_interval_seconds")
         );
         assert!(!replacement.automation.contains_key("runtime_last_tick"));
-        assert!(replacement.extra.is_empty());
+        assert_eq!(
+            Value::Object(replacement.extra),
+            json!({"local_session_conversation":{
+                "direct":false,
+                "source_ids":["claude:fixture"]
+            }})
+        );
     }
 
     #[test]

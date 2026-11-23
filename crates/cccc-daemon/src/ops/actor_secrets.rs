@@ -17,6 +17,7 @@ pub fn keys(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
 
 pub fn update(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let (group_id, actor_id) = public_target(home, request, "update private env")?;
+    super::actor_switch::refuse_pending(home, &group_id, &actor_id)?;
     let clear = request
         .args
         .get("clear")
@@ -109,6 +110,12 @@ fn public_target(
         .iter()
         .find(|actor| actor.id == actor_id)
         .ok_or_else(|| OpError::new("actor_not_found", format!("actor not found: {actor_id}")))?;
+    if !actor.external_session_id.is_empty() {
+        return Err(OpError::new(
+            "external_session_owned",
+            "Configure native session credentials in the original runtime",
+        ));
+    }
     if !actor.profile_id.trim().is_empty() {
         return Err(OpError::new(
             "actor_profile_linked_readonly",
@@ -147,12 +154,33 @@ pub fn effective_values(
     group_id: &str,
     actor: &cccc_contracts::Actor,
 ) -> Result<BTreeMap<String, String>, OpError> {
+    Ok(merge_private_values(
+        actor,
+        private_values(home, group_id, actor)?,
+    ))
+}
+
+pub(super) fn private_values(
+    home: &HomeLayout,
+    group_id: &str,
+    actor: &cccc_contracts::Actor,
+) -> Result<BTreeMap<String, String>, OpError> {
     if !actor.profile_id.is_empty() {
         return super::actor_profile_runtime::profile_secrets(home, actor);
     }
+    values(home, group_id, &actor.id)
+}
+
+pub(super) fn merge_private_values(
+    actor: &cccc_contracts::Actor,
+    private: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if !actor.profile_id.is_empty() {
+        return private;
+    }
     let mut env = actor.env.clone();
-    env.extend(values(home, group_id, &actor.id)?);
-    Ok(env)
+    env.extend(private);
+    env
 }
 
 pub fn replace(
@@ -330,6 +358,45 @@ pub(crate) fn validate_env_key(value: &str) -> Result<(), OpError> {
             format!("invalid env key: {value}"),
         ))
     }
+}
+
+/// Whether an environment or argument name marks its value as a credential,
+/// such as `GH_TOKEN`, `OPENAI_API_KEY` or `--clientSecret`. Camel case is
+/// split, so `authToken` counts while `TOKENIZERS_PARALLELISM` does not.
+pub(crate) fn sensitive_key(key: &str) -> bool {
+    let mut normalized = String::with_capacity(key.len());
+    let mut previous_lower_or_digit = false;
+    for character in key.chars() {
+        if character.is_ascii_uppercase() && previous_lower_or_digit {
+            normalized.push('_');
+        }
+        previous_lower_or_digit = character.is_ascii_lowercase() || character.is_ascii_digit();
+        normalized.push(character.to_ascii_lowercase());
+    }
+    let key = normalized;
+    key.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| {
+            matches!(
+                part,
+                "token"
+                    | "tokens"
+                    | "secret"
+                    | "secrets"
+                    | "password"
+                    | "passwords"
+                    | "passwd"
+                    | "apikey"
+                    | "credential"
+                    | "credentials"
+                    | "authorization"
+                    | "bearer"
+                    | "pat"
+            )
+        })
+        || key
+            .rsplit(|character: char| !character.is_ascii_alphanumeric())
+            .next()
+            == Some("key")
 }
 
 pub(crate) fn python_string(value: &Value) -> Result<String, OpError> {

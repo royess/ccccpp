@@ -1,11 +1,208 @@
 //! Payload-free ordered notice facts, separate from the fixed inbox page.
-//! Historical Mail/reply/read/delivery/claim relations are not yet pruned:
-//! this metadata grows with history, even though no Event payload is retained.
-//! Capping arbitrary old claim references would change the notice protocol.
+//! Opt-in repeats prune expired handed-off claims and withdrawn notices.
+//! Pending handoffs retain their original delivery ownership.
+//! Other historical relations still grow with history; no payload is retained.
 use super::*;
 use std::collections::HashSet;
 
-type MailClaims = HashMap<(String, String), Vec<(String, Vec<String>)>>;
+type MailClaims = HashMap<(String, String), Vec<MailClaim>>;
+
+struct MailClaim {
+    id: String,
+    ts: String,
+    sources: Vec<String>,
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use cccc_contracts::Actor;
+
+    #[test]
+    fn unresolved_cache_follows_recipient_generation_and_delivery_facts() {
+        // Reducer unit controls: these in-memory facts are synthetic, unlike
+        // the IPC integration tests' daemon-produced events.
+        let temp = tempfile::tempdir().expect("create temporary test directory");
+        let home = HomeLayout::from_path(temp.path().join("home")).expect("create test home");
+        let store = GroupStore::new(home).expect("open test group store");
+        let mut group = store.create("Mail reducer", "").expect("create test group");
+        group.actors.push(Actor::new("reader"));
+        group.actors.push(Actor::new("other"));
+        let mut state = NoticeState::default();
+        let mut mail = Event::new("chat.message", &group.group_id);
+        mail.by = "user".into();
+        mail.data = json!({"to":["reader"],"message_mode":"mail"})
+            .as_object()
+            .expect("Mail fixture is an object")
+            .clone();
+        state.note(&group, &mail);
+        let cutoff = Utc::now();
+        let summarize = |state: &mut NoticeState| {
+            state.overdue_summary(&group, &BTreeMap::new(), cutoff, cutoff)
+        };
+        assert_eq!(summarize(&mut state)[0].awaiting_count, 1);
+        assert_eq!(summarize(&mut state)[1].awaiting_count, 0);
+
+        let mut delivery = Event::new("runtime.delivery", &group.group_id);
+        delivery.data =
+            json!({"actor_id":"reader","source_event_id":"notice-id","state":"accepted"})
+                .as_object()
+                .expect("delivery fixture is an object")
+                .clone();
+        state.note(&group, &delivery);
+        assert_eq!(summarize(&mut state)[0].awaiting_count, 1);
+        delivery
+            .data
+            .insert("source_event_id".into(), json!(mail.id));
+        for status in ["accepted", "ambiguous"] {
+            delivery.data.insert("state".into(), json!(status));
+            state.note(&group, &delivery);
+            assert_eq!(summarize(&mut state)[0].awaiting_count, 0);
+            delivery.data.insert("state".into(), json!("failed"));
+            state.note(&group, &delivery);
+            assert_eq!(summarize(&mut state)[0].awaiting_count, 1);
+        }
+        let mut reply = Event::new("chat.message", &group.group_id);
+        reply.by = "reader".into();
+        reply.data.insert("reply_to".into(), json!(mail.id));
+        state.note(&group, &reply);
+        assert_eq!(summarize(&mut state)[0].awaiting_count, 0);
+
+        mail.id = "second-mail".into();
+        state.note(&group, &mail);
+        assert_eq!(summarize(&mut state)[0].awaiting_count, 1);
+        let cursor = BTreeMap::from([("reader".into(), mail.id.clone())]);
+        assert_eq!(
+            state.overdue_summary(&group, &cursor, cutoff, cutoff)[0].awaiting_count,
+            0
+        );
+        mail.id = "third-mail".into();
+        state.note(&group, &mail);
+        assert_eq!(summarize(&mut state)[0].awaiting_count, 1);
+        let mut added = Event::new("actor.add", &group.group_id);
+        added.data.insert("actor".into(), json!({"id":"reader"}));
+        state.note(&group, &added);
+        assert_eq!(summarize(&mut state)[0].awaiting_count, 0);
+        mail.id = "current-generation".into();
+        state.note(&group, &mail);
+        assert_eq!(summarize(&mut state)[0].awaiting_count, 1);
+    }
+
+    #[test]
+    fn mail_read_boundaries_remain_per_actor_and_do_not_move_backwards() {
+        let temp = tempfile::tempdir().expect("temporary test directory");
+        let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+        let store = GroupStore::new(home).expect("store");
+        let mut group = store.create("read boundary", "").expect("group");
+        group.actors.push(Actor::new("reader"));
+        group.actors.push(Actor::new("other"));
+        let mut state = NoticeState::default();
+        let mail = |id: &str| {
+            let mut event = Event::new("chat.message", &group.group_id);
+            event.id = id.to_owned();
+            event.by = "user".into();
+            event.data = json!({"to":["reader","other"],"message_mode":"mail"})
+                .as_object()
+                .expect("fixture data is an object")
+                .clone();
+            event
+        };
+        let first = mail("first-mail");
+        let second = mail("second-mail");
+        state.note(&group, &first);
+        state.note(&group, &second);
+        let read = |actor: &str, boundary: &str| {
+            let mut event = Event::new("mail.read", &group.group_id);
+            event.by = actor.to_owned();
+            event.data = json!({"actor_id":actor,"event_id":boundary})
+                .as_object()
+                .expect("fixture data is an object")
+                .clone();
+            event
+        };
+        // A duplicate/older fact must not move the read boundary backwards.
+        state.note(&group, &read("reader", "second-mail"));
+        state.note(&group, &read("reader", "first-mail"));
+        let mut delivery = Event::new("runtime.delivery", &group.group_id);
+        delivery.data =
+            json!({"actor_id":"reader","source_event_id":"second-mail","state":"failed"})
+                .as_object()
+                .expect("fixture data is an object")
+                .clone();
+        state.note(&group, &delivery);
+        let now = Utc::now();
+        let rows = state.overdue_summary(&group, &BTreeMap::new(), now, now);
+        assert_eq!(
+            rows[0].awaiting_count, 0,
+            "an old read fact must not reopen read mail"
+        );
+        assert_eq!(
+            rows[1].awaiting_count, 2,
+            "another Actor has an independent read boundary"
+        );
+        let mut added = Event::new("actor.add", &group.group_id);
+        added.data.insert("actor".into(), json!({"id":"reader"}));
+        state.note(&group, &added);
+        state.note(&group, &mail("new-generation"));
+        let rows = state.overdue_summary(&group, &BTreeMap::new(), now, Utc::now());
+        assert_eq!(
+            rows[0].awaiting_count, 1,
+            "old reads cannot cover newly created mail"
+        );
+        assert_eq!(rows[1].awaiting_count, 3);
+    }
+
+    #[test]
+    fn read_reference_seen_before_its_source_is_resolved_on_replay() {
+        let temp = tempfile::tempdir().expect("temporary test directory");
+        let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+        let store = GroupStore::new(home).expect("store");
+        let mut group = store.create("delayed reference", "").expect("group");
+        group.actors.push(Actor::new("reader"));
+        group.actors.push(Actor::new("other"));
+        let mut state = NoticeState::default();
+        let mut read = Event::new("mail.read", &group.group_id);
+        read.by = "reader".into();
+        read.data = json!({"actor_id":"reader","event_id":"late-source"})
+            .as_object()
+            .expect("fixture data is an object")
+            .clone();
+        state.remember_references(&read);
+        state.note(&group, &read);
+        let mut mail = Event::new("chat.message", &group.group_id);
+        mail.id = "late-source".into();
+        mail.by = "user".into();
+        mail.data = json!({"to":["reader","other"],"message_mode":"mail"})
+            .as_object()
+            .expect("fixture data is an object")
+            .clone();
+        state.note(&group, &mail);
+        let now = Utc::now();
+        let rows = state.overdue_summary(&group, &BTreeMap::new(), now, now);
+        assert_eq!(
+            rows[0].awaiting_count, 0,
+            "late reference must still resolve for reader"
+        );
+        assert_eq!(
+            rows[1].awaiting_count, 1,
+            "other Actor has not read the mail"
+        );
+    }
+    #[test]
+    fn discard_pending_through_includes_boundary_and_handles_maximum() {
+        let mut pending = BTreeMap::from([(0usize, 10usize), (1, 11), (2, 12), (usize::MAX, 13)]);
+        NoticeState::discard_pending_through(&mut pending, 1);
+        assert_eq!(pending, BTreeMap::from([(2, 12), (usize::MAX, 13)]));
+        NoticeState::discard_pending_through(&mut pending, 1);
+        assert_eq!(pending, BTreeMap::from([(2, 12), (usize::MAX, 13)]));
+        NoticeState::discard_pending_through(&mut pending, 2);
+        assert_eq!(pending, BTreeMap::from([(usize::MAX, 13)]));
+        NoticeState::discard_pending_through(&mut pending, usize::MAX);
+        assert!(pending.is_empty());
+        NoticeState::discard_pending_through(&mut pending, usize::MAX);
+        assert!(pending.is_empty());
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct NoticeState {
@@ -14,8 +211,19 @@ pub(crate) struct NoticeState {
     mail_ids: HashSet<String>,
     pub next_position: usize,
     sources: Vec<Source>,
+    mail_sources: HashMap<String, usize>,
+    // Payload-free references to unresolved Mail only. Resolved history is
+    // removed on each fact, so a summary poll never walks historical sources.
+    awaiting_mail: BTreeMap<String, BTreeMap<usize, usize>>,
     generations: HashMap<String, usize>,
     mail_reads: HashMap<String, Vec<(usize, String)>>,
+    // The latest resolved Mail read boundary by Actor. Keep the original read
+    // facts above for notice resolution, which needs their individual times.
+    read_boundary_max: HashMap<String, usize>,
+    // A referenced boundary can be encountered later in a historical replay.
+    // Resolve it when its source event appears instead of scanning all reads
+    // for every subsequent Mail or delivery fact.
+    unresolved_read_boundaries: HashMap<String, Vec<String>>,
     replies: HashMap<(String, String), usize>,
     cancelled: HashSet<String>,
     deliveries: HashMap<(String, String), (String, String, usize)>,
@@ -29,6 +237,7 @@ struct Source {
     ts: String,
     position: usize,
     mail: bool,
+    notice: bool,
     recipients: Vec<String>,
 }
 
@@ -81,9 +290,15 @@ impl NoticeState {
         }
         if source || self.references.contains(&event.id) {
             self.positions.insert(event.id.clone(), position);
+            if let Some(actors) = self.unresolved_read_boundaries.remove(&event.id) {
+                for actor in actors {
+                    self.note_read_boundary(&actor, position);
+                }
+            }
         }
         if let Some(actor) = actor_add_id(event) {
             self.generations.insert(actor.to_owned(), position);
+            self.awaiting_mail.remove(actor);
         }
         if event.kind == "group.start"
             || (event.kind == "group.set_state"
@@ -109,6 +324,17 @@ impl NoticeState {
                         .entry(actor.to_owned())
                         .or_default()
                         .push((position, boundary.to_owned()));
+                    if let Some(boundary_position) = self.positions.get(boundary).copied() {
+                        self.note_read_boundary(actor, boundary_position);
+                        if let Some(pending) = self.awaiting_mail.get_mut(actor) {
+                            Self::discard_pending_through(pending, boundary_position);
+                        }
+                    } else {
+                        self.unresolved_read_boundaries
+                            .entry(boundary.to_owned())
+                            .or_default()
+                            .push(actor.to_owned());
+                    }
                 }
             }
             "chat.message" => {
@@ -116,6 +342,7 @@ impl NoticeState {
                     self.replies
                         .entry((id.to_owned(), event.by.clone()))
                         .or_insert(position);
+                    self.refresh_mail(id, &event.by);
                 }
                 let broadcast = event
                     .data
@@ -128,7 +355,7 @@ impl NoticeState {
                                 .filter_map(Value::as_str)
                                 .any(|id| matches!(id, "@all" | "@peers" | "@foreman"))
                     });
-                if source && (mode != "mail" || !broadcast) {
+                if source {
                     let recipients = group
                         .actors
                         .iter()
@@ -136,13 +363,21 @@ impl NoticeState {
                         .map(|actor| actor.id.clone())
                         .collect::<Vec<_>>();
                     if !recipients.is_empty() {
+                        let index = self.sources.len();
                         self.sources.push(Source {
                             id: event.id.clone(),
                             ts: event.ts.clone(),
                             position,
                             mail: mode == "mail",
+                            notice: mode != "mail" || !broadcast,
                             recipients,
                         });
+                        if mode == "mail" {
+                            self.mail_sources.insert(event.id.clone(), index);
+                            for actor in self.sources[index].recipients.clone() {
+                                self.refresh_mail(&event.id, &actor);
+                            }
+                        }
                     }
                 }
             }
@@ -161,6 +396,7 @@ impl NoticeState {
                         (id.to_owned(), actor.to_owned()),
                         (state.to_owned(), event.ts.clone(), position),
                     );
+                    self.refresh_mail(id, actor);
                 }
             }
             "system.notify" => {
@@ -187,7 +423,11 @@ impl NoticeState {
                     self.mail_claims
                         .entry((actor.to_owned(), created.to_owned()))
                         .or_default()
-                        .push((event.id.clone(), ids));
+                        .push(MailClaim {
+                            id: event.id.clone(),
+                            ts: event.ts.clone(),
+                            sources: ids,
+                        });
                 } else {
                     self.reply_claims.extend(
                         ids.into_iter()
@@ -197,6 +437,117 @@ impl NoticeState {
             }
             _ => {}
         }
+        // Only notice/delivery facts need append-time pruning. Expiry is also
+        // reconciled in due(), without rescanning claims for every unrelated
+        // event in a cold history replay.
+        if matches!(event.kind.as_str(), "system.notify" | "runtime.delivery") {
+            self.prune_mail_claims(group);
+        }
+    }
+
+    // The pending keys are ordered positions; discard only the prefix. Avoid
+    // incrementing the boundary, which can overflow for the maximum key.
+    fn discard_pending_through(pending: &mut BTreeMap<usize, usize>, boundary: usize) {
+        let mut remaining = pending.split_off(&boundary);
+        remaining.remove(&boundary);
+        *pending = remaining;
+    }
+
+    fn note_read_boundary(&mut self, actor: &str, position: usize) {
+        let maximum = self
+            .read_boundary_max
+            .entry(actor.to_owned())
+            .or_insert(position);
+        *maximum = (*maximum).max(position);
+    }
+
+    fn refresh_mail(&mut self, id: &str, actor: &str) {
+        let Some(&index) = self.mail_sources.get(id) else {
+            return;
+        };
+        let source = &self.sources[index];
+        let generation = self.generations.get(actor).copied().unwrap_or(0);
+        let read = self
+            .read_boundary_max
+            .get(actor)
+            .is_some_and(|position| *position >= source.position);
+        let key = (id.to_owned(), actor.to_owned());
+        let awaiting = source.position >= generation
+            && source.recipients.iter().any(|recipient| recipient == actor)
+            && crate::mail_pending::awaiting(
+                read,
+                self.replies.contains_key(&key),
+                self.deliveries.get(&key).map(|value| value.0.as_str()),
+            );
+        let pending = self.awaiting_mail.entry(actor.to_owned()).or_default();
+        if awaiting {
+            pending.insert(source.position, index);
+        } else {
+            pending.remove(&source.position);
+        }
+    }
+
+    pub fn overdue_summary(
+        &mut self,
+        group: &GroupDoc,
+        cursors: &BTreeMap<String, String>,
+        cutoff: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+    ) -> Vec<OverdueMailSummary> {
+        group
+            .actors
+            .iter()
+            .map(|actor| {
+                let cursor = cursors.get(&actor.id).and_then(|id| self.positions.get(id));
+                let pending = self.awaiting_mail.entry(actor.id.clone()).or_default();
+                if let Some(cursor) = cursor {
+                    Self::discard_pending_through(pending, *cursor);
+                }
+                OverdueMailSummary::from_timestamps(
+                    &actor.id,
+                    pending
+                        .values()
+                        .map(|index| self.sources[*index].ts.as_str()),
+                    cutoff,
+                    observed_at,
+                )
+            })
+            .collect()
+    }
+
+    fn prune_mail_claims(&mut self, group: &GroupDoc) {
+        let repeat =
+            crate::automation::delivery_timing_value(group, "mail_notice_repeat_seconds", 0);
+        if repeat <= 0 {
+            return;
+        }
+        let now = Utc::now().timestamp();
+        self.mail_claims.retain(|(actor, created), claims| {
+            let current = group
+                .actors
+                .iter()
+                .any(|a| a.id == *actor && a.created_at == *created);
+            claims.retain(|claim| {
+                current
+                    && match self
+                        .deliveries
+                        .get(&(claim.id.clone(), actor.clone()))
+                        .map(|value| value.0.as_str())
+                    {
+                        Some("withdrawn") => false,
+                        Some("accepted" | "ambiguous") => {
+                            now - crate::automation::timestamp(&claim.ts, now) < repeat
+                        }
+                        _ => true,
+                    }
+            });
+            !claims.is_empty()
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_mail_claims(&self) -> usize {
+        self.mail_claims.values().map(Vec::len).sum()
     }
 
     pub fn still_awaited(
@@ -230,7 +581,7 @@ impl NoticeState {
     }
 
     pub fn due(
-        &self,
+        &mut self,
         group: &GroupDoc,
         eligible: &[&cccc_contracts::Actor],
         cursors: &BTreeMap<String, String>,
@@ -238,6 +589,7 @@ impl NoticeState {
         reply_after: i64,
     ) -> Vec<Event> {
         use crate::automation::{notice_event, timestamp};
+        self.prune_mail_claims(group);
         let now = Utc::now().timestamp();
         let resume_at = self.resume_at.as_deref().map(|ts| timestamp(ts, now));
         let mut notices = Vec::new();
@@ -273,7 +625,9 @@ impl NoticeState {
             let mut mail = Vec::new();
             let mut replies = Vec::new();
             for source in self.sources.iter().filter(|source| {
-                source.position >= generation && source.recipients.contains(&actor.id)
+                source.notice
+                    && source.position >= generation
+                    && source.recipients.contains(&actor.id)
             }) {
                 let key = (source.id.clone(), actor.id.clone());
                 let replied = self.replies.contains_key(&key);
@@ -309,13 +663,16 @@ impl NoticeState {
                     .into_iter()
                     .flatten()
                     .rev()
-                    .filter(|(id, _)| {
+                    .filter(|claim| {
+                        // Expiry is handled by pruning, which keeps pending handoffs.
+                        // Zero/default retains historical single-notice claims.
                         self.deliveries
-                            .get(&(id.clone(), actor.id.clone()))
+                            .get(&(claim.id.clone(), actor.id.clone()))
                             .is_none_or(|v| v.0 != "withdrawn")
                     })
-                    .any(|(_, claimed)| {
-                        let claimed = claimed
+                    .any(|claim| {
+                        let claimed = claim
+                            .sources
                             .iter()
                             .filter(|id| self.positions.contains_key(*id))
                             .collect::<Vec<_>>();

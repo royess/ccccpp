@@ -1,3 +1,4 @@
+use cccc_contracts::event::DeliveryEvidence;
 use cccc_contracts::{Actor, Event};
 use cccc_core::fs::with_exclusive_lock;
 use cccc_core::{GroupDoc, GroupStore, HomeLayout, inbox, ledger};
@@ -12,9 +13,16 @@ use crate::dispatch::OpError;
 
 #[cfg(test)]
 mod legacy_read_watermark;
+mod stranded_claims;
 
 #[cfg(test)]
 use legacy_read_watermark::LegacyReadWatermark;
+use stranded_claims::read_stranded_claims;
+
+#[cfg(test)]
+pub(super) fn reduced_stranded_claim_events() -> usize {
+    stranded_claims::reduced_events()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimResult {
@@ -25,19 +33,35 @@ pub enum ClaimResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryOutcome<'a> {
     Claimed,
-    Accepted,
+    Accepted(Option<DeliveryEvidence>),
     Failed(&'a str),
+    /// This attempt stopped before any native transport submission.
+    Unsubmitted(&'a str),
+    /// The runtime ran this delivery and it failed again after the delivery
+    /// worker's bounded retries: it stays failed, and automatic delivery does not
+    /// start it again. An explicit delivery request still may.
+    RetriesExhausted(&'a str),
     Ambiguous(&'a str),
     /// Never sent and not to be retried: a newer event supersedes it.
     Withdrawn(&'a str),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum OwnerAcknowledgement {
+    Retained,
+    KnownAttempt,
+    AfterWritePermit { known_only: bool },
+    NotOffered,
 }
 
 impl<'a> DeliveryOutcome<'a> {
     fn parts(self) -> (&'static str, &'a str) {
         match self {
             Self::Claimed => ("claimed", ""),
-            Self::Accepted => ("accepted", ""),
-            Self::Failed(reason) => ("failed", reason),
+            Self::Accepted(_) => ("accepted", ""),
+            Self::Failed(reason) | Self::Unsubmitted(reason) | Self::RetriesExhausted(reason) => {
+                ("failed", reason)
+            }
             Self::Ambiguous(reason) => ("ambiguous", reason),
             Self::Withdrawn(reason) => ("withdrawn", reason),
         }
@@ -64,6 +88,29 @@ pub fn append_state(
     transport: &str,
     outcome: DeliveryOutcome<'_>,
 ) -> Result<Event, OpError> {
+    append_state_with_owner(
+        home,
+        group_id,
+        actor_id,
+        actor_created_at,
+        source_event_id,
+        transport,
+        outcome,
+        OwnerAcknowledgement::Retained,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_state_with_owner(
+    home: &HomeLayout,
+    group_id: &str,
+    actor_id: &str,
+    actor_created_at: &str,
+    source_event_id: &str,
+    transport: &str,
+    outcome: DeliveryOutcome<'_>,
+    owner: OwnerAcknowledgement,
+) -> Result<Event, OpError> {
     let store = GroupStore::new(home.clone()).map_err(OpError::io)?;
     let (state, reason) = outcome.parts();
     let mut event = Event::new("runtime.delivery", group_id);
@@ -79,9 +126,111 @@ pub fn append_state(
     .as_object()
     .cloned()
     .expect("runtime delivery data");
+    match outcome {
+        DeliveryOutcome::Accepted(Some(evidence)) => {
+            event
+                .data
+                .insert("delivery_evidence".into(), json!(evidence));
+        }
+        DeliveryOutcome::Unsubmitted(_) => {
+            event.data.insert("retryable".into(), json!(true));
+        }
+        DeliveryOutcome::RetriesExhausted(_) => {
+            event.data.insert("retryable".into(), json!(false));
+        }
+        _ => {}
+    }
     ledger::append(&store.ledger_path(group_id).map_err(OpError::io)?, &event)
         .map_err(OpError::io)?;
+    if !matches!(outcome, DeliveryOutcome::Claimed) {
+        use crate::session_owner::{
+            acknowledge_event, acknowledge_known_event, track_acknowledgement,
+        };
+        let acknowledged = match owner {
+            OwnerAcknowledgement::Retained => {
+                acknowledge_event(home, group_id, actor_id, actor_created_at, source_event_id)
+            }
+            OwnerAcknowledgement::KnownAttempt => {
+                acknowledge_known_event(home, group_id, actor_id, actor_created_at, source_event_id)
+            }
+            OwnerAcknowledgement::AfterWritePermit { known_only } => track_acknowledgement(
+                home,
+                group_id,
+                actor_id,
+                actor_created_at,
+                source_event_id,
+                transport,
+                known_only,
+            ),
+            OwnerAcknowledgement::NotOffered => Ok(()),
+        };
+        if let Err(error) = acknowledged {
+            // The ledger is committed. An unavailable owner receipt must not
+            // invalidate it or invite another native submission.
+            tracing::debug!(kind = ?error.kind(), "session owner result acknowledgement is pending");
+            if matches!(owner, OwnerAcknowledgement::KnownAttempt) {
+                let _ = track_acknowledgement(
+                    home,
+                    group_id,
+                    actor_id,
+                    actor_created_at,
+                    source_event_id,
+                    transport,
+                    true,
+                );
+            }
+        }
+    }
     Ok(event)
+}
+
+/// Records that the host never handed a source to a service principal. There
+/// was no external I/O to claim, so this one `failed` fact is the whole
+/// delivery. A fact already recorded for this source is kept. Returns the
+/// delivery ID and whether this call appended it.
+pub(super) fn record_unsent_service_delivery(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    principal: &str,
+    principal_generation: &str,
+    source_event_id: &str,
+    transport: &str,
+    reason: &str,
+) -> Result<(String, bool), OpError> {
+    let store = GroupStore::new(home.clone()).map_err(OpError::io)?;
+    let ledger_path = store.ledger_path(&group.group_id).map_err(OpError::io)?;
+    let delivery_id = delivery_id(
+        &group.group_id,
+        principal,
+        principal_generation,
+        source_event_id,
+    );
+    let appended = with_exclusive_lock(&delivery_lock_path(&ledger_path), || {
+        let principals = [principal.to_owned()];
+        if inbox::delivery_states(home, group, &principals, source_event_id)?
+            .contains_key(principal)
+        {
+            return Ok(false);
+        }
+        let mut event = Event::new("runtime.delivery", &group.group_id);
+        event.by = "system".into();
+        event.data = json!({
+            "actor_id":principal,
+            "source_event_id":source_event_id,
+            "delivery_id":delivery_id,
+            "state":"failed",
+            "transport":transport,
+            "reason":reason,
+            "retryable":false,
+        })
+        .as_object()
+        .cloned()
+        .expect("runtime delivery data");
+        ledger::append(&ledger_path, &event)?;
+        Ok(true)
+    })
+    .map_err(OpError::io)?;
+    Ok((delivery_id, appended))
 }
 
 pub fn latest_state(
@@ -99,6 +248,83 @@ pub fn latest_state(
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimPolicy<'a> {
+    Automatic,
+    CurrentAttempt,
+    Explicit,
+    GapCatchup(Option<&'a str>),
+}
+
+pub(super) struct PreparedGapClaim(Option<String>);
+
+pub(super) fn prepare_gap_claim(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+    source_event_id: &str,
+) -> Result<Option<PreparedGapClaim>, OpError> {
+    let Some(receipt) = inbox::latest_delivery_receipt(home, group, &actor.id, source_event_id)
+        .map_err(OpError::io)?
+    else {
+        return Ok(Some(PreparedGapClaim(None)));
+    };
+    if receipt.data.get("state").and_then(Value::as_str) != Some("failed")
+        || !inbox::delivery_is_unsubmitted(home, group, &actor.id, source_event_id)
+            .map_err(OpError::io)?
+    {
+        return Ok(None);
+    }
+    crate::session_owner::acknowledge_retryable_event(
+        home,
+        &group.group_id,
+        &actor.id,
+        &actor.created_at,
+        source_event_id,
+    )
+    .map_err(OpError::io)?;
+    Ok(Some(PreparedGapClaim(Some(receipt.id))))
+}
+
+/// Used by gap catch-up to claim a source that either has no delivery record
+/// yet or ended with a confirmed pre-submission failure (`failed`, `retryable: true`).
+/// Accepted, claimed, ambiguous, withdrawn, retry-exhausted, and legacy unflagged
+/// failed records are never claimed here.
+pub(super) fn apply_gap_claim(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+    source_event_id: &str,
+    transport: &str,
+    prepared: PreparedGapClaim,
+) -> Result<bool, OpError> {
+    claim_with(
+        home,
+        group,
+        &[(actor, transport)],
+        source_event_id,
+        false,
+        ClaimPolicy::GapCatchup(prepared.0.as_deref()),
+    )
+    .map(|(claimed, _)| claimed)
+}
+
+#[cfg(test)]
+pub(super) fn claim_unclaimed_or_unsubmitted(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+    source_event_id: &str,
+    transport: &str,
+) -> Result<bool, OpError> {
+    let Some(prepared) = prepare_gap_claim(home, group, actor, source_event_id)? else {
+        return Ok(false);
+    };
+    apply_gap_claim(home, group, actor, source_event_id, transport, prepared)
+}
+
+/// Claims a delivery for automatic dispatch, which never restarts one whose
+/// automatic retries are used up.
 pub fn claim(
     home: &HomeLayout,
     group: &GroupDoc,
@@ -107,9 +333,71 @@ pub fn claim(
     transport: &str,
     force_ambiguous: bool,
 ) -> Result<ClaimResult, OpError> {
+    claim_one(
+        home,
+        group,
+        actor,
+        source_event_id,
+        transport,
+        force_ambiguous,
+        ClaimPolicy::Automatic,
+    )
+}
+
+pub(super) fn claim_current_attempt(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+    source_event_id: &str,
+    transport: &str,
+) -> Result<ClaimResult, OpError> {
+    claim_one(
+        home,
+        group,
+        actor,
+        source_event_id,
+        transport,
+        false,
+        ClaimPolicy::CurrentAttempt,
+    )
+}
+
+pub(super) fn claim_new_source(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+    source_event_id: &str,
+    transport: &str,
+) -> Result<ClaimResult, OpError> {
+    claim_one(
+        home,
+        group,
+        actor,
+        source_event_id,
+        transport,
+        false,
+        ClaimPolicy::GapCatchup(None),
+    )
+}
+
+fn claim_one(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+    source_event_id: &str,
+    transport: &str,
+    force_ambiguous: bool,
+    policy: ClaimPolicy<'_>,
+) -> Result<ClaimResult, OpError> {
     let deliveries = [(actor, transport)];
-    let (claimed, states) =
-        claim_deliveries(home, group, &deliveries, source_event_id, force_ambiguous)?;
+    let (claimed, states) = claim_with(
+        home,
+        group,
+        &deliveries,
+        source_event_id,
+        force_ambiguous,
+        policy,
+    )?;
     if claimed {
         Ok(ClaimResult::Claimed)
     } else {
@@ -119,6 +407,8 @@ pub fn claim(
     }
 }
 
+/// Claims deliveries for an explicit delivery request, which may also retry a
+/// delivery whose automatic retries are used up.
 pub fn claim_deliveries(
     home: &HomeLayout,
     group: &GroupDoc,
@@ -126,11 +416,29 @@ pub fn claim_deliveries(
     source_event_id: &str,
     force_ambiguous: bool,
 ) -> Result<(bool, HashMap<String, String>), OpError> {
+    claim_with(
+        home,
+        group,
+        deliveries,
+        source_event_id,
+        force_ambiguous,
+        ClaimPolicy::Explicit,
+    )
+}
+
+fn claim_with(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    deliveries: &[(&Actor, &str)],
+    source_event_id: &str,
+    force_ambiguous: bool,
+    policy: ClaimPolicy<'_>,
+) -> Result<(bool, HashMap<String, String>), OpError> {
     if std::env::var_os("CCCC_DELIVERY_QUERY_PROBE").is_some_and(|value| value == "1") {
-        eprintln!(
+        cccc_runtime::diagnostic(format_args!(
             "CCCC_DELIVERY_STATE_QUERY {}",
             json!({"group_id":group.group_id,"actors":deliveries.len()})
-        );
+        ));
     }
     let store = GroupStore::new(home.clone()).map_err(OpError::io)?;
     let ledger_path = store.ledger_path(&group.group_id).map_err(OpError::io)?;
@@ -150,8 +458,23 @@ pub fn claim_deliveries(
                     .map(|state| state.0.clone())
                     .unwrap_or_default();
                 states.insert(actor.id.clone(), state.clone());
-                if matches!(state.as_str(), "claimed" | "accepted" | "withdrawn")
+                // Checked under the claim lock: a worker may have used up the
+                // retries or finalized the source after the caller read its snapshot.
+                let gap_blocked = matches!(policy, ClaimPolicy::GapCatchup(_))
+                    && latest.contains_key(&actor.id)
+                    && !(state == "failed"
+                        && inbox::delivery_is_unsubmitted(
+                            home,
+                            group,
+                            &actor.id,
+                            source_event_id,
+                        )?);
+                if gap_blocked
+                    || matches!(state.as_str(), "claimed" | "accepted" | "withdrawn")
                     || (state == "ambiguous" && !force_ambiguous)
+                    || (matches!(policy, ClaimPolicy::Automatic | ClaimPolicy::CurrentAttempt)
+                        && state == "failed"
+                        && inbox::delivery_retry_closed(home, group, &actor.id, source_event_id)?)
                 {
                     claimable = false;
                     break;
@@ -161,6 +484,43 @@ pub fn claim_deliveries(
         };
         if !claimable {
             return Ok((false, states));
+        }
+        if let ClaimPolicy::GapCatchup(expected) = policy {
+            let actual =
+                inbox::latest_delivery_receipt(home, group, &deliveries[0].0.id, source_event_id)?;
+            if actual.as_ref().map(|receipt| receipt.id.as_str()) != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "delivery receipt changed during catch-up preparation",
+                ));
+            }
+        }
+        // A terminal append may have succeeded while its owner's Ack exchange
+        // failed. Finish that reclamation under the claim lock, before this
+        // claim hides the terminal proof. This also fences explicit retries
+        // racing the worker's bounded retry backoff.
+        for (actor, _) in deliveries {
+            if matches!(policy, ClaimPolicy::GapCatchup(_))
+                || !actor.external_session_id.is_empty()
+                || !states
+                    .get(&actor.id)
+                    .is_some_and(|state| matches!(state.as_str(), "failed" | "ambiguous"))
+            {
+                continue;
+            }
+            let acknowledge = if policy == ClaimPolicy::CurrentAttempt {
+                crate::session_owner::acknowledge_known_event
+            } else {
+                crate::session_owner::acknowledge_event
+            };
+            acknowledge(
+                home,
+                &group.group_id,
+                &actor.id,
+                &actor.created_at,
+                source_event_id,
+            )
+            .map_err(std::io::Error::other)?;
         }
         for (actor, transport) in deliveries {
             append_state(
@@ -180,55 +540,6 @@ pub fn claim_deliveries(
     .map_err(OpError::io)
 }
 
-fn read_stranded_claims(path: &Path) -> std::io::Result<HashMap<(String, String), String>> {
-    // Startup recovery needs only unresolved claims. Building the generic
-    // Event index here would retain history before IPC even becomes ready.
-    let mut pending = HashMap::<(String, String), String>::new();
-    ledger::visit_snapshot_oldest_first(path, |event| {
-        if event.kind == "actor.add" {
-            let actor = event
-                .data
-                .get("actor")
-                .and_then(Value::as_object)
-                .and_then(|actor| actor.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !actor.is_empty() {
-                pending.retain(|(id, _), _| id != actor);
-            }
-        } else if event.kind == "runtime.delivery" {
-            let actor = event
-                .data
-                .get("actor_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let source = event
-                .data
-                .get("source_event_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !actor.is_empty() && !source.is_empty() {
-                let key = (actor.to_owned(), source.to_owned());
-                if event.data.get("state").and_then(Value::as_str) == Some("claimed") {
-                    pending.insert(
-                        key,
-                        event
-                            .data
-                            .get("transport")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    );
-                } else {
-                    pending.remove(&key);
-                }
-            }
-        }
-        std::ops::ControlFlow::Continue(())
-    })?;
-    Ok(pending)
-}
-
 pub fn settle_stranded_claims(home: &HomeLayout, group: &GroupDoc) -> Result<usize, OpError> {
     let store = GroupStore::new(home.clone()).map_err(OpError::io)?;
     let ledger_path = store.ledger_path(&group.group_id).map_err(OpError::io)?;
@@ -240,6 +551,17 @@ pub fn settle_stranded_claims(home: &HomeLayout, group: &GroupDoc) -> Result<usi
             let Some(actor) = group.actors.iter().find(|actor| actor.id == actor_id) else {
                 continue;
             };
+            let retained = crate::session_owner::delivery_fact(
+                home,
+                &group.group_id,
+                &actor.id,
+                &actor.created_at,
+                &source_event_id,
+                &transport,
+            )?;
+            if matches!(retained, crate::session_owner::RetainedDelivery::Pending) {
+                continue;
+            }
             append_state(
                 home,
                 &group.group_id,
@@ -247,14 +569,164 @@ pub fn settle_stranded_claims(home: &HomeLayout, group: &GroupDoc) -> Result<usi
                 &actor.created_at,
                 &source_event_id,
                 &transport,
-                DeliveryOutcome::Ambiguous(
-                    "daemon restarted before the claimed handoff recorded an outcome",
-                ),
+                retained_outcome(&retained),
             )
             .map_err(|error| std::io::Error::other(error.message))?;
             settled += 1;
         }
         Ok(settled)
+    })
+    .map_err(OpError::io)
+}
+
+fn retained_outcome(fact: &crate::session_owner::RetainedDelivery) -> DeliveryOutcome<'_> {
+    use crate::session_owner::RetainedDelivery;
+    match fact {
+        RetainedDelivery::Accepted(evidence) => DeliveryOutcome::Accepted(*evidence),
+        RetainedDelivery::Unsubmitted => {
+            DeliveryOutcome::Unsubmitted("retained operation ended before native input")
+        }
+        RetainedDelivery::Failed(reason) => DeliveryOutcome::Failed(reason),
+        RetainedDelivery::Withdrawn => {
+            DeliveryOutcome::Withdrawn("retained early Mail notice was withheld")
+        }
+        RetainedDelivery::Pending | RetainedDelivery::Unknown => DeliveryOutcome::Ambiguous(
+            "daemon restarted before the claimed handoff recorded a verifiable outcome",
+        ),
+    }
+}
+
+struct RetainedClaim {
+    actor_id: String,
+    created: String,
+    event_id: String,
+    transport: String,
+    receipt: Option<String>,
+    fact: Option<crate::session_owner::RetainedDelivery>,
+    known_only: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedRetainedClaims(Vec<RetainedClaim>);
+
+/// Read the original executions without a Group write permit. A failed
+/// observation leaves this claim for the next pass and preserves other facts.
+pub(crate) fn prepare_retained_claims(
+    home: &HomeLayout,
+    group_id: &str,
+) -> Result<PreparedRetainedClaims, OpError> {
+    use crate::session_owner::{
+        RetainedDelivery, acknowledge_event, acknowledge_known_event, observe_attempt,
+    };
+    let store = GroupStore::new(home.clone()).map_err(OpError::io)?;
+    let group = store.load(group_id).map_err(OpError::io)?;
+    let mut prepared = Vec::new();
+    for (actor_id, created, event_id, transport, known_only) in
+        crate::session_owner::recoveries(home, group_id).map_err(OpError::io)?
+    {
+        let present = group
+            .actors
+            .iter()
+            .any(|actor| actor.id == actor_id && actor.created_at == created);
+        let receipt = inbox::latest_delivery_receipt(home, &group, &actor_id, &event_id)
+            .map_err(OpError::io)?;
+        let observation = if !present {
+            Ok(None)
+        } else if receipt.as_ref().is_some_and(|receipt| {
+            receipt.data.get("state").and_then(Value::as_str) == Some("claimed")
+        }) {
+            observe_attempt(home, group_id, &actor_id, &created, &event_id, !known_only).map(Some)
+        } else {
+            let acknowledge = if known_only {
+                acknowledge_known_event
+            } else {
+                acknowledge_event
+            };
+            acknowledge(home, group_id, &actor_id, &created, &event_id).map(|()| None)
+        };
+        match observation {
+            Ok(Some(RetainedDelivery::Pending)) => {}
+            Ok(fact) => prepared.push(RetainedClaim {
+                actor_id,
+                created,
+                event_id,
+                transport,
+                receipt: receipt.map(|receipt| receipt.id),
+                fact,
+                known_only,
+            }),
+            Err(error) => {
+                tracing::debug!(kind = ?error.kind(), %actor_id, "retained delivery is still unconfirmed")
+            }
+        }
+    }
+    Ok(PreparedRetainedClaims(prepared))
+}
+
+pub(crate) fn apply_retained_claims(
+    home: &HomeLayout,
+    group_id: &str,
+    prepared: PreparedRetainedClaims,
+) -> Result<(), OpError> {
+    if prepared.0.is_empty() {
+        return Ok(());
+    }
+    let store = GroupStore::new(home.clone()).map_err(OpError::io)?;
+    let group = store.load(group_id).map_err(OpError::io)?;
+    let path = store.ledger_path(group_id).map_err(OpError::io)?;
+    with_exclusive_lock(&delivery_lock_path(&path), || {
+        for claim in prepared.0 {
+            let actor = group
+                .actors
+                .iter()
+                .find(|actor| actor.id == claim.actor_id && actor.created_at == claim.created);
+            let Some(actor) = actor else {
+                crate::session_owner::forget_recovery(
+                    home,
+                    group_id,
+                    &claim.actor_id,
+                    &claim.created,
+                    &claim.event_id,
+                )?;
+                continue;
+            };
+            let receipt =
+                inbox::latest_delivery_receipt(home, &group, &claim.actor_id, &claim.event_id)?;
+            if receipt.as_ref().map(|receipt| receipt.id.as_str()) != claim.receipt.as_deref() {
+                continue;
+            }
+            if let Some(fact) = claim.fact {
+                if receipt.is_some_and(|receipt| {
+                    receipt.data.get("state").and_then(Value::as_str) == Some("claimed")
+                        && receipt.data.get("transport").and_then(Value::as_str)
+                            == Some(claim.transport.as_str())
+                }) {
+                    append_state_with_owner(
+                        home,
+                        group_id,
+                        &claim.actor_id,
+                        &claim.created,
+                        &claim.event_id,
+                        &claim.transport,
+                        retained_outcome(&fact),
+                        OwnerAcknowledgement::AfterWritePermit {
+                            known_only: claim.known_only,
+                        },
+                    )
+                    .map_err(|error| std::io::Error::other(error.message))?;
+                    super::actor_delivery::record_member_catchup(&group, actor);
+                }
+            } else {
+                crate::session_owner::forget_recovery(
+                    home,
+                    group_id,
+                    &claim.actor_id,
+                    &claim.created,
+                    &claim.event_id,
+                )?;
+            }
+        }
+        Ok(())
     })
     .map_err(OpError::io)
 }
@@ -273,6 +745,95 @@ pub(super) fn settle_replaced_transport_claims(
         Some((actor_id, transport)),
         "delivery mode changed before the claimed handoff recorded an outcome",
     )
+}
+
+/// After an Actor's runtime owner was stopped and its delivery worker joined:
+/// record every handoff still claimed, through any transport, as ambiguous, and
+/// return all of the Actor's unconfirmed handoffs, oldest first.
+///
+/// The caller must keep new delivery away from the Actor. A worker can itself
+/// record an ambiguous result while it is being stopped, so returning only the
+/// claims settled here would omit work the new owner needs to review. Earlier
+/// ambiguous handoffs of this member generation are returned as well, and a
+/// repeated call appends nothing.
+pub(super) fn settle_replaced_owner_claims(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor_id: &str,
+) -> Result<Vec<String>, OpError> {
+    let actor = group
+        .actors
+        .iter()
+        .find(|actor| actor.id == actor_id)
+        .ok_or_else(|| OpError::new("actor_not_found", "actor not found"))?;
+    let store = GroupStore::new(home.clone()).map_err(OpError::io)?;
+    let ledger_path = store.ledger_path(&group.group_id).map_err(OpError::io)?;
+    with_exclusive_lock(&delivery_lock_path(&ledger_path), || {
+        // The last receipt wins, including a receipt from a different
+        // transport. Keep its position so the handoffs stay in ledger order.
+        let mut unresolved = HashMap::<String, (Option<String>, usize)>::new();
+        let mut position = 0_usize;
+        ledger::visit_snapshot_oldest_first(&ledger_path, |event| {
+            position += 1;
+            if event.kind == "actor.add" {
+                let added = event
+                    .data
+                    .get("actor")
+                    .and_then(Value::as_object)
+                    .and_then(|actor| actor.get("id"))
+                    .and_then(Value::as_str);
+                if added == Some(actor_id) {
+                    unresolved.clear();
+                }
+            } else if event.kind == "runtime.delivery"
+                && event.data.get("actor_id").and_then(Value::as_str) == Some(actor_id)
+                && let Some(source) = event
+                    .data
+                    .get("source_event_id")
+                    .and_then(Value::as_str)
+                    .filter(|source| !source.is_empty())
+            {
+                let transport = event
+                    .data
+                    .get("transport")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match event.data.get("state").and_then(Value::as_str) {
+                    Some("claimed") => {
+                        unresolved
+                            .insert(source.to_owned(), (Some(transport.to_owned()), position));
+                    }
+                    Some("ambiguous") => {
+                        unresolved.insert(source.to_owned(), (None, position));
+                    }
+                    _ => {
+                        unresolved.remove(source);
+                    }
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        })?;
+        let mut unresolved = unresolved.into_iter().collect::<Vec<_>>();
+        unresolved.sort_by_key(|(_, (_, position))| *position);
+        for (source, (claimed_transport, _)) in &unresolved {
+            if let Some(transport) = claimed_transport {
+                append_state(
+                    home,
+                    &group.group_id,
+                    actor_id,
+                    &actor.created_at,
+                    source,
+                    transport,
+                    DeliveryOutcome::Ambiguous(
+                        "runtime replaced before the claimed handoff recorded an outcome",
+                    ),
+                )
+                .map_err(|error| std::io::Error::other(error.message))?;
+            }
+        }
+        Ok(unresolved.into_iter().map(|(source, _)| source).collect())
+    })
+    .map_err(OpError::io)
 }
 
 fn settle_claims(
@@ -395,7 +956,10 @@ fn legacy_pending_sources(
                 event.data.get("source_event_id").and_then(Value::as_str),
                 event.data.get("state").and_then(Value::as_str),
             ) {
-                latest.insert(source.to_owned(), Value::String(state.to_owned()));
+                latest.insert(
+                    source.to_owned(),
+                    json!({"state":state,"retryable":event.data.get("retryable")}),
+                );
             }
         }
         let mut pending = Vec::new();
@@ -405,15 +969,20 @@ fn legacy_pending_sources(
             }
             let state = latest
                 .get(&event.id)
-                .and_then(Value::as_str)
+                .and_then(|value| value["state"].as_str())
                 .unwrap_or_default();
+            let retryable = state == "failed"
+                && latest
+                    .get(&event.id)
+                    .is_some_and(|value| value["retryable"] == true);
             let addressed = if event.kind == "chat.message" {
                 let mode = event
                     .data
                     .get("message_mode")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                (matches!(mode, "send" | "request_reply") || (mode == "mail" && state == "claimed"))
+                (matches!(mode, "send" | "request_reply")
+                    || (mode == "mail" && (state == "claimed" || retryable)))
                     && inbox::is_for_actor(group, event, &actor.id)
             } else if event.kind == "system.notify" {
                 if legacy_read_watermark.covers_notification(event) {
@@ -436,7 +1005,18 @@ fn legacy_pending_sources(
             if !addressed {
                 continue;
             }
-            if !matches!(state, "accepted" | "ambiguous" | "withdrawn") {
+            let exhausted = state == "failed"
+                && latest
+                    .get(&event.id)
+                    .is_some_and(|value| value["retryable"] == false);
+            // Native transport rejections are explicit failures, not an
+            // automatic retry loop that can starve subsequent messages; nor is a
+            // delivery whose automatic retries are used up.
+            // message_deliver still allows an operator to retry them.
+            if !matches!(state, "accepted" | "ambiguous" | "withdrawn")
+                && !exhausted
+                && (state != "failed" || actor.external_session_id.is_empty() || retryable)
+            {
                 pending.push(event.clone());
                 if pending.len() >= limit.max(1) {
                     break;
@@ -452,6 +1032,225 @@ fn legacy_pending_sources(
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn prepared_gap_claim_cannot_hide_a_later_receipt_with_the_same_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+        let store = GroupStore::new(home.clone()).expect("store");
+        let mut group = store.create("gap claim proof", "").expect("group");
+        let actor = Actor::new("peer");
+        group.actors.push(actor.clone());
+        store.save(&group).expect("save");
+        let append = |outcome| {
+            append_state(
+                &home,
+                &group.group_id,
+                &actor.id,
+                &actor.created_at,
+                "source",
+                "pty",
+                outcome,
+            )
+            .expect("receipt")
+        };
+        append(DeliveryOutcome::Unsubmitted("first refusal"));
+        let prepared = prepare_gap_claim(&home, &group, &actor, "source")
+            .expect("prepare")
+            .expect("eligible");
+        append(DeliveryOutcome::Claimed);
+        let latest = append(DeliveryOutcome::Unsubmitted("second refusal"));
+        assert!(apply_gap_claim(&home, &group, &actor, "source", "pty", prepared).is_err());
+        let observed = inbox::latest_delivery_receipt(&home, &group, &actor.id, "source")
+            .expect("observe")
+            .expect("receipt");
+        assert_eq!(observed.id, latest.id);
+        let current = prepare_gap_claim(&home, &group, &actor, "source")
+            .expect("prepare current")
+            .expect("eligible");
+        assert!(apply_gap_claim(&home, &group, &actor, "source", "pty", current).expect("claim"));
+    }
+
+    #[test]
+    fn replaced_owner_keeps_all_unconfirmed_handoffs_without_replaying_them() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+        let store = GroupStore::new(home.clone()).expect("store");
+        let mut group = store.create("native replacement", "").expect("group");
+        let actor = Actor::new("old");
+        let other = Actor::new("other");
+        group.actors.extend([actor.clone(), other.clone()]);
+        store.save(&group).expect("save group");
+
+        let receipt = |who: &Actor, source: &str, transport: &str, outcome: DeliveryOutcome<'_>| {
+            append_state(
+                &home,
+                &group.group_id,
+                &who.id,
+                &who.created_at,
+                source,
+                transport,
+                outcome,
+            )
+            .expect("delivery receipt");
+        };
+        receipt(
+            &actor,
+            "older-ambiguous",
+            "local_session",
+            DeliveryOutcome::Ambiguous("unknown"),
+        );
+        receipt(
+            &actor,
+            "claimed-z",
+            "local_session",
+            DeliveryOutcome::Claimed,
+        );
+        receipt(
+            &actor,
+            "claimed-a",
+            "local_session",
+            DeliveryOutcome::Claimed,
+        );
+        receipt(
+            &actor,
+            "accepted",
+            "local_session",
+            DeliveryOutcome::Claimed,
+        );
+        receipt(
+            &actor,
+            "accepted",
+            "local_session",
+            DeliveryOutcome::Accepted(None),
+        );
+        receipt(
+            &actor,
+            "unsubmitted",
+            "local_session",
+            DeliveryOutcome::Claimed,
+        );
+        receipt(
+            &actor,
+            "unsubmitted",
+            "local_session",
+            DeliveryOutcome::Unsubmitted("receiver unavailable"),
+        );
+        receipt(&actor, "pty-claim", "pty", DeliveryOutcome::Claimed);
+        receipt(
+            &other,
+            "other-claim",
+            "local_session",
+            DeliveryOutcome::Claimed,
+        );
+        receipt(
+            &actor,
+            "changed-transport",
+            "local_session",
+            DeliveryOutcome::Ambiguous("old"),
+        );
+        receipt(
+            &actor,
+            "changed-transport",
+            "pty",
+            DeliveryOutcome::Accepted(None),
+        );
+
+        // Every transport's open claim may have reached the replaced owner.
+        let expected = vec!["older-ambiguous", "claimed-z", "claimed-a", "pty-claim"];
+        assert_eq!(
+            settle_replaced_owner_claims(&home, &group, &actor.id).expect("settle"),
+            expected
+        );
+        assert_eq!(
+            settle_replaced_owner_claims(&home, &group, &actor.id).expect("settle again"),
+            expected
+        );
+        for source in ["older-ambiguous", "claimed-z", "claimed-a"] {
+            assert_eq!(
+                claim(&home, &group, &actor, source, "local_session", false).expect("retry"),
+                ClaimResult::Terminal("ambiguous".into())
+            );
+        }
+        assert_eq!(
+            claim(&home, &group, &actor, "pty-claim", "pty", false).expect("retry"),
+            ClaimResult::Terminal("ambiguous".into())
+        );
+        assert_eq!(
+            latest_state(&home, &group.group_id, &actor.id, "accepted").expect("accepted"),
+            Some(("accepted".into(), "local_session".into()))
+        );
+        assert_eq!(
+            latest_state(&home, &group.group_id, &actor.id, "unsubmitted").expect("unsubmitted"),
+            Some(("failed".into(), "local_session".into()))
+        );
+        assert_eq!(
+            latest_state(&home, &group.group_id, &actor.id, "pty-claim").expect("pty"),
+            Some(("ambiguous".into(), "pty".into()))
+        );
+        assert_eq!(
+            latest_state(&home, &group.group_id, &other.id, "other-claim").expect("other"),
+            Some(("claimed".into(), "local_session".into()))
+        );
+        let events =
+            ledger::read_all(&store.ledger_path(&group.group_id).expect("ledger")).expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "runtime.delivery"
+                        && event.data["actor_id"] == actor.id
+                        && event.data["source_event_id"] == "claimed-z"
+                        && event.data["state"] == "ambiguous"
+                })
+                .count(),
+            1,
+            "repeating the operation must not append another uncertainty receipt"
+        );
+    }
+
+    #[test]
+    fn native_replacement_ignores_claims_from_an_earlier_actor_registration() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+        let store = GroupStore::new(home.clone()).expect("store");
+        let mut group = store.create("actor generation", "").expect("group");
+        let actor = Actor::new("peer");
+        group.actors.push(actor.clone());
+        store.save(&group).expect("group");
+        let path = store.ledger_path(&group.group_id).expect("ledger");
+        append_state(
+            &home,
+            &group.group_id,
+            &actor.id,
+            &actor.created_at,
+            "earlier",
+            "local_session",
+            DeliveryOutcome::Claimed,
+        )
+        .expect("previous claim");
+        let mut added = Event::new("actor.add", &group.group_id);
+        added.data = json!({"actor":{"id":actor.id}})
+            .as_object()
+            .expect("actor data")
+            .clone();
+        ledger::append(&path, &added).expect("new actor registration");
+        append_state(
+            &home,
+            &group.group_id,
+            &actor.id,
+            &actor.created_at,
+            "current",
+            "local_session",
+            DeliveryOutcome::Claimed,
+        )
+        .expect("current claim");
+
+        assert_eq!(
+            settle_replaced_owner_claims(&home, &group, &actor.id).expect("settle"),
+            ["current"]
+        );
+    }
 
     #[test]
     #[ignore = "operator-supplied copied real groups only"]
@@ -854,5 +1653,89 @@ mod tests {
             latest_state(&home, &group.group_id, "peer1", "source-1").expect("first state"),
             None
         );
+    }
+
+    #[test]
+    fn a_delivery_that_used_up_its_retries_leaves_automatic_delivery_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+        let store = GroupStore::new(home.clone()).expect("store");
+        let mut group = store.create("used-up retries", "").expect("group");
+        let actor = Actor::new("peer1");
+        group.actors.push(actor.clone());
+        store.save(&group).expect("save actor");
+        let ledger_path = store.ledger_path(&group.group_id).expect("ledger");
+        let mut sources = Vec::new();
+        for text in ["used up", "plain failure"] {
+            let mut source = Event::new("chat.message", &group.group_id);
+            source.by = "user".into();
+            source.data = json!({"to":["peer1"],"text":text,"message_mode":"send"})
+                .as_object()
+                .cloned()
+                .expect("source data");
+            ledger::append(&ledger_path, &source).expect("source");
+            assert_eq!(
+                claim(&home, &group, &actor, &source.id, "deepseek", false).expect("claim"),
+                ClaimResult::Claimed
+            );
+            sources.push(source);
+        }
+        let (used_up, plain) = (&sources[0], &sources[1]);
+        let record = append_state(
+            &home,
+            &group.group_id,
+            &actor.id,
+            &actor.created_at,
+            &used_up.id,
+            "deepseek",
+            DeliveryOutcome::RetriesExhausted("turn failed: upstream stream ended"),
+        )
+        .expect("used-up failure");
+        assert_eq!(record.data.get("state"), Some(&json!("failed")));
+        assert_eq!(record.data.get("retryable"), Some(&json!(false)));
+        append_state(
+            &home,
+            &group.group_id,
+            &actor.id,
+            &actor.created_at,
+            &plain.id,
+            "deepseek",
+            DeliveryOutcome::Failed("delivery worker stopped before runtime acceptance"),
+        )
+        .expect("plain failure");
+
+        // A plain managed failure keeps its automatic recovery; a used-up one
+        // does not, in the projection and in the legacy replay alike.
+        let pending = pending_sources(&home, &group, &actor, 10).expect("pending sources");
+        assert_eq!(
+            pending
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            [plain.id.as_str()]
+        );
+        let legacy = legacy_pending_sources(&home, &group, &actor, 10).expect("legacy pending");
+        assert_eq!(
+            legacy
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            [plain.id.as_str()]
+        );
+        assert_eq!(
+            claim(&home, &group, &actor, &used_up.id, "deepseek", false).expect("automatic claim"),
+            ClaimResult::Terminal("failed".into())
+        );
+        assert_eq!(
+            latest_state(&home, &group.group_id, &actor.id, &used_up.id)
+                .expect("state")
+                .map(|state| state.0),
+            Some("failed".into())
+        );
+        // An explicit delivery request may still retry it.
+        let (claimed, _) =
+            claim_deliveries(&home, &group, &[(&actor, "deepseek")], &used_up.id, false)
+                .expect("explicit claim");
+        assert!(claimed);
     }
 }

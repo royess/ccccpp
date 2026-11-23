@@ -3,6 +3,35 @@ use serde_json::json;
 use std::time::Duration;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The whole cancel, from asking the loop to seeing the turn end. Hermes
+/// ended a cancelled turn in about 0.3 s in real runs.
+const HERMES_STOP_SETTLE: Duration = Duration::from_secs(2);
+
+/// What stopping did to a prompt this client had written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopInterrupt {
+    /// No prompt of this client needed interrupting before it closed.
+    None,
+    /// The cancelled prompt answered with an explicit stopReason.
+    Settled,
+    /// The cancel was written, but no stopReason arrived before close: the
+    /// prompt was still open or ended by an error, so its outcome is unknown.
+    Requested,
+    /// The cancel could not be confirmed written; what the turn does after
+    /// the client closed is unknown.
+    Unconfirmed,
+}
+
+impl StopInterrupt {
+    pub(crate) fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Settled => Some("settled"),
+            Self::Requested => Some("interrupt_requested"),
+            Self::Unconfirmed => Some("unconfirmed"),
+        }
+    }
+}
 
 impl AnalystSession {
     pub(crate) async fn cancel_pending_input(
@@ -127,10 +156,39 @@ impl AnalystSession {
                 io::ErrorKind::Unsupported,
                 "this managed Runtime does not support safe in-turn steering",
             )),
-            ManagedProtocol::Claude(_) | ManagedProtocol::Pi(_) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "this managed Runtime does not support safe in-turn steering",
-            )),
+            ManagedProtocol::Claude(_) | ManagedProtocol::Pi(_) | ManagedProtocol::OpenCode(_) => {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "this managed Runtime does not support safe in-turn steering",
+                ))
+            }
+        }
+    }
+
+    /// Cancels the ACP prompt this session wrote even before the provider
+    /// reports it started; answers whether there was one. Other protocols
+    /// only cancel a started turn (`interrupt`).
+    pub(crate) async fn cancel_written_prompt(
+        &self,
+        expected_generation: &str,
+    ) -> io::Result<bool> {
+        self.require_generation(expected_generation)?;
+        match self.written_prompt_canceller() {
+            Some(protocol) => protocol.cancel_current(&self.thread_id).await,
+            None => Ok(false),
+        }
+    }
+
+    /// Whether `cancel_written_prompt` had a prompt to cancel when read.
+    pub(crate) fn has_cancellable_prompt(&self) -> bool {
+        self.written_prompt_canceller()
+            .is_some_and(|protocol| protocol.has_open_prompt())
+    }
+
+    fn written_prompt_canceller(&self) -> Option<&AcpClient> {
+        match &self.protocol {
+            ManagedProtocol::Acp(protocol) if self.structured_only() => Some(protocol),
+            _ => None,
         }
     }
 
@@ -151,6 +209,7 @@ impl AnalystSession {
                 .await
                 .map(|_| ()),
             ManagedProtocol::Acp(protocol) => protocol.cancel(&self.thread_id).await,
+            ManagedProtocol::OpenCode(protocol) => protocol.cancel(turn_id).await,
             ManagedProtocol::Claude(protocol) => protocol.cancel(turn_id).await,
             ManagedProtocol::Pi(protocol) => protocol.cancel(&self.thread_id, turn_id).await,
         }
@@ -196,9 +255,94 @@ impl AnalystSession {
     }
 
     pub(crate) async fn stop(&self, expected_generation: &str) -> io::Result<()> {
+        self.stop_and_report(expected_generation).await.map(|_| ())
+    }
+
+    /// Stop, and report what stopping did to a turn this session started.
+    pub(crate) async fn stop_and_report(
+        &self,
+        expected_generation: &str,
+    ) -> io::Result<StopInterrupt> {
+        let interrupt = self.close_for_stop(expected_generation).await?;
+        lifecycle_timing::run_sync("runtime.process_cleanup", || self.cleanup_owned_resources())?;
+        Ok(interrupt)
+    }
+
+    /// Voice cleanup may wait on OS processes. Keep it off the Web runtime's
+    /// worker threads so a stalled child cannot prevent the deadline firing.
+    pub(crate) async fn stop_for_voice(
+        self: &Arc<Self>,
+        expected_generation: &str,
+    ) -> io::Result<()> {
+        self.close_for_stop(expected_generation).await?;
+        let session = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            lifecycle_timing::run_sync("runtime.process_cleanup", || {
+                session.cleanup_owned_resources()
+            })
+        })
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("Voice process cleanup worker failed: {error}"))
+        })?
+    }
+
+    async fn close_for_stop(&self, expected_generation: &str) -> io::Result<StopInterrupt> {
         self.require_generation(expected_generation)?;
+        let interrupt = self.interrupt_gateway_turn().await;
         lifecycle_timing::run("runtime.protocol_close", self.protocol.close()).await?;
-        lifecycle_timing::run_sync("runtime.process_cleanup", || self.cleanup_owned_resources())
+        Ok(interrupt)
+    }
+
+    /// Hermes runs each turn in its shared gateway, which finishes a turn
+    /// after its last client closes, tools included. Cancel the prompt this
+    /// client wrote and wait briefly for Hermes to end it; stop continues
+    /// either way. Other providers end the turn with their own process.
+    async fn interrupt_gateway_turn(&self) -> StopInterrupt {
+        let ManagedProtocol::Acp(protocol) = &self.protocol else {
+            return StopInterrupt::None;
+        };
+        if self.runtime != ActorRuntime::Hermes {
+            return StopInterrupt::None;
+        }
+        match protocol
+            .cancel_and_settle(&self.thread_id, HERMES_STOP_SETTLE)
+            .await
+        {
+            acp::CancelOutcome::NoTurn => StopInterrupt::None,
+            acp::CancelOutcome::Settled => StopInterrupt::Settled,
+            acp::CancelOutcome::Requested => {
+                tracing::warn!(
+                    "Hermes did not confirm the cancelled turn ended before stop closed its client"
+                );
+                StopInterrupt::Requested
+            }
+            acp::CancelOutcome::Unconfirmed => {
+                tracing::warn!(
+                    "Hermes could not be confirmed to receive the cancel before stop closed its client"
+                );
+                StopInterrupt::Unconfirmed
+            }
+        }
+    }
+
+    /// Signal only processes this session owns. Remote jobs have no such local
+    /// handle and still require their own confirmed protocol shutdown.
+    pub(crate) fn terminate_local_processes(&self) -> io::Result<bool> {
+        let mut attempted = false;
+        let mut first_error = None;
+        for process in self.process.iter().chain(self.auxiliary_processes.iter()) {
+            attempted = true;
+            if let Err(error) = process.terminate_now()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(attempted),
+        }
     }
 
     fn cleanup_owned_resources(&self) -> io::Result<()> {

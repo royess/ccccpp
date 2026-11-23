@@ -1,69 +1,48 @@
-import { getGroupPresenceDotClass } from "./statusIndicators";
 import type { GroupDoc, GroupMeta, GroupRuntimeStatus } from "../types";
 
-export type GroupStatusKey = "run" | "paused" | "idle" | "stop";
+export type GroupStatusKey = "run" | "paused" | "idle" | "offline" | "stop" | "unknown";
 
-export const GROUP_STATUS_DOT_BASE_CLASS = "size-[8px] shrink-0 rounded-full";
-
-export type GroupStatus = {
-  key: GroupStatusKey;
-  label: string;
-  pillClass: string;
-  dotClass: string;
+/** Layout-namespace label of each status, shared by every surface that names it. */
+export const GROUP_STATUS_LABEL_KEYS: Record<GroupStatusKey, string> = {
+  run: "statusRunning",
+  paused: "statusPaused",
+  idle: "statusIdle",
+  offline: "statusOffline",
+  stop: "statusStopped",
+  unknown: "statusUnknown",
 };
+
+export type GroupStatus = { key: GroupStatusKey };
 
 type GroupStatusSource =
   | Pick<GroupMeta, "running" | "state" | "runtime_status">
   | Pick<GroupDoc, "running" | "state" | "runtime_status">;
 
-function buildStatus(key: GroupStatusKey, label: string, dotClass: string): GroupStatus {
-  return { key, label, pillClass: `glass-status-pill glass-status-pill-${key}`, dotClass };
-}
-
+/**
+ * The terminal interface uses the same words. Paused and Stopped name the
+ * recorded lifecycle whether or not processes are alive, so the controls take
+ * the matching resume or launch path. A Group that was not stopped but has no
+ * running Actor is Offline, which keeps a deliberate stop distinguishable from
+ * a Group whose Actors have not started or have exited.
+ */
 export function getGroupStatus(running: boolean, state?: string): GroupStatus {
-  if (state === "paused") {
-    return buildStatus("paused", "PAUSED", getGroupPresenceDotClass("paused"));
-  }
-  if (!running) {
-    return buildStatus("stop", "STOP", getGroupPresenceDotClass("stop"));
-  }
-  if (state === "idle") {
-    return buildStatus("idle", "IDLE", getGroupPresenceDotClass("idle"));
-  }
-  return buildStatus("run", "RUN", getGroupPresenceDotClass("run"));
+  if (state === "paused") return { key: "paused" };
+  if (state === "stopped") return { key: "stop" };
+  if (!running) return { key: "offline" };
+  if (state === "idle") return { key: "idle" };
+  return { key: "run" };
 }
 
-export function getGroupStatusLight(running: boolean, state?: string): GroupStatus {
-  if (state === "paused") {
-    return buildStatus("paused", "PAUSED", getGroupPresenceDotClass("paused"));
-  }
-  if (!running) {
-    return buildStatus("stop", "STOP", getGroupPresenceDotClass("stop"));
-  }
-  if (state === "idle") {
-    return buildStatus("idle", "IDLE", getGroupPresenceDotClass("idle"));
-  }
-  return buildStatus("run", "RUN", getGroupPresenceDotClass("run"));
-}
-
-/** Unified group status using dark: prefix - no isDark dependency needed */
-export function getGroupStatusUnified(running: boolean, state?: string): GroupStatus {
-  // Paused is a lifecycle state independent of whether processes are alive.
-  // Show it truthfully so the launch button takes the correct resume path.
-  if (state === "paused") {
-    return buildStatus("paused", "PAUSED", getGroupPresenceDotClass("paused"));
-  }
-  if (!running) {
-    return buildStatus("stop", "STOP", getGroupPresenceDotClass("stop"));
-  }
-  if (state === "idle") {
-    return buildStatus("idle", "IDLE", getGroupPresenceDotClass("idle"));
-  }
-  return buildStatus("run", "RUN", getGroupPresenceDotClass("run"));
+/** The runtime of a Group the daemon could not fully observe: its recorded lifecycle only. */
+export function unobservableGroupRuntime(lifecycleState?: string | null): GroupRuntimeStatus {
+  return { lifecycle_state: String(lifecycleState || "active"), available: false };
 }
 
 export function getGroupRuntimeStatus(source?: GroupStatusSource | null): GroupRuntimeStatus {
   const runtime = source?.runtime_status;
+  if (runtime?.available === false) {
+    return unobservableGroupRuntime(runtime.lifecycle_state || source?.state);
+  }
   return {
     lifecycle_state: String(runtime?.lifecycle_state || source?.state || "active"),
     runtime_running: Boolean(runtime?.runtime_running ?? source?.running ?? false),
@@ -76,5 +55,10 @@ export function getGroupRuntimeStatus(source?: GroupStatusSource | null): GroupR
 
 export function getGroupStatusFromSource(source?: GroupStatusSource | null): GroupStatus {
   const runtime = getGroupRuntimeStatus(source);
-  return getGroupStatusUnified(runtime.runtime_running, runtime.lifecycle_state);
+  if (runtime.available === false) {
+    // A recorded pause or stop stays what it is; otherwise whether anything runs is unknown.
+    const recorded = getGroupStatus(false, runtime.lifecycle_state);
+    return recorded.key === "paused" || recorded.key === "stop" ? recorded : { key: "unknown" };
+  }
+  return getGroupStatus(Boolean(runtime.runtime_running), runtime.lifecycle_state);
 }

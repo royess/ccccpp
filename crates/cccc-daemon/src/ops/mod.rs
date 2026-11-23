@@ -1,8 +1,8 @@
 pub(crate) mod actor_activity;
 pub(crate) mod actor_delivery;
-mod actor_delivery_preamble;
+pub(crate) mod actor_delivery_preamble;
 mod actor_delivery_render;
-mod actor_delivery_worker;
+pub(crate) mod actor_delivery_worker;
 mod actor_listing;
 mod actor_profile_runtime;
 pub(crate) mod actor_runtime;
@@ -13,13 +13,17 @@ mod actor_runtime_status_tests;
 mod actor_runtime_tests;
 mod actor_saga;
 mod actor_secrets;
+mod actor_switch;
 mod actors;
 mod assistants;
 mod automation_config;
 mod automation_manage;
 mod automation_rule_access;
 pub(crate) mod automation_runtime;
-mod capabilities;
+mod backlog;
+pub(crate) mod capabilities;
+mod chet_group_wait;
+mod chet_history;
 mod codex_mcp;
 pub(crate) mod codex_voice_analyst;
 pub(crate) mod codex_voice_controller;
@@ -32,10 +36,12 @@ mod context;
 mod direct;
 pub(crate) use connect::ConnectService;
 mod context_projection;
-mod deepseek_runtime;
+pub(crate) mod deepseek_runtime;
 mod diagnostics;
 pub(crate) mod dots_events;
+mod event_prefix;
 mod grok_webhook;
+mod group_activity;
 mod group_copy;
 mod group_create_rollback;
 mod group_creation;
@@ -46,16 +52,23 @@ mod group_space;
 mod groups;
 mod hermes_runtime;
 mod im;
+pub(crate) mod instruction_files;
+#[cfg(test)]
+mod isolated_test;
 pub(crate) mod local_headless;
+pub(crate) mod local_sessions;
 mod maintenance;
 mod membership;
+mod owned_process_recovery;
 pub(crate) use membership::ReachRestore;
 pub(crate) use membership::validated_live_web_binding;
+mod mail_advisory;
+mod mcp_identity_notice;
 mod membership_account;
 mod membership_cloudflared;
-mod memory;
 mod message_idempotency;
 mod message_metadata;
+mod message_pins;
 mod messaging;
 pub(crate) use messaging::reply_crosses_groups;
 mod messaging_inbox;
@@ -66,7 +79,9 @@ mod messaging_status;
 mod presentation;
 mod profile_access;
 mod profiles;
+mod quick_reply_templates;
 mod remote_access;
+mod reply_requests;
 mod runtime_completion;
 pub(crate) mod runtime_delivery;
 mod runtime_mcp;
@@ -99,12 +114,18 @@ pub(crate) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
         group_scopes::resolve_operation,
         group_space::resolve_operation,
         actors::resolve_operation,
+        actor_switch::resolve_operation,
+        local_sessions::resolve_operation,
         automation_config::resolve_operation,
         assistants::resolve_operation,
         capabilities::resolve_operation,
+        chet_group_wait::resolve_operation,
+        chet_history::resolve_operation,
         messaging::resolve_operation,
+        message_pins::resolve_operation,
         presentation::resolve_operation,
         profiles::resolve_operation,
+        quick_reply_templates::resolve_operation,
         diagnostics::resolve_operation,
         remote_access::resolve_operation,
         membership::resolve_operation,
@@ -116,9 +137,10 @@ pub(crate) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
         dots_events::resolve_operation,
         grok_webhook::resolve_operation,
         maintenance::resolve_operation,
+        owned_process_recovery::resolve_operation,
         im::resolve_operation,
-        memory::resolve_operation,
         context::resolve_operation,
+        backlog::resolve_operation,
         settings::resolve_operation,
         web_model_connectors::resolve_operation,
         voice_notifications::resolve_operation,

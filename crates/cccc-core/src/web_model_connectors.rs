@@ -105,15 +105,20 @@ fn update<T>(home: &HomeLayout, change: impl FnOnce(&mut Value) -> io::Result<T>
 }
 
 pub fn load(home: &HomeLayout) -> io::Result<Vec<Value>> {
-    fs::with_exclusive_lock(&lock_path(home), || {
-        let root = read(home)?;
-        Ok(root["connectors"]
-            .as_object()
-            .expect("validated store")
-            .values()
-            .cloned()
-            .collect())
-    })
+    fs::with_exclusive_lock(&lock_path(home), || snapshot(home))
+}
+
+/// Read one published connector document without creating or waiting for its
+/// write lock. Writers publish atomically; this is an observation, not a fence
+/// for a later mutation or an authorization decision.
+pub fn snapshot(home: &HomeLayout) -> io::Result<Vec<Value>> {
+    let root = read(home)?;
+    Ok(root["connectors"]
+        .as_object()
+        .expect("validated store")
+        .values()
+        .cloned()
+        .collect())
 }
 
 pub fn requires_reconfiguration(home: &HomeLayout) -> io::Result<bool> {
@@ -152,6 +157,36 @@ pub fn create_provider_if_absent(home: &HomeLayout, provider: &str) -> io::Resul
     configure_inner(home, provider, false)
 }
 
+/// Replace only an active connector's credential, preserving its routes and
+/// pairings. A missing or revoked connector must be created explicitly.
+pub fn rotate_provider(home: &HomeLayout, provider: &str) -> io::Result<Value> {
+    if !matches!(provider, "chatgpt_web" | "grok_web") {
+        return Err(error("invalid_web_model_provider"));
+    }
+    update(home, |root| {
+        let connector = root["connectors"]
+            .get_mut(provider)
+            .filter(|item| item.is_object() && item["revoked"] != true)
+            .ok_or_else(|| error("connector_unavailable"))?;
+        let secret = install_secret(connector, &cccc_contracts::utc_now());
+        Ok(json!({"outcome":"rotated","connector":connector,"secret":secret}))
+    })
+}
+
+fn install_secret(connector: &mut Value, now: &str) -> String {
+    let secret = format!(
+        "wmcs_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    connector["secret_hash"] = json!(hash(&secret));
+    connector["secret_preview"] =
+        json!(format!("{}…{}", &secret[..6], &secret[secret.len() - 4..]));
+    connector["updated_at"] = json!(now);
+    connector["revoked"] = json!(false);
+    secret
+}
+
 fn configure_inner(
     home: &HomeLayout,
     provider: &str,
@@ -171,16 +206,8 @@ fn configure_inner(
         } else {
             json!({"connector_id":format!("wmc_{}",Uuid::new_v4().simple()),"kind":"web_model_connector","routing_mode":if provider == "grok_web" {"credential"} else {"session"},"provider":provider,"routing_salt":Uuid::new_v4().to_string(),"created_at":now,"bindings":{},"pairings":{}})
         };
-        let secret = format!(
-            "wmcs_{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
-        connector["secret_hash"] = json!(hash(&secret));
-        connector["secret_preview"] =
-            json!(format!("{}…{}", &secret[..6], &secret[secret.len() - 4..]));
-        connector["updated_at"] = json!(now);
-        connector["revoked"] = json!(false);
+        let existed = old.is_object() && old["revoked"] != true;
+        let secret = install_secret(&mut connector, &now);
         if provider == "grok_web" && !connector["routing_key"].is_string() {
             connector["routing_key"] = json!(format!(
                 "{}{}",
@@ -192,7 +219,9 @@ fn configure_inner(
         if provider == "chatgpt_web" {
             root["requires_reconfiguration"] = json!(false);
         }
-        Ok(Some(json!({"connector":connector,"secret":secret})))
+        Ok(Some(
+            json!({"outcome":if existed {"rotated"} else {"created"},"connector":connector,"secret":secret}),
+        ))
     })
 }
 
@@ -225,6 +254,43 @@ pub fn secret_matches(item: &Value, supplied: &str) -> bool {
 /// Credential-scoped correlation, not authentication. Never use model arguments
 /// or HTTP transport session IDs as a substitute for per-call host metadata.
 pub fn session_key(connector: &Value, metadata: &Value) -> io::Result<String> {
+    Ok(hash(
+        &Value::Array(session_parts(connector, metadata)?).to_string(),
+    ))
+}
+
+/// Diagnostic correlation only. Domain separation prevents these hashes from
+/// substituting for a session key; each component stays scoped to this connector.
+pub fn host_identity_fingerprints(connector: &Value, metadata: &Value) -> io::Result<Value> {
+    let parts = session_parts(connector, metadata)?;
+    let mut result = serde_json::Map::new();
+    for (index, field) in ["session", "subject", "organization"]
+        .into_iter()
+        .enumerate()
+    {
+        let value = &parts[index + 3];
+        result.insert(
+            field.into(),
+            if value.is_null() {
+                Value::Null
+            } else {
+                json!(hash(
+                    &json!([
+                        "cccc-host-identity-diagnostic-v1",
+                        parts[1],
+                        parts[2],
+                        field,
+                        value
+                    ])
+                    .to_string()
+                ))
+            },
+        );
+    }
+    Ok(Value::Object(result))
+}
+
+fn session_parts(connector: &Value, metadata: &Value) -> io::Result<Vec<Value>> {
     require_chatgpt(connector)?;
     let metadata = metadata
         .as_object()
@@ -249,7 +315,7 @@ pub fn session_key(connector: &Value, metadata: &Value) -> io::Result<String> {
             None => parts.push(Value::Null),
         }
     }
-    Ok(hash(&Value::Array(parts).to_string()))
+    Ok(parts)
 }
 
 pub fn binding_for_actor(
@@ -294,13 +360,16 @@ pub fn validate_binding(home: &HomeLayout, expected: &Value) -> io::Result<()> {
         .iter()
         .find(|a| a.id == actor_id)
         .ok_or_else(|| error("paired_actor_unavailable"))?;
-    if generation.is_empty()
-        || crate::actors::generation_identity(actor) != generation
-        || !actor.enabled
-        || actor.runtime.web_model_provider() != connector["provider"].as_str()
+    if generation.is_empty() || crate::actors::generation_identity(actor) != generation {
+        return Err(error("paired_actor_identity_changed"));
+    }
+    if actor.runtime.web_model_provider() != connector["provider"].as_str()
         || actor.runner != cccc_contracts::RunnerKind::Headless
     {
-        return Err(error("paired_actor_unavailable"));
+        return Err(error("paired_actor_runtime_changed"));
+    }
+    if !actor.enabled {
+        return Err(error("paired_actor_stopped"));
     }
     let current = binding_for_actor(&connector, group_id, actor_id, generation)
         .ok_or_else(|| error("conversation_not_paired"))?;
@@ -627,6 +696,22 @@ fn retire(home: &HomeLayout, group: &str, actor: Option<&str>) -> io::Result<Vec
         Ok(retired)
     })
 }
+/// Held by a Web process for one Actor's browser work, from its claim to its
+/// last write, and by a runtime switch. Neither waits, so the work falls wholly
+/// before or after the switch, whichever process each runs in.
+pub fn browser_work_lock(home: &HomeLayout, group: &str, actor: &str) -> std::path::PathBuf {
+    browser_work_locks(home, group).join(format!("{actor}.lock"))
+}
+
+fn browser_work_locks(home: &HomeLayout, group: &str) -> std::path::PathBuf {
+    home.root().join("state/web_model_browser_work").join(group)
+}
+
+/// Best effort, once a Group is gone: nothing depends on these empty files.
+pub fn remove_browser_work_locks(home: &HomeLayout, group: &str) {
+    let _ = std::fs::remove_dir_all(browser_work_locks(home, group));
+}
+
 pub fn retire_actor(home: &HomeLayout, group: &str, actor: &str) -> io::Result<Vec<Value>> {
     retire(home, group, Some(actor))
 }
@@ -667,10 +752,10 @@ pub fn restore(home: &HomeLayout, entries: &[Value]) -> io::Result<()> {
             let key = entry["key"]
                 .as_str()
                 .ok_or_else(|| error("invalid route snapshot"))?;
-            if let Some(existing) = c[collection].get(key) {
-                if existing != &entry["value"] {
-                    return Err(error("route changed during rollback"));
-                }
+            if let Some(existing) = c[collection].get(key)
+                && existing != &entry["value"]
+            {
+                return Err(error("route changed during rollback"));
             }
             c[collection][key] = entry["value"].clone();
         }

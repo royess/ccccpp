@@ -1,9 +1,8 @@
 use super::operation::{
     Operation,
-    Policy::{Read, Write},
+    Policy::{GlobalWrite, Read, Write},
 };
 use cccc_contracts::{DaemonRequest, Event};
-use cccc_core::group::AUTOMATION_TIMING_KEYS;
 use cccc_core::ledger;
 use cccc_core::permissions;
 use cccc_core::settings;
@@ -25,6 +24,11 @@ const SECTION_SETTING_KEYS: &[(&str, &str, &str)] = &[
         "mail_notice_idle_after_seconds",
     ),
     (
+        "mail_notice_repeat_seconds",
+        "delivery",
+        "mail_notice_repeat_seconds",
+    ),
+    (
         "reply_notice_after_seconds",
         "delivery",
         "reply_notice_after_seconds",
@@ -34,17 +38,6 @@ const SECTION_SETTING_KEYS: &[(&str, &str, &str)] = &[
         "terminal_transcript",
         "visibility",
     ),
-    (
-        "terminal_transcript_notify_tail",
-        "terminal_transcript",
-        "notify_tail",
-    ),
-    (
-        "terminal_transcript_notify_lines",
-        "terminal_transcript",
-        "notify_lines",
-    ),
-    ("panorama_enabled", "features", "panorama_enabled"),
 ];
 
 pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
@@ -60,6 +53,8 @@ pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
         "branding_update" => Operation::new(Write, |home, request| {
             global_update(home, request, "branding")
         }),
+        "unattended_get" => Operation::new(Read, unattended_get),
+        "unattended_update" => Operation::new(GlobalWrite, unattended_update),
         _ => return None,
     })
 }
@@ -79,18 +74,14 @@ fn group_settings(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
 
             promote_legacy_group_settings(doc, &mut flat);
 
-            let mut automation_patch = Map::new();
             let mut flat_patch = Map::new();
             for (key, value) in &patch {
-                if AUTOMATION_TIMING_KEYS.contains(&key.as_str()) {
-                    automation_patch.insert(key.clone(), value.clone());
-                } else if let Some((section, canonical)) = section_target(key) {
+                if let Some((section, canonical)) = section_target(key) {
                     set_section_value(doc, section, canonical, value.clone());
                 } else {
                     flat_patch.insert(key.clone(), value.clone());
                 }
             }
-            settings::merge(&mut doc.automation, &automation_patch);
             settings::merge(&mut flat, &flat_patch);
             if !flat.is_empty() {
                 doc.extra
@@ -144,11 +135,6 @@ fn set_section_value(doc: &mut GroupDoc, section: &str, key: &str, value: Value)
 }
 
 fn promote_legacy_group_settings(doc: &mut GroupDoc, flat: &mut Map<String, Value>) {
-    for key in AUTOMATION_TIMING_KEYS {
-        if let Some(legacy) = flat.remove(*key) {
-            doc.automation.entry(*key).or_insert(legacy);
-        }
-    }
     for (legacy_key, section, canonical_key) in SECTION_SETTING_KEYS {
         if let Some(legacy) = flat.remove(*legacy_key) {
             section_mut(doc, section)
@@ -159,11 +145,6 @@ fn promote_legacy_group_settings(doc: &mut GroupDoc, flat: &mut Map<String, Valu
 }
 
 fn effective_group_settings(doc: &GroupDoc, mut flat: Map<String, Value>) -> Map<String, Value> {
-    for key in AUTOMATION_TIMING_KEYS {
-        if let Some(value) = doc.automation.get(*key) {
-            flat.insert((*key).into(), value.clone());
-        }
-    }
     for (legacy_key, section, canonical_key) in SECTION_SETTING_KEYS {
         if let Some(value) = doc
             .extra
@@ -210,6 +191,44 @@ fn global_update(home: &HomeLayout, request: &DaemonRequest, key: &str) -> OpRes
     })
     .map_err(OpError::io)?;
     object(json!({key: result}))
+}
+
+fn unattended_get(home: &HomeLayout, _request: &DaemonRequest) -> OpResult {
+    let unattended = cccc_core::unattended::load(home).map_err(OpError::io)?;
+    object(json!({"unattended": unattended}))
+}
+
+/// Only the user turns unattended mode on or off; an Actor, or a call bound to
+/// an Actor's session, is refused. Turning it on records the moment from which
+/// Chet receives copies; turning it off clears it, and Chet receives no more.
+fn unattended_update(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
+    if request.args.get("by").and_then(Value::as_str) != Some("user")
+        || request.args.contains_key("_cccc_native_binding")
+        || request.args.contains_key("_cccc_native_source_binding")
+        || request.args.contains_key("_cccc_web_binding")
+    {
+        return Err(OpError::new(
+            "permission_denied",
+            "only the user turns unattended mode on or off",
+        ));
+    }
+    let enabled = request
+        .args
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| OpError::invalid("enabled must be true or false"))?;
+    let unattended = settings::update(home, |global| {
+        let current = &mut global.unattended;
+        if !enabled {
+            *current = Default::default();
+        } else if !current.enabled || current.since.is_none() {
+            current.enabled = true;
+            current.since = Some(cccc_contracts::utc_now());
+        }
+        Ok(current.clone())
+    })
+    .map_err(OpError::io)?;
+    object(json!({"unattended": unattended}))
 }
 
 fn patch(request: &DaemonRequest) -> Result<Map<String, Value>, OpError> {
@@ -263,6 +282,57 @@ mod tests {
     use super::*;
     use cccc_core::GroupStore;
 
+    fn unattended(home: &HomeLayout, args: Value) -> OpResult {
+        unattended_update(
+            home,
+            &DaemonRequest {
+                v: 1,
+                op: "unattended_update".into(),
+                args: args.as_object().cloned().expect("request object"),
+            },
+        )
+    }
+
+    #[test]
+    fn only_the_user_turns_unattended_mode_on_and_each_period_has_its_own_start() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+        for args in [
+            json!({"enabled":true}),
+            json!({"by":"worker","enabled":true}),
+            json!({"by":"user","enabled":true,"_cccc_native_binding":{}}),
+            json!({"by":"user","enabled":true,"_cccc_web_binding":{}}),
+        ] {
+            let error = unattended(&home, args).expect_err("refused");
+            assert_eq!(error.code, "permission_denied");
+        }
+        assert_eq!(
+            unattended(&home, json!({"by":"user","enabled":"yes"}))
+                .expect_err("not a boolean")
+                .code,
+            "invalid_args"
+        );
+        assert!(!cccc_core::unattended::load(&home).expect("load").enabled);
+
+        let on = unattended(
+            &home,
+            json!({"by":"user","enabled":true,"since":"1970-01-01T00:00:00Z"}),
+        )
+        .expect("on");
+        let since = on["unattended"]["since"]
+            .as_str()
+            .expect("since")
+            .to_owned();
+        assert_ne!(since, "1970-01-01T00:00:00Z", "the host sets the start");
+        // Turning it on again keeps the current period.
+        let again = unattended(&home, json!({"by":"user","enabled":true})).expect("again");
+        assert_eq!(again["unattended"]["since"], json!(since));
+        let off = unattended(&home, json!({"by":"user","enabled":false})).expect("off");
+        assert_eq!(off["unattended"], json!({"enabled":false}));
+        let stored = cccc_core::unattended::load(&home).expect("load");
+        assert!(stored.is_default());
+    }
+
     #[test]
     fn idle_mail_delay_is_stored_where_the_unread_tick_reads_it() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -303,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn group_settings_promote_legacy_automation_timing_to_canonical_storage() {
+    fn group_settings_promote_legacy_sections_and_leave_retired_timing_keys_unread() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
         let store = GroupStore::new(home.clone()).expect("store");
@@ -316,7 +386,6 @@ mod tests {
                 group.extra.insert(
                     "settings".into(),
                     json!({
-                        "actor_idle_timeout_seconds":999,
                         "help_nudge_interval_seconds":777,
                         "default_send_to":"broadcast",
                         "native_extension":{"keep":true}
@@ -334,11 +403,7 @@ mod tests {
             args: json!({
                 "group_id":group.group_id,
                 "by":"user",
-                "patch":{
-                    "keepalive_delay_seconds":456,
-                    "terminal_transcript_visibility":"all",
-                    "panorama_enabled":true
-                }
+                "patch":{"terminal_transcript_visibility":"all"}
             })
             .as_object()
             .cloned()
@@ -352,15 +417,15 @@ mod tests {
             .expect("flat settings object");
 
         assert_eq!(stored.automation["actor_idle_timeout_seconds"], json!(123));
-        assert_eq!(stored.automation["help_nudge_interval_seconds"], json!(777));
-        assert_eq!(stored.automation["keepalive_delay_seconds"], json!(456));
+        assert!(
+            !stored
+                .automation
+                .contains_key("help_nudge_interval_seconds")
+        );
         assert_eq!(
             Value::Object(flat.clone()),
-            json!({"native_extension":{"keep":true}})
+            json!({"help_nudge_interval_seconds":777,"native_extension":{"keep":true}})
         );
-        for key in AUTOMATION_TIMING_KEYS {
-            assert!(!flat.contains_key(*key));
-        }
         assert_eq!(
             stored.extra["messaging"]["default_send_to"],
             json!("foreman")
@@ -369,12 +434,15 @@ mod tests {
             stored.extra["terminal_transcript"]["visibility"],
             json!("all")
         );
-        assert_eq!(stored.extra["features"]["panorama_enabled"], json!(true));
-        assert_eq!(
-            response["settings"]["actor_idle_timeout_seconds"],
-            json!(123)
+        assert!(
+            response["settings"]
+                .get("actor_idle_timeout_seconds")
+                .is_none()
         );
-        assert_eq!(response["settings"]["keepalive_delay_seconds"], json!(456));
+        assert_eq!(
+            response["settings"]["help_nudge_interval_seconds"],
+            json!(777)
+        );
         assert_eq!(response["settings"]["default_send_to"], json!("foreman"));
         assert_eq!(response["group_id"], json!(group.group_id));
         assert_eq!(response["event"]["kind"], json!("group.settings_update"));

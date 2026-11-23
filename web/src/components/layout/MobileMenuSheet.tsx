@@ -15,6 +15,8 @@ import {
   CloseIcon,
 } from "../Icons";
 import { GroupStatusIndicator } from "./GroupStatusIndicator";
+import { AppWindow } from "lucide-react";
+import { LcdIcon } from "../Icons";
 
 export interface MobileMenuSheetProps {
   isOpen: boolean;
@@ -22,7 +24,7 @@ export interface MobileMenuSheetProps {
   textScale: TextScale;
   selectedGroupId: string;
   groupDoc: GroupDoc | null;
-  selectedGroupRunning: boolean;
+  selectedGroupRunning: boolean | null;
   onClose: () => void;
   onThemeChange: (theme: Theme) => void;
   onTextScaleChange: (scale: TextScale) => void;
@@ -30,6 +32,11 @@ export interface MobileMenuSheetProps {
   onOpenContext: () => void;
   /** Opens the workspace file tree as a full-screen surface; absent when unavailable. */
   onOpenFiles?: () => void;
+  /**
+   * The resource panel on a phone, whose header leaves room for the Group title: its open tabs, or
+   * with none open, the way back to what was closed last.
+   */
+  resources?: { open: number; onOpen: () => void };
   onOpenSettings: () => void;
   canAccessAccount: boolean;
   accountLabel?: string | null;
@@ -50,6 +57,7 @@ export function MobileMenuSheet({
   onOpenSearch,
   onOpenContext,
   onOpenFiles,
+  resources,
   onOpenSettings,
   canAccessAccount,
   accountLabel,
@@ -60,7 +68,7 @@ export function MobileMenuSheet({
   const { t } = useTranslation("layout");
   const selectedStatus = selectedGroupId
     ? getGroupStatusFromSource({
-        running: selectedGroupRunning,
+        running: selectedGroupRunning ?? undefined,
         state: groupDoc?.state,
         runtime_status: groupDoc?.runtime_status,
       })
@@ -92,7 +100,7 @@ export function MobileMenuSheet({
         aria-label={t("menu")}
       >
         <div className="flex justify-center pt-3 pb-1 md:hidden" onClick={onClose}>
-          <div className="w-12 h-1.5 rounded-full bg-black/15 dark:bg-white/20" />
+          <div className="w-12 h-1.5 rounded-full bg-black/15 dark:bg-white/20" data-sheet-handle />
         </div>
 
         <div className="px-6 pb-4 md:pt-5 flex items-center justify-between gap-3">
@@ -199,6 +207,28 @@ export function MobileMenuSheet({
                   <FolderIcon size={18} />
                   <span>{t("workspaceFilesButton")}</span>
                 </div>
+              </button>
+            ) : null}
+            {resources ? (
+              <button
+                className={rowButtonClass}
+                onClick={() => {
+                  onClose();
+                  resources.onOpen();
+                }}
+                data-mobile-menu-resources
+              >
+                <div className="flex items-center gap-3">
+                  <LcdIcon icon={AppWindow} glyph="app-windows" className="h-[18px] w-[18px]" />
+                  <span>
+                    {t(resources.open ? "resourcesButton" : "reopenClosedResourcesButton")}
+                  </span>
+                </div>
+                {resources.open ? (
+                  <span className="tabular-nums text-[var(--color-text-tertiary)]">
+                    {resources.open}
+                  </span>
+                ) : null}
               </button>
             ) : null}
             <button

@@ -78,7 +78,10 @@ export function useGroupMenu(label: string, actions: GroupMenuActionItem[]) {
                 items[next]?.focus();
               },
             })}
-            className="z-max min-w-[180px] max-w-[calc(100vw-24px)] rounded-xl p-1.5 shadow-2xl glass-panel"
+            // A column: its items are inline-flex buttons, and in a block container the
+            // width to fit would be that of adjacent items placed side by side.
+            className="z-max flex min-w-[180px] max-w-[calc(100vw-24px)] flex-col rounded-xl p-1.5 shadow-2xl glass-panel"
+            data-group-menu
           >
             {actions.map((action, index) => (
               <Fragment key={action.label}>
@@ -120,8 +123,13 @@ export function useGroupMenu(label: string, actions: GroupMenuActionItem[]) {
     onContextMenu(event: React.MouseEvent<HTMLElement>) {
       if (!actions.length) return;
       event.preventDefault();
-      event.currentTarget.focus();
-      refs.setReference(event.currentTarget);
+      // Expanded rows wrap the group button and its separate action buttons.
+      // Return focus to the primary button rather than the unfocusable row.
+      const trigger =
+        event.currentTarget.querySelector<HTMLButtonElement>(":scope > button") ??
+        event.currentTarget;
+      trigger.focus();
+      refs.setReference(trigger);
       refs.setPositionReference({
         getBoundingClientRect: () => new DOMRect(event.clientX, event.clientY, 0, 0),
       });

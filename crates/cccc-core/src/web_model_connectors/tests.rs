@@ -1,5 +1,37 @@
 use super::*;
 
+#[test]
+fn a_connector_snapshot_does_not_wait_for_or_change_the_write_lock() {
+    let (_temp, home, _) = fixture();
+    let path = store_path(&home);
+    let before = std::fs::read(&path).expect("published connector state");
+    let (locked, entered) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let locked_home = home.clone();
+    let writer = std::thread::spawn(move || {
+        fs::with_exclusive_lock(&lock_path(&locked_home), || {
+            locked.send(()).expect("lock acquired");
+            released.recv().expect("release lock");
+            Ok(())
+        })
+        .expect("writer lock");
+    });
+    entered.recv().expect("writer ready");
+    let (finished, observed) = std::sync::mpsc::channel();
+    let observed_home = home.clone();
+    let reader = std::thread::spawn(move || {
+        finished
+            .send(snapshot(&observed_home).map(|items| items.len()))
+            .expect("snapshot result");
+    });
+    let read_while_locked = observed.recv_timeout(std::time::Duration::from_secs(2));
+    release.send(()).expect("release writer");
+    writer.join().expect("writer stopped");
+    reader.join().expect("reader stopped");
+    assert!(matches!(read_while_locked, Ok(Ok(1))));
+    assert!(before == std::fs::read(path).expect("unchanged connector state"));
+}
+
 fn fixture() -> (tempfile::TempDir, HomeLayout, Value) {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
@@ -93,6 +125,63 @@ fn host_metadata_is_scoped_stable_and_strict() {
     );
     assert!(!a.contains("host-A"));
 }
+#[test]
+fn host_identity_diagnostics_are_scoped_component_hashes_not_routing_keys() {
+    let (_temp, home, configured) = fixture();
+    let connector = &configured["connector"];
+    let metadata = json!({"openai/session":"synthetic-conversation",
+        "openai/subject":"synthetic-user","openai/organization":"synthetic-org",
+        "unrelated":"synthetic-private-metadata"});
+    let routing = session_key(connector, &metadata).expect("routing key");
+    assert_eq!(
+        routing,
+        hash(
+            &json!([
+                "cccc-web-model-session-v1",
+                connector["connector_id"],
+                connector["routing_salt"],
+                metadata["openai/session"],
+                metadata["openai/subject"],
+                metadata["openai/organization"]
+            ])
+            .to_string()
+        )
+    );
+    let fingerprints = host_identity_fingerprints(connector, &metadata).expect("fingerprints");
+    assert_eq!(fingerprints.as_object().expect("object").len(), 3);
+    for value in fingerprints.as_object().expect("object").values() {
+        assert_eq!(value.as_str().expect("hash").len(), 64);
+        assert_ne!(value, &json!(routing));
+    }
+    assert!(!fingerprints.to_string().contains("synthetic"));
+    let mut changed = metadata.clone();
+    changed["openai/organization"] = json!("synthetic-other-org");
+    let other = host_identity_fingerprints(connector, &changed).expect("changed organization");
+    assert_eq!(fingerprints["session"], other["session"]);
+    assert_eq!(fingerprints["subject"], other["subject"]);
+    assert_ne!(fingerprints["organization"], other["organization"]);
+    changed
+        .as_object_mut()
+        .expect("metadata")
+        .remove("openai/subject");
+    let absent = host_identity_fingerprints(connector, &changed).expect("missing optional field");
+    assert!(absent["subject"].is_null());
+    assert_eq!(absent["session"], fingerprints["session"]);
+    assert!(host_identity_fingerprints(connector, &json!({})).is_err());
+    assert!(host_identity_fingerprints(connector, &json!({"openai/session":7})).is_err());
+    let rotated = configure(&home).expect("credential rotation");
+    assert_eq!(
+        fingerprints,
+        host_identity_fingerprints(&rotated["connector"], &metadata).expect("rotation")
+    );
+    let mut other_connector = connector.clone();
+    other_connector["routing_salt"] = json!("synthetic-other-salt");
+    let other = host_identity_fingerprints(&other_connector, &metadata).expect("other connector");
+    for field in ["session", "subject", "organization"] {
+        assert_ne!(fingerprints[field], other[field]);
+    }
+}
+
 #[test]
 fn pairing_is_one_session_and_needs_explicit_confirmation() {
     let (_temp, home, c) = fixture();
@@ -475,4 +564,59 @@ fn create_if_absent_never_rotates_an_active_connector() {
             .expect("create")
             .is_some()
     );
+}
+
+#[test]
+fn explicit_rotation_preserves_routes_and_refuses_missing_or_revoked_connectors() {
+    for provider in ["chatgpt_web", "grok_web"] {
+        let temp = tempfile::tempdir().expect("home");
+        let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+        home.initialize().expect("initialize");
+        assert!(rotate_provider(&home, provider).is_err());
+        assert!(
+            !store_path(&home).exists(),
+            "rotation cannot create an entrance"
+        );
+        let first = configure_provider(&home, provider).expect("create");
+        let id = first["connector"]["connector_id"].as_str().expect("id");
+        update(&home, |root| {
+            let c = &mut root["connectors"][provider];
+            c["bindings"] = json!({"route":{"generation":"g1","revision":2}});
+            c["pairings"] = json!({"pending":{"code":"test-only"}});
+            c["dots"] = json!({"state":"active","wake":{"id":"fixture-wake"}});
+            Ok(())
+        })
+        .expect("state fixture");
+        let before = load(&home).expect("load").remove(0);
+        let rotated = rotate_provider(&home, provider).expect("rotate");
+        let after = &rotated["connector"];
+        for field in [
+            "connector_id",
+            "created_at",
+            "routing_mode",
+            "routing_key",
+            "routing_salt",
+            "bindings",
+            "pairings",
+            "dots",
+        ] {
+            assert_eq!(after[field], before[field], "preserve {field}");
+        }
+        assert_eq!(rotated["outcome"], "rotated");
+        assert!(!secret_matches(
+            after,
+            first["secret"].as_str().expect("old secret")
+        ));
+        assert!(secret_matches(
+            after,
+            rotated["secret"].as_str().expect("new secret")
+        ));
+        revoke(&home, id).expect("revoke");
+        let revoked_bytes = std::fs::read(store_path(&home)).expect("store");
+        assert!(rotate_provider(&home, provider).is_err());
+        assert_eq!(
+            std::fs::read(store_path(&home)).expect("store"),
+            revoked_bytes
+        );
+    }
 }

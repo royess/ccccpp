@@ -1,15 +1,146 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  attachScope,
   fetchVoiceAssistantStatus,
   fetchVoiceAssistantWorkspace,
+  previewGroupCopy,
+  startPresentationBrowserSurfaceSession,
   transcribeVoiceAssistantAudio,
   updateVoiceAssistantRecordingLease,
+  type GroupCopyPreview,
 } from "./groups";
+import { setAuthToken } from "./base";
 import {
   fetchVoiceAssistantDocumentContent,
   retryVoiceAssistantTranscriptPersistence,
 } from "./voiceSecretary";
+
+describe("Presentation browser session", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    setAuthToken("");
+  });
+
+  it.each([undefined, false, true])(
+    "sends reuse only when requested (%s)",
+    async (reuseExistingSession) => {
+      vi.stubGlobal("window", { location: { search: "" } });
+      const fetchMock = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValue(
+          new Response(
+            JSON.stringify({
+              ok: true,
+              result: {
+                group_id: "g",
+                browser_surface: {
+                  active: true,
+                  state: "ready",
+                  url: "https://example.test/next",
+                  initial_url: "https://example.test/start",
+                },
+              },
+            }),
+          ),
+        );
+      const result = await startPresentationBrowserSurfaceSession("g", {
+        slotId: "slot-1",
+        url: "https://example.test/start",
+        reuseExistingSession,
+      });
+      expect(result.ok && result.result.browser_surface.initial_url).toBe(
+        "https://example.test/start",
+      );
+      const init = fetchMock.mock.calls[0][1];
+      expect(JSON.parse(String(init?.body))).toEqual({
+        by: "user",
+        slot: "slot-1",
+        url: "https://example.test/start",
+        width: 1280,
+        height: 800,
+        ...(reuseExistingSession ? { reuse_existing: true } : {}),
+      });
+    },
+  );
+});
+
+describe("scope attachment API", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    setAuthToken("");
+  });
+
+  it.each([undefined, true, false])(
+    "passes activation %s explicitly only when requested and keeps the added scope receipt",
+    async (activate) => {
+      vi.stubGlobal("window", { location: { search: "" } });
+      setAuthToken("");
+      const result = {
+        group_id: "group/fixture",
+        scope_key: "s_added",
+        scope: { scope_key: "s_added", url: "/project", label: "Project", git_remote: "" },
+      };
+      const fetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValue(new Response(JSON.stringify({ ok: true, result })));
+
+      expect(
+        await attachScope(
+          "group/fixture",
+          "/project/subdirectory",
+          activate === undefined ? undefined : { activate },
+        ),
+      ).toEqual({ ok: true, result });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      const [url, init] = fetch.mock.calls[0];
+      expect(url).toBe("/api/v1/groups/group%2Ffixture/attach");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        path: "/project/subdirectory",
+        by: "user",
+        ...(activate === undefined ? {} : { activate }),
+      });
+    },
+  );
+});
+
+describe("group copy preview API", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    setAuthToken("");
+  });
+
+  it("preserves native-session flags independently of Codex runtime in an uploaded preview", async () => {
+    vi.stubGlobal("window", { location: { search: "" } });
+    setAuthToken("");
+    const preview: GroupCopyPreview = {
+      source_group_id: "g_source",
+      actors: [
+        { id: "native", runtime: "codex", enabled: true, native_session: true },
+        { id: "managed", runtime: "codex", enabled: true, native_session: false },
+      ],
+      requires_reconnect: { native_sessions: true },
+    };
+    const result = { upload_id: "fixture-upload", preview };
+    const fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true, result })));
+    const file = new File(["fixture zip"], "native-members.zip");
+
+    expect(await previewGroupCopy(file)).toEqual({ ok: true, result });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, init] = fetch.mock.calls[0];
+    expect(url).toBe("/api/v1/groups/copy/preview_import");
+    expect(init?.method).toBe("POST");
+    const uploaded = (init!.body as FormData).get("file") as File;
+    expect(uploaded.name).toBe(file.name);
+    expect(uploaded.size).toBe(file.size);
+  });
+});
 
 describe("assistant API helpers", () => {
   afterEach(() => {

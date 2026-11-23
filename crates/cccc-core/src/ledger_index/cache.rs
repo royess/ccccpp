@@ -1,6 +1,7 @@
 use super::LedgerIndex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 const MAX_ENTRIES: usize = 32;
@@ -18,6 +19,37 @@ struct IndexCache {
     clock: u64,
     max_entries: usize,
     max_source_bytes: u64,
+    counters: Counters,
+}
+
+/// Process-lifetime counts for diagnostics; they never influence caching.
+#[derive(Clone, Copy, Default)]
+struct Counters {
+    hits: u64,
+    entries_created: u64,
+    evictions: u64,
+    invalidations: u64,
+}
+
+/// Completed full index builds, cold reads included. Counted outside the cache
+/// lock because a build runs under the index lock only.
+static INDEX_REBUILDS: AtomicU64 = AtomicU64::new(0);
+
+/// A diagnostic view of the ledger index cache. Budget figures are the
+/// eviction weights (the larger of source file bytes and the estimated event
+/// memory), not measured process memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub entries: u64,
+    pub budget_bytes: u64,
+    pub budget_limit_bytes: u64,
+    pub largest_budget_bytes: u64,
+    pub pinned: u64,
+    pub hits: u64,
+    pub entries_created: u64,
+    pub index_rebuilds: u64,
+    pub evictions: u64,
+    pub invalidations: u64,
 }
 
 impl IndexCache {
@@ -28,6 +60,31 @@ impl IndexCache {
             clock: 0,
             max_entries,
             max_source_bytes,
+            counters: Counters::default(),
+        }
+    }
+
+    fn stats(&self) -> Stats {
+        Stats {
+            entries: self.entries.len() as u64,
+            budget_bytes: self.source_bytes,
+            budget_limit_bytes: self.weight_limit(),
+            largest_budget_bytes: self
+                .entries
+                .values()
+                .map(|cached| cached.source_bytes)
+                .max()
+                .unwrap_or_default(),
+            pinned: self
+                .entries
+                .values()
+                .filter(|cached| Arc::strong_count(&cached.index) > 1)
+                .count() as u64,
+            hits: self.counters.hits,
+            entries_created: self.counters.entries_created,
+            index_rebuilds: INDEX_REBUILDS.load(Ordering::Relaxed),
+            evictions: self.counters.evictions,
+            invalidations: self.counters.invalidations,
         }
     }
 
@@ -45,6 +102,7 @@ impl IndexCache {
                 .saturating_add(source_bytes);
             cached.source_bytes = source_bytes;
             cached.last_used = self.clock;
+            self.counters.hits += 1;
             Arc::clone(&cached.index)
         } else {
             let index = Arc::new(RwLock::new(LedgerIndex::default()));
@@ -57,6 +115,7 @@ impl IndexCache {
                 },
             );
             self.source_bytes = self.source_bytes.saturating_add(source_bytes);
+            self.counters.entries_created += 1;
             index
         };
         let retired = self.evict(path);
@@ -113,21 +172,25 @@ impl IndexCache {
                 .map(|(path, _)| path.clone());
             let Some(candidate) = candidate else { break };
             if let Some(removed) = self.remove(&candidate) {
+                self.counters.evictions += 1;
                 retired.push(removed);
             }
         }
         retired
     }
 
+    /// The base budget, raised so the largest index always fits beside one other of the same
+    /// size up to the base budget. Someone moving between two Groups then keeps both indexes;
+    /// without it, two mid-sized ledgers would rebuild on every switch while a larger one fit.
     fn weight_limit(&self) -> u64 {
-        let oversized_allowance = self
+        let largest = self
             .entries
             .values()
             .map(|cached| cached.source_bytes)
             .max()
-            .filter(|largest| *largest > self.max_source_bytes)
             .unwrap_or_default();
-        self.max_source_bytes.saturating_add(oversized_allowance)
+        self.max_source_bytes
+            .max(largest.saturating_add(largest.min(self.max_source_bytes)))
     }
 }
 
@@ -163,11 +226,28 @@ pub(super) fn update_weight(path: &Path, source_bytes: u64, expected: &Arc<RwLoc
 }
 
 pub(super) fn invalidate(path: &Path) {
-    let retired = cache()
+    let retired = {
+        let mut cache = cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retired = cache.remove(path);
+        if retired.is_some() {
+            cache.counters.invalidations += 1;
+        }
+        retired
+    };
+    drop(retired);
+}
+
+pub(super) fn note_rebuild() {
+    INDEX_REBUILDS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(super) fn stats() -> Stats {
+    cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(path);
-    drop(retired);
+        .stats()
 }
 
 #[cfg(test)]
@@ -220,18 +300,68 @@ mod tests {
 
     #[test]
     fn updates_weight_and_evicts_the_idle_lru_entry() {
-        let mut cache = IndexCache::new(2, 10);
+        let mut cache = IndexCache::new(3, 10);
         let first = Path::new("first");
         let second = Path::new("second");
-        drop(cache.entry(first, 4));
+        let third = Path::new("third");
+        drop(cache.entry(first, 3));
         drop(cache.entry(second, 4));
+        drop(cache.entry(third, 3));
         let first_index = cache.get(first).expect("first entry");
 
-        cache.update_weight(first, 9, &first_index);
+        cache.update_weight(first, 5, &first_index);
 
         assert!(cache.entries.contains_key(first));
         assert!(!cache.entries.contains_key(second));
-        assert_eq!(cache.source_bytes, 9);
+        assert!(cache.entries.contains_key(third));
+        assert_eq!(cache.source_bytes, 8);
+    }
+
+    #[test]
+    fn budget_grows_with_the_largest_entry_without_a_step() {
+        for (largest, limit) in [(5, 10), (6, 12), (10, 20), (11, 21)] {
+            let mut cache = IndexCache::new(4, 10);
+            cache.entry(Path::new("largest"), largest);
+            assert_eq!(cache.weight_limit(), limit, "largest weight {largest}");
+        }
+    }
+
+    #[test]
+    fn keeps_two_alternating_mid_sized_entries() {
+        let mut cache = IndexCache::new(4, 10);
+        let first = Path::new("first");
+        let second = Path::new("second");
+        // Hold no index between accesses: an entry in use is never evicted.
+        for _ in 0..3 {
+            for (path, weight) in [(first, 8), (second, 6)] {
+                let (_, retired) = cache.entry(path, weight);
+                assert!(retired.is_empty(), "{} was evicted", path.display());
+            }
+        }
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.source_bytes, 14);
+    }
+
+    #[test]
+    fn counts_hits_creations_evictions_and_pinned_entries() {
+        let mut cache = IndexCache::new(1, 10);
+        let first = Path::new("first");
+        let second = Path::new("second");
+        drop(cache.entry(first, 4));
+        drop(cache.entry(first, 4));
+        let active = cache.entry(second, 6).0;
+
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.entries_created, 2);
+        assert_eq!(stats.evictions, 1);
+        assert_eq!(stats.pinned, 1);
+        assert_eq!(stats.budget_bytes, 6);
+        assert_eq!(stats.largest_budget_bytes, 6);
+        assert_eq!(stats.budget_limit_bytes, 12);
+        drop(active);
+        assert_eq!(cache.stats().pinned, 0);
     }
 
     #[test]

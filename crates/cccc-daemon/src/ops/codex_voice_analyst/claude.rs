@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 mod command;
+mod confirmation;
 mod control;
 mod resume_failure;
 mod transcript;
@@ -25,13 +26,25 @@ mod transcript_move_client_tests;
 mod transcript_path;
 mod workspace_trust;
 
-pub(super) use command::prepare;
+pub(crate) use command::capture_host_environment;
+pub(super) use command::{prepare, prepare_with_host};
+pub(crate) use confirmation::ConfirmationLaunch;
+pub(super) use confirmation::launch as confirmation_launch;
 pub(super) use resume_failure::diagnostic as resume_diagnostic;
 pub(super) use workspace_trust::untrusted_workspace;
 
 #[cfg(test)]
 pub(super) fn workspace_refusal(detail: &str, workspace: &Path) -> Option<io::Error> {
-    workspace_trust::WorkspaceUntrusted::from_refusal(detail, workspace, "claude", workspace)
+    workspace_trust::WorkspaceUntrusted::from_refusal(
+        detail,
+        workspace,
+        ConfirmationLaunch {
+            executable: "claude".into(),
+            config_dir: workspace.to_owned(),
+            environment: BTreeMap::new(),
+            arguments: Vec::new(),
+        },
+    )
 }
 
 pub(super) fn remove_actor_settings(
@@ -67,6 +80,16 @@ pub(super) struct LaunchedClaude {
     pub(super) tui_command: Vec<String>,
     pub(super) environment: BTreeMap<String, String>,
     pub(super) cleanup_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub(super) struct LaunchFailure {
+    pub(super) error: io::Error,
+    /// False when a PATH-only candidate found a live job and selected a new
+    /// conversation instead. Its startup error is not a failed resume.
+    pub(super) resume_selected: bool,
+    /// Proof from this launch or an authoritative rollback, never its error kind.
+    pub(super) job_absence_confirmed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -107,19 +130,53 @@ pub(super) async fn launch(
     generation: &str,
     purpose: SessionPurpose,
     requested_session_id: Option<&str>,
-) -> io::Result<LaunchedClaude> {
-    launch_inner(prepared, cwd, generation, purpose, requested_session_id).await
+    cold_only: bool,
+) -> Result<LaunchedClaude, LaunchFailure> {
+    let mut resume_selected = requested_session_id.is_some();
+    let mut job_absence_confirmed = true;
+    launch_inner(
+        prepared,
+        cwd,
+        generation,
+        purpose,
+        requested_session_id,
+        cold_only,
+        &mut resume_selected,
+        &mut job_absence_confirmed,
+    )
+    .await
+    .map_err(|error| LaunchFailure {
+        error,
+        resume_selected,
+        job_absence_confirmed,
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn launch_inner(
     prepared: command::PreparedClaude,
     cwd: &Path,
     generation: &str,
     purpose: SessionPurpose,
-    requested_session_id: Option<&str>,
+    mut requested_session_id: Option<&str>,
+    cold_only: bool,
+    resume_selected: &mut bool,
+    job_absence_confirmed: &mut bool,
 ) -> io::Result<LaunchedClaude> {
     command::require_supported_version(&prepared.executable, cwd, &prepared.launch_environment)
         .await?;
+    let live_job = if let Some(session_id) = requested_session_id {
+        validate_session_id(session_id)?;
+        find_live_job(&prepared.config_dir, session_id).await?
+    } else {
+        None
+    };
+    if cold_only && live_job.is_some() {
+        // The existing worker may have work of its own and still uses the old
+        // PATH. Do not adopt or stop it; keep the prior fresh-launch behavior.
+        requested_session_id = None;
+        *resume_selected = false;
+    }
     // Inspect durable job metadata BEFORE respawn can replace it. A receipt
     // alone does not imply that this session ever received its first prompt.
     let skip_existing_transcript = match requested_session_id {
@@ -127,22 +184,23 @@ async fn launch_inner(
         None => false,
     };
 
-    if let Some(session_id) = requested_session_id {
-        validate_session_id(session_id)?;
-        if let Some((endpoint, job)) = find_live_job(&prepared.config_dir, session_id).await? {
-            validate_worker_version(&job)?;
-            await_settled(&prepared.config_dir, &job, cwd).await?;
-            return connect_launched(
-                prepared,
-                endpoint,
-                job,
-                generation,
-                true,
-                skip_existing_transcript,
-                false,
-            )
-            .await;
-        }
+    if requested_session_id.is_some()
+        && let Some((endpoint, job)) = live_job
+    {
+        *job_absence_confirmed = false;
+        validate_worker_version(&job)?;
+        await_settled(&prepared.config_dir, &job, cwd).await?;
+        return connect_launched(
+            prepared,
+            endpoint,
+            job,
+            generation,
+            true,
+            skip_existing_transcript,
+            false,
+            job_absence_confirmed,
+        )
+        .await;
     }
 
     let name = format!(
@@ -154,6 +212,11 @@ async fn launch_inner(
         },
         &generation[..generation.len().min(8)]
     );
+    let rollback_name = (purpose == SessionPurpose::Actor
+        && crate::session_owner::is_owner()
+        && requested_session_id.is_none())
+    .then(|| name.clone());
+    let rollback_config = prepared.config_dir.clone();
     let mut arguments = Vec::new();
     if let Some(session_id) = requested_session_id {
         // Agent View resumes the exact durable session only when no launch
@@ -176,91 +239,99 @@ async fn launch_inner(
         .env_clear()
         .envs(&prepared.launch_environment)
         .kill_on_drop(true);
-    let output = tokio::time::timeout(LAUNCH_TIMEOUT, command.output())
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Claude Agent View launch timed out",
-            )
-        })??;
-    let output_bytes = output.stdout.len().saturating_add(output.stderr.len());
-    if output_bytes > MAX_LAUNCH_OUTPUT_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Claude Agent View launch output exceeded its limit",
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
-        let detail = nonempty_detail(&stderr, &stdout);
-        if let Some(error) = workspace_trust::WorkspaceUntrusted::from_refusal(
-            detail,
-            cwd,
-            &prepared.executable,
-            &prepared.config_dir,
-        ) {
-            return Err(error);
-        }
-        let guidance = if detail
-            .contains("--bg with bypassPermissions requires accepting the disclaimer first")
-        {
-            format!(
-                " For this session, run the configured executable '{}' interactively with \
-                 --dangerously-skip-permissions and CLAUDE_CONFIG_DIR set to '{}'. \
-                 After accepting the disclaimer, exit that session and retry in CCCC.",
-                prepared.executable,
-                prepared.config_dir.display(),
-            )
-        } else {
-            String::new()
-        };
-        return Err(io::Error::other(format!(
-            "Claude Agent View launch failed: {detail}{guidance}"
-        )));
-    }
-    let short = parse_short_id(&stdout)
-        .or_else(|| parse_short_id(&stderr))
-        .ok_or_else(|| {
-            io::Error::new(
+    *job_absence_confirmed = false;
+    let result = async {
+        let output = tokio::time::timeout(LAUNCH_TIMEOUT, command.output())
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Claude Agent View launch timed out",
+                )
+            })??;
+        let output_bytes = output.stdout.len().saturating_add(output.stderr.len());
+        if output_bytes > MAX_LAUNCH_OUTPUT_BYTES {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Claude Agent View launch did not identify its managed session",
-            )
-        })?;
-    let (endpoint, job) = match wait_for_job(&prepared.config_dir, &short).await {
-        Ok(value) => value,
-        Err(error) => {
-            let rollback = rollback_started_job(&prepared.config_dir, &short).await;
+                "Claude Agent View launch output exceeded its limit",
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            let detail = nonempty_detail(&stderr, &stdout);
+            if let Some(error) = workspace_trust::WorkspaceUntrusted::from_refusal(
+                detail,
+                cwd,
+                ConfirmationLaunch::from_prepared(&prepared),
+            ) {
+                *job_absence_confirmed = true;
+                return Err(error);
+            }
+            if let Some(error) = confirmation::refusal(detail, cwd, &prepared) {
+                *job_absence_confirmed = true;
+                return Err(error);
+            }
+            return Err(io::Error::other(format!(
+                "Claude Agent View launch failed: {detail}"
+            )));
+        }
+        let short = parse_short_id(&stdout)
+            .or_else(|| parse_short_id(&stderr))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Claude Agent View launch did not identify its managed session",
+                )
+            })?;
+        let (endpoint, job) = match wait_for_job(&prepared.config_dir, &short).await {
+            Ok(value) => value,
+            Err(error) => {
+                let rollback = rollback_started_job(&prepared.config_dir, &short).await;
+                *job_absence_confirmed = rollback.is_ok();
+                return Err(with_optional_cleanup_error(error, rollback.err()));
+            }
+        };
+        if let Err(error) = validate_worker_version(&job) {
+            let rollback = kill_and_confirm(&endpoint, &job.short).await;
+            *job_absence_confirmed = rollback.is_ok();
             return Err(with_optional_cleanup_error(error, rollback.err()));
         }
-    };
-    if let Err(error) = validate_worker_version(&job) {
-        let rollback = kill_and_confirm(&endpoint, &job.short).await;
-        return Err(with_optional_cleanup_error(error, rollback.err()));
+        if let Some(expected) = requested_session_id
+            && job.session_id != expected
+        {
+            let error = resume_failure::Rejection::CopiedSession.error();
+            let rollback = kill_and_confirm(&endpoint, &job.short).await;
+            *job_absence_confirmed = rollback.is_ok();
+            return Err(with_optional_cleanup_error(error, rollback.err()));
+        }
+        if let Err(error) = await_settled(&prepared.config_dir, &job, cwd).await {
+            let rollback = kill_and_confirm(&endpoint, &job.short).await;
+            *job_absence_confirmed = rollback.is_ok();
+            return Err(with_optional_cleanup_error(error, rollback.err()));
+        }
+        let resumed = requested_session_id.is_some();
+        connect_launched(
+            prepared,
+            endpoint,
+            job,
+            generation,
+            resumed,
+            skip_existing_transcript,
+            true,
+            job_absence_confirmed,
+        )
+        .await
     }
-    if let Some(expected) = requested_session_id
-        && job.session_id != expected
+    .await;
+    if result.is_err()
+        && !*job_absence_confirmed
+        && let Some(name) = rollback_name
+        && rollback_named_job(&rollback_config, &name).await.is_ok()
     {
-        let error = resume_failure::Rejection::CopiedSession.error();
-        let rollback = kill_and_confirm(&endpoint, &job.short).await;
-        return Err(with_optional_cleanup_error(error, rollback.err()));
+        *job_absence_confirmed = true;
     }
-    if let Err(error) = await_settled(&prepared.config_dir, &job, cwd).await {
-        let rollback = kill_and_confirm(&endpoint, &job.short).await;
-        return Err(with_optional_cleanup_error(error, rollback.err()));
-    }
-    let resumed = requested_session_id.is_some();
-    connect_launched(
-        prepared,
-        endpoint,
-        job,
-        generation,
-        resumed,
-        skip_existing_transcript,
-        true,
-    )
-    .await
+    result
 }
 
 fn known_empty_session(config_dir: &Path, session_id: &str) -> io::Result<bool> {
@@ -341,6 +412,7 @@ async fn connect_launched(
     resumed: bool,
     skip_existing_transcript: bool,
     rollback_on_failure: bool,
+    job_absence_confirmed: &mut bool,
 ) -> io::Result<LaunchedClaude> {
     let state_path = prepared
         .config_dir
@@ -365,6 +437,7 @@ async fn connect_launched(
                 Ok(endpoint) => kill_and_confirm(&endpoint, &job.short).await,
                 Err(error) => Err(error),
             };
+            *job_absence_confirmed = rollback.is_ok();
             return Err(with_optional_cleanup_error(error, rollback.err()));
         }
         Err(error) => return Err(error),
@@ -476,6 +549,45 @@ async fn wait_for_job(config_dir: &Path, short: &str) -> io::Result<(control::En
     }
 }
 
+/// Only a new launch carrying this exact name may use this observation. Resume
+/// and adoption can retain another name and must keep their unknown evidence.
+async fn rollback_named_job(config_dir: &Path, name: &str) -> io::Result<()> {
+    let endpoint = control::Endpoint::resolve(config_dir)?;
+    let jobs = control::list(&endpoint).await?;
+    let mut matching = None;
+    for job in jobs {
+        let actual_name = job.get("name").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "job listing omits launch names")
+        })?;
+        if !actual_name.is_null() && !actual_name.is_string() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid job launch name",
+            ));
+        }
+        if actual_name.as_str() != Some(name) {
+            continue;
+        }
+        let short = job
+            .get("short")
+            .and_then(Value::as_str)
+            .filter(|short| valid_short_id(short))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "named job has no valid short id",
+                )
+            })?;
+        if matching.replace(short.to_owned()).is_some() {
+            return Err(io::Error::other("multiple jobs match this launch name"));
+        }
+    }
+    if let Some(short) = matching {
+        kill_and_confirm(&endpoint, &short).await?;
+    }
+    Ok(())
+}
+
 async fn rollback_started_job(config_dir: &Path, short: &str) -> io::Result<()> {
     let endpoint = control::Endpoint::resolve(config_dir)?;
     let jobs = control::list(&endpoint).await?;
@@ -489,6 +601,19 @@ async fn rollback_started_job(config_dir: &Path, short: &str) -> io::Result<()> 
 }
 
 async fn kill_and_confirm(endpoint: &control::Endpoint, short: &str) -> io::Result<()> {
+    confirm_job_removal(endpoint, short)
+        .await
+        .map_err(unconfirmed_stop)
+}
+
+fn unconfirmed_stop(error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("Claude Agent View stop unconfirmed; ownership retained: {error}"),
+    )
+}
+
+async fn confirm_job_removal(endpoint: &control::Endpoint, short: &str) -> io::Result<()> {
     let mut kill_error = None;
     match control::list(endpoint).await {
         Ok(jobs)
@@ -507,6 +632,9 @@ async fn kill_and_confirm(endpoint: &control::Endpoint, short: &str) -> io::Resu
     }
     let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
     let mut last_error: Option<io::Error>;
+    // Agent View jobs can outlive their control harness. This adapter owns a
+    // job identifier, not a process identity it can verify has exited, so only
+    // a successful authoritative listing without that job confirms removal.
     loop {
         match control::list(endpoint).await {
             Ok(jobs)
@@ -516,8 +644,12 @@ async fn kill_and_confirm(endpoint: &control::Endpoint, short: &str) -> io::Resu
             {
                 return Ok(());
             }
-            Ok(_) => last_error = None,
-            Err(error) if retryable_control_error(&error) => last_error = Some(error),
+            Ok(_) => {
+                last_error = None;
+            }
+            Err(error) if retryable_control_error(&error) => {
+                last_error = Some(error);
+            }
             Err(error) => return Err(error),
         }
         if tokio::time::Instant::now() >= deadline {
@@ -529,7 +661,7 @@ async fn kill_and_confirm(endpoint: &control::Endpoint, short: &str) -> io::Resu
                 .unwrap_or_default();
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("Claude Agent View task did not stop{observation}{kill}"),
+                format!("job removal was not confirmed{observation}{kill}"),
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -909,12 +1041,12 @@ impl ClaudeClient {
             tokio::time::timeout(STOP_TIMEOUT + Duration::from_secs(1), receiver)
                 .await
                 .map_err(|_| {
-                    io::Error::new(
+                    unconfirmed_stop(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "Claude managed-session stop confirmation timed out",
-                    )
+                        "stop confirmation timed out",
+                    ))
                 })?
-                .map_err(|_| closed_error())??;
+                .map_err(|_| unconfirmed_stop(closed_error()))??;
         } else {
             kill_and_confirm(&self.endpoint, &self.short).await?;
         }
@@ -1496,6 +1628,44 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn only_native_prelaunch_refusals_prove_absence_after_an_unsuccessful_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("isolated test directory");
+        for (detail, absent) in [
+            (
+                "--bg with bypassPermissions requires accepting the disclaimer first",
+                true,
+            ),
+            ("background launcher failed unexpectedly", false),
+        ] {
+            let executable = temp.path().join("fake-claude");
+            std::fs::write(&executable, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.281 (Claude Code)'; exit 0; fi\nprintf '%s\\n' '{detail}' >&2\nexit 1\n")).expect("write fixture file");
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                .expect("make fake provider executable");
+            let result = launch(
+                command::PreparedClaude {
+                    executable: executable.to_string_lossy().into_owned(),
+                    arguments: Vec::new(),
+                    launch_environment: BTreeMap::new(),
+                    config_dir: temp.path().join("config"),
+                    settings_path: temp.path().join("settings.json"),
+                },
+                temp.path(),
+                "test-generation",
+                SessionPurpose::Actor,
+                None,
+                false,
+            )
+            .await;
+            let Err(failure) = result else {
+                panic!("fixture must refuse launch");
+            };
+            assert_eq!(failure.job_absence_confirmed, absent, "{detail}");
+        }
+    }
+
+    #[cfg(unix)]
     struct ControlDirectory(PathBuf);
 
     #[cfg(unix)]
@@ -1538,6 +1708,83 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(control_dir.join("control.sock"))
             .expect("control socket");
         (config_dir, listener, guard)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_rollback_confirms_only_its_exact_job_and_refuses_incomplete_lists() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for (initial, confirmed, kills) in [
+            (json!([]), true, 0),
+            (
+                json!([{"name":"another-member","short":"11111111"}]),
+                true,
+                0,
+            ),
+            (
+                json!([{"name":"cccc-actor-fixture","short":"abcdef12"},{"name":"another-member","short":"11111111"}]),
+                true,
+                1,
+            ),
+            (json!([{"short":"abcdef12"}]), false, 0),
+            (
+                json!([{"name":"cccc-actor-fixture","short":"bad"}]),
+                false,
+                0,
+            ),
+            (
+                json!([{"name":"cccc-actor-fixture","short":"abcdef12"},{"name":"cccc-actor-fixture","short":"12345678"}]),
+                false,
+                0,
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("isolated test directory");
+            let (config, listener, _directory) = bind_fake_control(&temp.path().join("config"));
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = seen.clone();
+            let server = tokio::spawn(async move {
+                let mut jobs = initial.as_array().expect("array result").clone();
+                loop {
+                    let (stream, _) = listener
+                        .accept()
+                        .await
+                        .expect("accept fake control connection");
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    stream
+                        .read_line(&mut line)
+                        .await
+                        .expect("read fake control request");
+                    let request: Value =
+                        serde_json::from_str(&line).expect("decode test protocol frame");
+                    let response = match request["op"].as_str().expect("string result") {
+                        "list" => json!({"ok":true,"op":"list","jobs":jobs}),
+                        "kill" => {
+                            let short =
+                                request["short"].as_str().expect("string result").to_owned();
+                            recorded
+                                .lock()
+                                .expect("fixture registry lock")
+                                .push(short.clone());
+                            jobs.retain(|job| job["short"] != short);
+                            json!({"ok":true,"op":"kill"})
+                        }
+                        other => panic!("unexpected operation {other}"),
+                    };
+                    stream
+                        .get_mut()
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .expect("write fake control response");
+                }
+            });
+            let result = rollback_named_job(&config, "cccc-actor-fixture").await;
+            server.abort();
+            assert_eq!(result.is_ok(), confirmed, "{result:?}");
+            let seen = seen.lock().expect("fixture registry lock");
+            assert_eq!(seen.len(), kills);
+            assert!(seen.iter().all(|short| short == "abcdef12"));
+        }
     }
 
     #[test]
@@ -2232,6 +2479,7 @@ mod tests {
             "generation-12345678",
             SessionPurpose::Actor,
             re_adopt.then_some(session_id),
+            false,
         )
         .await
         .expect("launch Agent View");
@@ -2534,6 +2782,154 @@ mod tests {
             "{:?}",
             fixture.operations()
         );
+    }
+
+    /// A missing endpoint cannot establish whether the managed job exited.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_is_unconfirmed_when_the_endpoint_stays_missing() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(config_dir.join("daemon")).expect("daemon config");
+        let control_key = config_dir.join("daemon/control.key");
+        std::fs::write(&control_key, "0123456789abcdef0123456789abcdef\n").expect("key");
+        std::fs::set_permissions(&control_key, std::fs::Permissions::from_mode(0o600))
+            .expect("key permissions");
+        let config_dir = config_dir.canonicalize().expect("canonical config");
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(config_dir.to_string_lossy().as_bytes())
+        );
+        let control_dir = Path::new("/tmp")
+            .join(format!(
+                "cc-daemon-{}",
+                config_dir.metadata().expect("metadata").uid()
+            ))
+            .join(&digest[..8]);
+        std::fs::create_dir_all(&control_dir).expect("control directory");
+        std::fs::set_permissions(&control_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("control directory permissions");
+        let _guard = ControlDirectory(control_dir); // no control.sock is bound
+
+        let endpoint = control::Endpoint::resolve(&config_dir).expect("endpoint resolves");
+        let started = std::time::Instant::now();
+        let error = kill_and_confirm(&endpoint, "deadbeef")
+            .await
+            .expect_err("a missing endpoint cannot confirm job removal");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("stop unconfirmed"), "{error}");
+        assert!(
+            started.elapsed() >= STOP_TIMEOUT,
+            "a missing endpoint must allow time for authoritative confirmation: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A task that stays listed keeps the full timeout: a stuck Agent View
+    /// job must still fail the stop, not masquerade as gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_still_times_out_when_the_task_stays_listed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("config");
+        let (config_dir, listener, _guard) = bind_fake_control(&config_dir);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut line = Vec::new();
+                let mut byte = [0u8; 1];
+                while tokio::io::AsyncReadExt::read(&mut stream, &mut byte)
+                    .await
+                    .expect("read")
+                    > 0
+                {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    line.push(byte[0]);
+                }
+                let request: Value = serde_json::from_slice(&line).expect("request json");
+                let op = request.get("op").and_then(Value::as_str).unwrap_or("");
+                let response = match op {
+                    "list" => json!({"ok":true,"op":"list","jobs":[{"short":"deadbeef"}]}),
+                    "kill" => json!({"ok":true,"op":"kill"}),
+                    _ => json!({"ok":false,"op":op,"code":"EPROTO","error":"unexpected op"}),
+                };
+                let mut bytes = serde_json::to_vec(&response).expect("response");
+                bytes.push(b'\n');
+                tokio::io::AsyncWriteExt::write_all(&mut stream, &bytes)
+                    .await
+                    .expect("write");
+            }
+        });
+        let endpoint = control::Endpoint::resolve(&config_dir).expect("endpoint resolves");
+        let error = kill_and_confirm(&endpoint, "deadbeef")
+            .await
+            .expect_err("a stuck task still fails the stop");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("stop unconfirmed"), "{error}");
+        server.abort();
+    }
+
+    /// A stale socket is not proof that the managed job has exited. Its owned
+    /// directory is still cleaned by the test's guard after the failed stop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_is_unconfirmed_when_a_stale_socket_refuses_connections() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (config_dir, listener, _guard) = bind_fake_control(&temp.path().join("config"));
+        // The socket file outlives its listener, so connecting is refused.
+        drop(listener);
+        let endpoint = control::Endpoint::resolve(&config_dir).expect("endpoint resolves");
+        let started = std::time::Instant::now();
+        let error = kill_and_confirm(&endpoint, "deadbeef")
+            .await
+            .expect_err("a stale socket cannot confirm job removal");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("stop unconfirmed"), "{error}");
+        assert!(started.elapsed() >= STOP_TIMEOUT, "{:?}", started.elapsed());
+        let socket = _guard.0.join("control.sock");
+        assert!(socket.exists(), "unconfirmed stop preserves the socket");
+        drop(_guard);
+        assert!(!socket.exists(), "the owner can still clean a stale socket");
+    }
+
+    /// Neither missing nor refused observations confirm managed job removal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_is_unconfirmed_when_the_endpoint_alternates_missing_and_refused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (config_dir, listener, guard) = bind_fake_control(&temp.path().join("config"));
+        let socket = guard.0.join("control.sock");
+        drop(listener);
+        let alternating = Arc::new(AtomicBool::new(true));
+        let alternate = {
+            let alternating = Arc::clone(&alternating);
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                while alternating.load(Ordering::Acquire) {
+                    if socket.exists() {
+                        // NotFound from here on.
+                        let _ = std::fs::remove_file(&socket);
+                    } else {
+                        // ConnectionRefused from here on: bound, never accepted.
+                        drop(std::os::unix::net::UnixListener::bind(&socket).expect("rebind"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+        let endpoint = control::Endpoint::resolve(&config_dir).expect("endpoint resolves");
+        let started = std::time::Instant::now();
+        let stopped = kill_and_confirm(&endpoint, "deadbeef").await;
+        alternating.store(false, Ordering::Release);
+        alternate.await.expect("alternating endpoint");
+        let error = stopped.expect_err("endpoint absence cannot confirm job removal");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("stop unconfirmed"), "{error}");
+        assert!(started.elapsed() >= STOP_TIMEOUT, "{:?}", started.elapsed());
     }
 }
 

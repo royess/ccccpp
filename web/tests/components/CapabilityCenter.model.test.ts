@@ -1,16 +1,19 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  capabilityCenterDisableScopes,
   capabilityCenterDisplayName,
   capabilityCenterFilterItemsForSystemVisibility,
   capabilityCenterRemovalAction,
   capabilityCenterFrameClass,
   capabilityCenterRootClass,
   capabilityCenterSourceRemovalAction,
+  capabilityCenterStateReadable,
   capabilityCenterSourcesGridClass,
   capabilityCenterSectionTypeFilter,
   capabilityCenterPageRange,
   capabilityCenterPaginationMode,
+  capabilityCenterTurnOff,
   capabilityCenterType,
   filterCapabilityCenterRemovedItems,
   filterCapabilityCenterItems,
@@ -18,7 +21,11 @@ import {
   normalizeCapabilityCenterPagination,
   summarizeCapabilityCenter,
 } from "../../src/components/capabilities/capabilityCenterModel";
-import type { CapabilityOverviewItem, CapabilityStateResult } from "../../src/types";
+import type {
+  CapabilityOverviewItem,
+  CapabilityStateResult,
+  CapabilityUsageSummary,
+} from "../../src/types";
 
 function row(
   overrides: Partial<CapabilityOverviewItem> & { capability_id: string },
@@ -236,7 +243,7 @@ describe("CapabilityCenter model", () => {
         row({ capability_id: "pack:diagnostics", kind: "pack", source_id: "cccc_builtin" }),
         { enabled: true },
       ),
-    ).toBe("disable");
+    ).toBe("none");
     expect(
       capabilityCenterRemovalAction(
         row({
@@ -298,75 +305,46 @@ describe("CapabilityCenter model", () => {
 
   it("only allows deleting user-owned capability sources", () => {
     expect(
-      capabilityCenterSourceRemovalAction({
-        source_id: "manual_import",
-        enabled: true,
-        record_count: 3,
-      }),
+      capabilityCenterSourceRemovalAction({ source_id: "manual_import", record_count: 3 }),
     ).toBe("delete");
     expect(
-      capabilityCenterSourceRemovalAction({
-        source_id: "github_import",
-        enabled: true,
-        record_count: 2,
-      }),
+      capabilityCenterSourceRemovalAction({ source_id: "github_import", record_count: 2 }),
+    ).toBe("delete");
+    expect(capabilityCenterSourceRemovalAction({ source_id: "url_import", record_count: 1 })).toBe(
+      "delete",
+    );
+    expect(
+      capabilityCenterSourceRemovalAction({ source_id: "local_import", record_count: 1 }),
     ).toBe("delete");
     expect(
-      capabilityCenterSourceRemovalAction({
-        source_id: "url_import",
-        enabled: true,
-        record_count: 1,
-      }),
+      capabilityCenterSourceRemovalAction({ source_id: "agent_self_proposed", record_count: 1 }),
     ).toBe("delete");
     expect(
-      capabilityCenterSourceRemovalAction({
-        source_id: "local_import",
-        enabled: true,
-        record_count: 1,
-      }),
-    ).toBe("delete");
-    expect(
-      capabilityCenterSourceRemovalAction({
-        source_id: "agent_self_proposed",
-        enabled: true,
-        record_count: 1,
-      }),
-    ).toBe("delete");
-    expect(
-      capabilityCenterSourceRemovalAction({
-        source_id: "github_skills_curated",
-        enabled: true,
-        record_count: 49,
-      }),
+      capabilityCenterSourceRemovalAction({ source_id: "github_skills_curated", record_count: 49 }),
     ).toBe("none");
     expect(
       capabilityCenterSourceRemovalAction({
         source_id: "mcp_registry_official",
-        enabled: true,
         record_count: 1450,
       }),
     ).toBe("none");
     expect(
-      capabilityCenterSourceRemovalAction({
-        source_id: "cccc_builtin",
-        enabled: true,
-        record_count: 34,
-      }),
+      capabilityCenterSourceRemovalAction({ source_id: "cccc_builtin", record_count: 34 }),
     ).toBe("none");
   });
 
-  it("reserves a stable actions column for source rows with and without delete", () => {
-    const gridClass = capabilityCenterSourcesGridClass();
-
-    expect(gridClass).toContain("_76px]");
-    expect(gridClass).toContain("md:grid-cols");
+  it("gives source rows a name column and room for the delete action", () => {
+    expect(capabilityCenterSourcesGridClass()).toContain("grid-cols-[minmax(0,1fr)_auto]");
   });
 
-  it("keeps the page shell viewport-bound so only the center content scrolls", () => {
-    expect(capabilityCenterRootClass("page")).toContain("h-dvh");
-    expect(capabilityCenterRootClass("page")).toContain("overflow-hidden");
-    expect(capabilityCenterFrameClass("page")).toContain("h-dvh");
-    expect(capabilityCenterFrameClass("page")).not.toContain("min-h-dvh");
+  it("covers the panel it opened from, clear of the phone's notch and home bar, and scrolls only inside", () => {
+    const root = capabilityCenterRootClass();
+    expect(root).toContain("fixed inset-0");
+    expect(root).toContain("overflow-hidden");
+    for (const side of ["top", "right", "bottom", "left"]) {
+      expect(root).toContain(`env(safe-area-inset-${side},0px)`);
+    }
+    expect(capabilityCenterFrameClass()).toContain("min-h-0");
   });
 
   it("hides readonly builtin system rows by default but preserves search discoverability", () => {
@@ -414,5 +392,88 @@ describe("CapabilityCenter model", () => {
         state,
       }).map((item) => item.capability_id),
     ).toEqual(["pack:diagnostics", "mcp:github/chrome-devtools-mcp", "pack:enabled-builtin"]);
+  });
+
+  it("turns off the Group binding and only the user's own bindings, as the usage reports them", () => {
+    const usage = (fields: Partial<CapabilityUsageSummary>): CapabilityUsageSummary => ({
+      capability_id: "pack:diagnostics",
+      used: true,
+      group_enabled: false,
+      actor_enabled: [],
+      session_enabled: [],
+      ...fields,
+    });
+    const user = { actor_id: "user" };
+    const peer = { actor_id: "codex-1" };
+
+    expect(capabilityCenterDisableScopes(null)).toBeNull();
+    // A usage without one of the three fields is not read as "none".
+    for (const field of ["group_enabled", "actor_enabled", "session_enabled"] as const) {
+      expect(capabilityCenterDisableScopes(usage({ [field]: undefined }))).toBeNull();
+    }
+    expect(capabilityCenterDisableScopes(usage({ group_enabled: true }))).toEqual(["group"]);
+    expect(capabilityCenterDisableScopes(usage({ session_enabled: [user] }))).toEqual(["session"]);
+    expect(capabilityCenterDisableScopes(usage({ actor_enabled: [user] }))).toEqual(["actor"]);
+    expect(
+      capabilityCenterDisableScopes(usage({ group_enabled: true, session_enabled: [peer, user] })),
+    ).toEqual(["group", "session"]);
+    // Bindings another Actor made for itself are left alone.
+    expect(
+      capabilityCenterDisableScopes(usage({ actor_enabled: [peer], session_enabled: [peer] })),
+    ).toEqual([]);
+  });
+
+  it("does not take a state without its enabled list as nothing enabled", () => {
+    expect(capabilityCenterStateReadable(null)).toBe(false);
+    expect(capabilityCenterStateReadable({} as CapabilityStateResult)).toBe(false);
+    expect(
+      capabilityCenterStateReadable({
+        enabled_capabilities: "pack:x",
+      } as unknown as CapabilityStateResult),
+    ).toBe(false);
+    expect(
+      capabilityCenterStateReadable({ enabled_capabilities: [] } as CapabilityStateResult),
+    ).toBe(true);
+  });
+
+  it("writes nothing without usage and confirms only the writes that succeeded", async () => {
+    const run = async (usage: CapabilityUsageSummary | null, failing?: string) => {
+      const written: string[] = [];
+      const outcome = await capabilityCenterTurnOff({
+        readUsage: async () => usage,
+        turnOff: async (scope) => {
+          written.push(scope);
+          return scope !== failing;
+        },
+      });
+      return { ...outcome, written };
+    };
+    const both: CapabilityUsageSummary = {
+      capability_id: "pack:diagnostics",
+      used: true,
+      group_enabled: true,
+      actor_enabled: [{ actor_id: "user" }],
+      session_enabled: [{ actor_id: "user" }],
+    };
+
+    expect(await run(null)).toEqual({ result: "unread", confirmed: false, written: [] });
+    expect(await run(both)).toEqual({
+      result: "done",
+      confirmed: true,
+      written: ["group", "actor", "session"],
+    });
+    expect(await run(both, "group")).toEqual({
+      result: "failed",
+      confirmed: false,
+      written: ["group"],
+    });
+    expect(await run(both, "actor")).toEqual({
+      result: "failed",
+      confirmed: true,
+      written: ["group", "actor"],
+    });
+    expect(
+      await run({ ...both, group_enabled: false, actor_enabled: [], session_enabled: [] }),
+    ).toEqual({ result: "done", confirmed: false, written: [] });
   });
 });

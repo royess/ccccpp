@@ -26,7 +26,7 @@ The pencil beside the name edits the Group's name and description.
 ## 3. Add an Agent
 
 Use the **+** in the Agent bar near the composer. Choose an installed Runtime
-(for example, Claude Code or Codex), set an Actor ID and review the configuration.
+(for example, Claude Code or Codex), set an agent ID and review the configuration.
 Add the Agent when ready. The first Group coordinator has the **foreman** role;
 additional Agents can work as peers.
 
@@ -59,8 +59,8 @@ remaining Agents. Return to **Messages** to read replies or continue the discuss
 ## 5. Keep the work organized
 
 - **Project Context** (clipboard button in the header): **Tasks** opens the board
-  with an expandable working summary. **AGENTS.md** edits repository instructions,
-  and **Coordination log** records decisions and handoffs. **Agent State** shows
+  with an expandable coordination brief. **AGENTS.md** edits repository instructions.
+  **Agent State** shows
   each Agent's latest saved report; it is not a live process monitor. **Skills**
   shows this Group's generated skill candidates.
 - **Files**: browse the workspace, preview supported files and inspect changes.

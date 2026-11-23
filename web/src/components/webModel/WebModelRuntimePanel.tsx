@@ -16,7 +16,8 @@ import { HoverTooltip } from "../HoverTooltip";
 import { InfoIcon, RefreshIcon, SettingsIcon } from "../Icons";
 import { ProjectedBrowserSurfacePanel } from "../browser/ProjectedBrowserSurfacePanel";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
-import { WebModelConnectionStatus } from "./WebModelConnectionStatus";
+import { WebModelConnectionStatus, WebModelManagedConnection } from "./WebModelConnectionStatus";
+import { Button } from "../ui/button";
 
 interface WebModelRuntimePanelProps {
   groupId: string;
@@ -25,7 +26,9 @@ interface WebModelRuntimePanelProps {
   isDark: boolean;
   isVisible: boolean;
   readOnly?: boolean;
+  canAccessConnection?: boolean;
   compact?: boolean;
+  onOpenSharedSettings?: () => void;
 }
 
 function iconButtonClass(primary = false): string {
@@ -38,6 +41,7 @@ function iconButtonClass(primary = false): string {
 }
 
 export function WebModelRuntimePanel(props: WebModelRuntimePanelProps) {
+  if (props.canAccessConnection === false) return <WebModelManagedConnection />;
   // A runtime change owns a different browser and must retire pending UI requests.
   return (
     <RuntimePanel key={`${props.groupId}/${props.actor.id}/${props.actor.runtime}`} {...props} />
@@ -52,14 +56,18 @@ function RuntimePanel({
   isVisible,
   readOnly,
   compact = false,
+  onOpenSharedSettings,
 }: WebModelRuntimePanelProps) {
-  const { t } = useTranslation("chat");
+  const { t, i18n } = useTranslation("chat");
   const openActorEditor = useModalStore((state) => state.openActorEditor);
   const [pairing, setPairing] = useState<WebModelPairing>();
   const [session, setSession] = useState<WebModelBrowserSession | null>(null);
   const [error, setError] = useState("");
   const [busyAction, setBusyAction] = useState("");
   const [surfaceRestartNonce, setSurfaceRestartNonce] = useState(0);
+  // Odd revisions reserve status for an explicit inspection. Cached polling
+  // must not overwrite that result with a read started before the check.
+  const statusRevisionRef = useRef(0);
   const currentSelectionRef = useRef({ groupId, actorId: String(actor.id || "").trim() });
   const actorId = String(actor.id || "").trim();
   currentSelectionRef.current = { groupId, actorId };
@@ -80,12 +88,13 @@ function RuntimePanel({
     setBusyAction("load");
     let loading = false;
     const load = (initial: boolean) => {
-      if (loading) return;
+      if (loading || statusRevisionRef.current % 2 !== 0) return;
+      const revision = statusRevisionRef.current;
       loading = true;
       void api
         .fetchWebModelBrowserSession(groupId, actorId, { inspect: false })
         .then((resp) => {
-          if (cancelled) return;
+          if (cancelled || statusRevisionRef.current !== revision) return;
           if (!resp.ok) {
             setError(resp.error?.message || t("webModelDelivery.statusFailed"));
             return;
@@ -95,7 +104,8 @@ function RuntimePanel({
           setError("");
         })
         .catch(() => {
-          if (!cancelled) setError(t("webModelDelivery.statusFailed"));
+          if (!cancelled && statusRevisionRef.current === revision)
+            setError(t("webModelDelivery.statusFailed"));
         })
         .finally(() => {
           loading = false;
@@ -144,6 +154,27 @@ function RuntimePanel({
     openActorEditor(actor, "chatgpt");
   };
 
+  const checkPage = async () => {
+    if (readOnly || busyAction || !session?.active) return;
+    statusRevisionRef.current += 1;
+    setBusyAction("check");
+    try {
+      const response = await api.fetchWebModelBrowserSession(groupId, actorId, { inspect: true });
+      if (!matchesWebModelActorSelection(currentSelectionRef.current, groupId, actorId)) return;
+      if (!response.ok) throw new Error(response.error.message);
+      setSession(response.result.browser_session);
+      setPairing(response.result.pairing);
+      setError("");
+    } catch {
+      if (matchesWebModelActorSelection(currentSelectionRef.current, groupId, actorId))
+        setError(t("webModelDelivery.statusFailed"));
+    } finally {
+      statusRevisionRef.current += 1;
+      if (matchesWebModelActorSelection(currentSelectionRef.current, groupId, actorId))
+        setBusyAction("");
+    }
+  };
+
   const updateDeliveryMode = async (mode: WebModelDeliveryMode) => {
     if (!groupId || !actorId || readOnly || busyAction) return;
     if ((session?.delivery_mode || "standard") === mode) return;
@@ -168,8 +199,14 @@ function RuntimePanel({
   };
 
   const loadBrowserSurfaceSession = useCallback(async () => {
+    const revision = statusRevisionRef.current;
     const resp = await api.fetchWebModelBrowserSurfaceSession(groupId, actorId, { inspect: false });
-    if (!matchesWebModelActorSelection(currentSelectionRef.current, groupId, actorId)) return resp;
+    if (
+      !matchesWebModelActorSelection(currentSelectionRef.current, groupId, actorId) ||
+      revision % 2 !== 0 ||
+      statusRevisionRef.current !== revision
+    )
+      return resp;
     if (resp.ok) {
       setSession(resp.result.browser_session || {});
       setPairing(resp.result.pairing);
@@ -215,6 +252,9 @@ function RuntimePanel({
 
   const deliveryState =
     session?.health_snapshot?.delivery?.state || session?.last_delivery_status || "";
+  const browserNeedsAttention = session?.ready === false || session?.active === false;
+  const connectionNeedsSetup =
+    pairing && !["bound", "waiting", "awaiting_confirmation"].includes(pairing.state);
   const deliveryNeedsAttention = ["ambiguous", "blocked", "failed"].includes(deliveryState);
   const activity = deliveryNeedsAttention
     ? t(`webModelDelivery.activity.${deliveryState}`)
@@ -223,7 +263,9 @@ function RuntimePanel({
       : ["pending", "pending_bind", "submitting"].includes(deliveryState)
         ? t("webModelDelivery.activity.submitting")
         : session?.last_delivery_at
-          ? t("webModelDelivery.activity.last", { time: formatTime(session.last_delivery_at) })
+          ? t("webModelDelivery.activity.last", {
+              time: formatTime(session.last_delivery_at, i18n?.language),
+            })
           : "";
   const surfaceDisabledMessage = !isVisible
     ? ""
@@ -251,7 +293,10 @@ function RuntimePanel({
             <span id="web-model-delivery-mode-scope" className="sr-only">
               {t("webModelDelivery.modeDescription")}
             </span>
-            <div className="inline-flex h-10 min-w-0 items-center rounded-xl border border-[var(--glass-border-subtle)] bg-[var(--glass-tab-bg)] p-1">
+            <div
+              className="inline-flex h-10 min-w-0 items-center rounded-xl border border-[var(--glass-border-subtle)] bg-[var(--glass-tab-bg)] p-1 pointer-coarse:h-auto"
+              data-web-model-delivery
+            >
               {(
                 [
                   {
@@ -293,16 +338,24 @@ function RuntimePanel({
                         />
                         <span
                           className={classNames(
-                            "inline-flex h-8 min-w-0 select-none items-center justify-center gap-1 rounded-lg border px-2.5 text-[11px] font-semibold transition-colors",
+                            "inline-flex h-8 min-w-0 select-none items-center justify-center gap-1 rounded-lg border px-2.5 text-[11px] font-semibold transition-colors pointer-coarse:min-h-[44px] pointer-coarse:min-w-[44px]",
                             "peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-[rgb(143,163,187)]/55 peer-focus-visible:ring-offset-1",
                             deliveryMode === option.mode
                               ? "border-[var(--glass-tab-border-active)] bg-[var(--glass-tab-bg-active)] text-[var(--color-text-primary)] shadow-[var(--glass-tab-shadow-active)]"
-                              : "border-transparent text-[var(--color-text-secondary)] hover:bg-[var(--glass-tab-bg-hover)] hover:text-[var(--color-text-primary)]",
+                              : classNames(
+                                  "border-transparent text-[var(--color-text-secondary)]",
+                                  // A disabled choice gives no hover feedback.
+                                  !deliveryModeDisabled &&
+                                    "hover:bg-[var(--glass-tab-bg-hover)] hover:text-[var(--color-text-primary)]",
+                                ),
                           )}
                         >
                           <span className="truncate">{option.label}</span>
                           {option.mode === "image_compat" ? (
-                            <span className="shrink-0 rounded-full bg-amber-500/15 px-1 py-px text-[8px] font-bold uppercase leading-3 tracking-wide text-amber-700 dark:text-amber-300">
+                            <span
+                              className="shrink-0 rounded-full bg-amber-500/15 px-1 py-px text-[8px] font-bold uppercase leading-3 tracking-wide text-amber-700 dark:text-amber-300"
+                              data-status-tone="warning"
+                            >
                               {t("webModelDelivery.modeImageCompatBadge")}
                             </span>
                           ) : null}
@@ -363,7 +416,7 @@ function RuntimePanel({
           </Popover>
         </>
       }
-      {!readOnly && (
+      {!readOnly && compact && (
         <button
           type="button"
           className="glass-btn px-3 py-2 inline-flex items-center gap-2"
@@ -384,6 +437,7 @@ function RuntimePanel({
         isDark ? "text-slate-100" : "text-[rgb(35,36,37)]",
       )}
       aria-label="ChatGPT Web Model runtime"
+      data-web-model-panel
     >
       <div
         className={classNames(
@@ -392,6 +446,7 @@ function RuntimePanel({
             : "shrink-0 rounded-2xl border px-2 py-2 shadow-[0_14px_42px_-38px_rgba(15,23,42,0.65)]",
           isDark ? "border-white/10 bg-white/[0.035]" : "border-black/[0.07] bg-white/[0.78]",
         )}
+        data-web-model-bar
       >
         <div
           className={
@@ -402,6 +457,27 @@ function RuntimePanel({
         >
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 px-1">
             <WebModelConnectionStatus pairing={pairing} session={session} />
+            {!readOnly && browserNeedsAttention && onOpenSharedSettings && (
+              <Button type="button" variant="outline" size="sm" onClick={onOpenSharedSettings}>
+                {t("settings:webModelActor.sharedLogin")}
+              </Button>
+            )}
+            {!readOnly && session?.active && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={Boolean(busyAction)}
+                onClick={() => void checkPage()}
+              >
+                {t("settings:webModelActor.checkPage")}
+              </Button>
+            )}
+            {!readOnly && !compact && connectionNeedsSetup && (
+              <Button type="button" variant="outline" size="sm" onClick={openSettings}>
+                {t("settings:webModelActor.configureConnection")}
+              </Button>
+            )}
             {activity && (
               <span
                 className={classNames(
@@ -410,6 +486,7 @@ function RuntimePanel({
                     ? "text-amber-700 dark:text-amber-300"
                     : "text-[var(--color-text-secondary)]",
                 )}
+                data-status-tone={deliveryNeedsAttention ? "warning" : undefined}
               >
                 {activity}
               </span>
@@ -425,6 +502,7 @@ function RuntimePanel({
                       className={iconButtonClass()}
                       aria-label={t("settings:title")}
                       title={t("settings:title")}
+                      data-lcd-key
                     >
                       <SettingsIcon size={17} aria-hidden="true" />
                     </button>
@@ -447,6 +525,7 @@ function RuntimePanel({
               className={iconButtonClass(false)}
               title={t("webModelDelivery.refreshPage")}
               aria-label={t("webModelDelivery.refreshPage")}
+              data-lcd-key
             >
               <RefreshIcon size={17} aria-hidden="true" />
             </button>
@@ -491,6 +570,7 @@ function RuntimePanel({
             "shrink-0 border-rose-500/20 bg-rose-500/10 px-3 py-2 text-xs leading-5 text-rose-700 dark:text-rose-300",
             compact ? "border-t" : "rounded-xl border",
           )}
+          data-status-tone="error"
         >
           {error}
         </div>

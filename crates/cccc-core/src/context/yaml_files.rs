@@ -23,10 +23,14 @@ pub(super) fn load_tasks(tasks_dir: &Path) -> io::Result<Vec<Map<String, Value>>
         .map(|path| {
             // An enumerated task must exist and remain readable. Treating it as
             // empty could recycle its ID and overwrite the user's original file.
-            let task = required_yaml_map(path)?;
+            let mut task = required_yaml_map(path)?;
             let id = task.get("id").and_then(Value::as_str);
             if id != path.file_stem().and_then(|stem| stem.to_str()) {
                 return Err(invalid_data(path, "task id must match its filename"));
+            }
+            let rev = task.entry("rev").or_insert(Value::from(0));
+            if rev.as_u64().is_none() {
+                return Err(invalid_data(path, "task rev must be an unsigned integer"));
             }
             Ok(task)
         })
@@ -87,9 +91,21 @@ pub(super) fn write_task_diff(
     after: &[Map<String, Value>],
 ) -> io::Result<()> {
     let before = task_map(before);
+    // Creates append in operation order: caller refs can only name earlier
+    // tasks. Keep that order across T999/T1000 instead of sorting filenames.
+    // Finish new targets before existing tasks can publish references to them.
+    for task in after {
+        if task
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !before.contains_key(id))
+        {
+            write_task(paths, task)?;
+        }
+    }
     let after = task_map(after);
     for (id, task) in &after {
-        if before.get(id) != Some(task) {
+        if before.get(id).is_some_and(|previous| previous != task) {
             write_task(paths, task)?;
         }
     }

@@ -2,6 +2,7 @@ use super::operation::{
     Operation,
     Policy::{Read, ResourceOwned, Write},
 };
+use crate::session_owner::runtime as cccc_runtime;
 use cccc_contracts::{ActorRole, DaemonRequest, RunnerKind};
 use cccc_core::{GroupDoc, GroupStore, HomeLayout};
 use serde_json::{Value, json};
@@ -31,6 +32,7 @@ pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
         "terminal_write" => Operation::new(ResourceOwned, session_control::write),
         "term_resize" | "terminal_resize" => Operation::new(Write, session_control::resize),
         "terminal_clear" => Operation::new(Write, session_control::clear),
+        "actor_terminal_ready" => Operation::new(ResourceOwned, session_control::ready),
         _ => return None,
     })
 }
@@ -206,7 +208,8 @@ fn load_pty_target(home: &HomeLayout, group_id: &str, actor_id: &str) -> Result<
         .map_err(|_| OpError::new("group_not_found", format!("group not found: {group_id}")))?;
     let actor = cccc_core::actors::find(&group, actor_id)
         .ok_or_else(|| OpError::new("actor_not_found", format!("actor not found: {actor_id}")))?;
-    if actor.runner != RunnerKind::Pty {
+    if actor.runner != RunnerKind::Pty && !super::actor_runtime::has_primary_pty(group_id, actor_id)
+    {
         let mut error = OpError::new(
             "not_pty_actor",
             "terminal operation is only available for PTY actors",

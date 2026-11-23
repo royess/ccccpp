@@ -41,6 +41,76 @@ async fn windows_reserved_port_retries_with_zero_and_returns_the_effective_liste
     );
     assert!(listener.local_addr().expect("effective address").port() > 0);
 }
+
+#[tokio::test]
+async fn occupied_requested_web_port_suggests_how_to_choose_another() {
+    use std::io;
+
+    for windows in [false, true] {
+        let error = web_listener::bind_web_listener_with(
+            "127.0.0.1",
+            8448,
+            windows,
+            |_host, _port| async {
+                Err(io::Error::new(io::ErrorKind::AddrInUse, "occupied fixture"))
+            },
+        )
+        .await
+        .expect_err("occupied requested port");
+        let message = error.to_string();
+        assert!(message.contains("127.0.0.1"), "{message}");
+        assert!(message.contains("8448"), "{message}");
+        assert!(
+            message.contains("for `cccc`, use `--port <port>`"),
+            "{message}"
+        );
+        assert!(format!("{error:?}").contains("occupied fixture"));
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::AddrInUse)
+        );
+    }
+}
+
+#[tokio::test]
+async fn other_web_bind_failures_do_not_claim_the_requested_port_is_occupied() {
+    use std::io;
+
+    // Windows may deny the requested port and then fail while finding an ephemeral port.
+    let fallback =
+        web_listener::bind_web_listener_with("127.0.0.1", 8448, true, |_host, port| async move {
+            if port == 8448 {
+                Err(io::Error::from_raw_os_error(10013))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "no ephemeral port",
+                ))
+            }
+        })
+        .await
+        .expect_err("ephemeral fallback failed");
+    assert_eq!(fallback.to_string(), "no ephemeral port");
+    assert_eq!(
+        fallback.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(io::ErrorKind::AddrInUse)
+    );
+
+    for (port, kind, detail) in [
+        (0, io::ErrorKind::AddrInUse, "no ephemeral port"),
+        (8448, io::ErrorKind::PermissionDenied, "binding denied"),
+    ] {
+        let error = web_listener::bind_web_listener_with(
+            "127.0.0.1",
+            port,
+            false,
+            move |_host, _port| async move { Err(io::Error::new(kind, detail)) },
+        )
+        .await
+        .expect_err("fixture bind failure");
+        assert_eq!(error.to_string(), detail);
+    }
+}
 use futures_util::StreamExt;
 use tower::ServiceExt;
 
@@ -56,6 +126,42 @@ async fn explicit_shutdown_stops_web_server() {
     .expect("Web shutdown timeout")
     .expect("Web result");
     assert!(result.port() > 0);
+}
+
+#[tokio::test]
+async fn supervised_listener_reports_its_actual_ephemeral_address() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let (address_tx, mut address_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_until_mode_supervised(
+        home,
+        "127.0.0.1",
+        0,
+        WebMode::Normal,
+        async {
+            let _ = stopped.await;
+        },
+        Some(Arc::new(move |address| {
+            let _ = address_tx.send(address);
+        })),
+    ));
+    let address = tokio::time::timeout(std::time::Duration::from_secs(2), address_rx.recv())
+        .await
+        .expect("listener callback timeout")
+        .expect("listener address");
+    assert!(address.port() > 0);
+    let ready = reqwest::get(format!("http://{address}/api/v1/ready"))
+        .await
+        .expect("ready request");
+    assert!(ready.status().is_success());
+    stop.send(()).expect("shutdown");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    assert!(matches!(outcome, ServeOutcome::Stopped(actual) if actual == address));
 }
 
 #[test]
@@ -271,4 +377,20 @@ async fn shutdown_closes_headless_sse_response() {
             .expect("headless SSE shutdown timeout")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn voice_shutdown_timeout_leaves_the_original_worker_running() {
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (finished, observed) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = released.await;
+        let _ = finished.send(());
+    });
+    await_codex_voice_shutdown(Some(task), std::time::Duration::from_millis(25)).await;
+    release.send(()).expect("worker still owns the receiver");
+    tokio::time::timeout(std::time::Duration::from_secs(1), observed)
+        .await
+        .expect("detached shutdown finishes")
+        .expect("worker was not cancelled");
 }

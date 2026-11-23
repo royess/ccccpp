@@ -1,6 +1,7 @@
 import type {
   AgentState,
   ActorRuntimeState,
+  BacklogSource,
   ContextDetailLevel,
   GroupContext,
   GroupPresentation,
@@ -16,10 +17,15 @@ import type {
   TaskChecklistItem,
 } from "../../types";
 import { frameResourceUrl } from "../../features/connect/protocol";
+import { frameAccessPaused } from "../../features/connect/frameAccess";
 
 export type ApiResponse<T> =
   | { ok: true; result: T; error?: null }
-  | { ok: false; result?: unknown; error: { code: string; message: string; details?: unknown } };
+  | {
+      ok: false;
+      result?: unknown;
+      error: { code: string; message: string; details?: unknown; httpStatus?: number };
+    };
 
 export type FetchContextOptions = {
   fresh?: boolean;
@@ -68,6 +74,17 @@ function clearAllReadRequestCaches(): void {
   recentReadGenerations.clear();
 }
 
+const authChangeListeners = new Set<() => void>();
+
+/** Run `listener` whenever this browser's credentials change: a sign-in, a sign-out, or a
+ *  session the server stopped accepting. What belonged to the previous person is dropped there. */
+export function onAuthChange(listener: () => void): () => void {
+  authChangeListeners.add(listener);
+  return () => {
+    authChangeListeners.delete(listener);
+  };
+}
+
 export function setAuthToken(token: string): void {
   clearAllReadRequestCaches();
   cachedToken = token;
@@ -76,6 +93,7 @@ export function setAuthToken(token: string): void {
   } catch {
     void 0;
   }
+  authChangeListeners.forEach((listener) => listener());
 }
 
 export function clearAuthToken(): void {
@@ -86,6 +104,7 @@ export function clearAuthToken(): void {
   } catch {
     void 0;
   }
+  authChangeListeners.forEach((listener) => listener());
 }
 
 export function setForceTokenLogin(): void {
@@ -173,8 +192,11 @@ export function refreshAuthTokenInUrl(url: string): string {
   }
 }
 
-function makeErrorResponse<T>(code: string, message: string): ApiResponse<T> {
-  return { ok: false, error: { code, message } };
+function makeErrorResponse<T>(code: string, message: string, httpStatus?: number): ApiResponse<T> {
+  return {
+    ok: false,
+    error: { code, message, ...(httpStatus === undefined ? {} : { httpStatus }) },
+  };
 }
 
 export function reuseSharedReadRequest<T>(
@@ -344,6 +366,17 @@ export function asStringArray(value: unknown): string[] {
   return value.map((item) => asString(item).trim()).filter(Boolean);
 }
 
+/** A source is whole or absent: a part of one cannot find its entry. */
+export function normalizeBacklogSource(value: unknown): BacklogSource | null {
+  const record = asRecord(value);
+  const source = {
+    scope_key: asString(record?.scope_key),
+    path: asString(record?.path),
+    entry_id: asString(record?.entry_id),
+  };
+  return source.scope_key && source.path && source.entry_id ? source : null;
+}
+
 function formatDaemonEndpoint(details: UnknownRecord | null): string {
   const endpoint = asRecord(details?.endpoint);
   if (!endpoint) return "";
@@ -405,11 +438,15 @@ export function normalizeApiResponse<T>(data: unknown): ApiResponse<T> {
 export function normalizeChecklistItem(value: unknown, index: number): TaskChecklistItem | null {
   const record = asRecord(value);
   if (!record) return null;
-  const text = asString(record.text).trim();
-  if (!text) return null;
-  const id = asString(record.id).trim() || `item-${index + 1}`;
-  const status = asString(record.status).trim() || "pending";
+  const text = asString(record.text);
+  if (!text.trim()) return null;
+  const id = asString(record.id) || `item-${index + 1}`;
+  const status = record.status == null ? record.status : asString(record.status);
   return { id, text, status };
+}
+
+export function isTaskRevision(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 export function normalizeTask(value: unknown): Task | null {
@@ -420,14 +457,28 @@ export function normalizeTask(value: unknown): Task | null {
 
   const title = asString(record.title).trim() || id;
   const outcome = asString(record.outcome);
-  const checklist = Array.isArray(record.checklist)
-    ? record.checklist
-        .map((item, index) => normalizeChecklistItem(item, index))
-        .filter((item): item is TaskChecklistItem => !!item)
-    : [];
+  const rawChecklist = Array.isArray(record.checklist) ? record.checklist : [];
+  const checklistIds = new Set(
+    rawChecklist.map((item) => asString(asRecord(item)?.id)).filter(Boolean),
+  );
+  let nextChecklistId = 1;
+  const checklist = rawChecklist
+    .map((item, index) => {
+      const normalized = normalizeChecklistItem(item, index);
+      if (!normalized) return null;
+      if (!asString(asRecord(item)?.id)) {
+        while (checklistIds.has(`item-${nextChecklistId}`)) nextChecklistId += 1;
+        normalized.id = `item-${nextChecklistId}`;
+        checklistIds.add(normalized.id);
+        nextChecklistId += 1;
+      }
+      return normalized;
+    })
+    .filter((item): item is TaskChecklistItem => !!item);
 
   return {
     id,
+    rev: isTaskRevision(record.rev) ? record.rev : undefined,
     title,
     outcome,
     status: asString(record.status).trim() || undefined,
@@ -435,6 +486,9 @@ export function normalizeTask(value: unknown): Task | null {
     priority: asOptionalString(record.priority),
     parent_id: asOptionalString(record.parent_id),
     blocked_by: asStringArray(record.blocked_by),
+    open_blocked_by: Array.isArray(record.open_blocked_by)
+      ? asStringArray(record.open_blocked_by)
+      : undefined,
     waiting_on: asString(record.waiting_on).trim() || undefined,
     handoff_to: asOptionalString(record.handoff_to),
     task_type: asOptionalString(record.task_type),
@@ -443,6 +497,7 @@ export function normalizeTask(value: unknown): Task | null {
     created_at: asOptionalString(record.created_at),
     updated_at: asOptionalString(record.updated_at),
     archived_from: asOptionalString(record.archived_from),
+    source: normalizeBacklogSource(record.source),
     progress:
       typeof record.progress === "number"
         ? record.progress
@@ -580,28 +635,6 @@ export function normalizeContext(raw: unknown): GroupContext {
           }
         : null,
       tasks,
-      recent_decisions: Array.isArray(coordination.recent_decisions)
-        ? coordination.recent_decisions
-            .map((item) => asRecord(item))
-            .filter((item): item is UnknownRecord => !!item)
-            .map((item) => ({
-              at: asOptionalString(item.at),
-              by: asOptionalString(item.by),
-              summary: asString(item.summary),
-              task_id: asOptionalString(item.task_id),
-            }))
-        : [],
-      recent_handoffs: Array.isArray(coordination.recent_handoffs)
-        ? coordination.recent_handoffs
-            .map((item) => asRecord(item))
-            .filter((item): item is UnknownRecord => !!item)
-            .map((item) => ({
-              at: asOptionalString(item.at),
-              by: asOptionalString(item.by),
-              summary: asString(item.summary),
-              task_id: asOptionalString(item.task_id),
-            }))
-        : [],
     },
     agent_states: agentStates,
     actors_runtime: actorsRuntime,
@@ -741,6 +774,7 @@ export function normalizePresentationBrowserSurfaceState(
       : null,
     strategy: asOptionalString(record.strategy),
     url: asOptionalString(record.url),
+    initial_url: asOptionalString(record.initial_url),
     width: Number.isFinite(Number(record.width)) ? Number(record.width) : 0,
     height: Number.isFinite(Number(record.height)) ? Number(record.height) : 0,
     started_at: asOptionalString(record.started_at),
@@ -774,6 +808,25 @@ export function normalizePresentationBrowserSurfaceState(
 }
 
 export async function apiJson<T>(path: string, init?: RequestInit): Promise<ApiResponse<T>> {
+  if (frameAccessPaused()) {
+    return makeErrorResponse("NETWORK_ERROR", "The remote workspace is reconnecting.");
+  }
+  return apiJsonRequest<T>(path, init, true);
+}
+
+// Only Connect's admission checks use this while an embedded page is paused.
+export async function apiFrameControl<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<ApiResponse<T>> {
+  return apiJsonRequest<T>(path, init, false);
+}
+
+async function apiJsonRequest<T>(
+  path: string,
+  init: RequestInit | undefined,
+  notifyAuth: boolean,
+): Promise<ApiResponse<T>> {
   let resp: Response;
   try {
     resp = await fetch(path, {
@@ -791,7 +844,7 @@ export async function apiJson<T>(path: string, init?: RequestInit): Promise<ApiR
     );
   }
 
-  if (resp.status === 401) {
+  if (notifyAuth && resp.status === 401) {
     authRequiredHandler?.();
   }
 
@@ -802,30 +855,46 @@ export async function apiJson<T>(path: string, init?: RequestInit): Promise<ApiR
     return makeErrorResponse(
       "NETWORK_ERROR",
       error instanceof Error ? error.message : "Network response was interrupted",
+      resp.status,
     );
   }
   if (!text) {
     if (resp.ok) {
       return { ok: true, result: {} as T };
     }
-    return makeErrorResponse("EMPTY_RESPONSE", `Server returned ${resp.status} with empty body`);
+    return makeErrorResponse(
+      "EMPTY_RESPONSE",
+      `Server returned ${resp.status} with empty body`,
+      resp.status,
+    );
   }
 
   try {
     const data = JSON.parse(text);
-    if (!data.ok && resp.status === 401 && isAuthRequiredErrorCode(data.error?.code)) {
+    if (
+      notifyAuth &&
+      !data.ok &&
+      resp.status === 401 &&
+      isAuthRequiredErrorCode(data.error?.code)
+    ) {
       authRequiredHandler?.();
     }
-    return normalizeApiResponse<T>(data);
+    const result = normalizeApiResponse<T>(data);
+    return result.ok ? result : { ...result, error: { ...result.error, httpStatus: resp.status } };
   } catch {
     if (!resp.ok) {
       const statusText = resp.statusText ? ` ${resp.statusText}` : "";
       return makeErrorResponse(
         "HTTP_ERROR",
         `Server returned ${resp.status}${statusText}: ${text.slice(0, 100)}`,
+        resp.status,
       );
     }
-    return makeErrorResponse("PARSE_ERROR", `Invalid JSON response: ${text.slice(0, 100)}`);
+    return makeErrorResponse(
+      "PARSE_ERROR",
+      `Invalid JSON response: ${text.slice(0, 100)}`,
+      resp.status,
+    );
   }
 }
 
@@ -834,6 +903,9 @@ export async function apiForm<T>(
   form: FormData,
   init?: RequestInit,
 ): Promise<ApiResponse<T>> {
+  if (frameAccessPaused()) {
+    return makeErrorResponse("NETWORK_ERROR", "The remote workspace is reconnecting.");
+  }
   let resp: Response;
   try {
     resp = await fetch(path, {
@@ -853,7 +925,15 @@ export async function apiForm<T>(
     authRequiredHandler?.();
   }
 
-  const text = await resp.text();
+  let text: string;
+  try {
+    text = await resp.text();
+  } catch (error) {
+    return makeErrorResponse(
+      "NETWORK_ERROR",
+      error instanceof Error ? error.message : "Network request failed",
+    );
+  }
   if (!text) {
     if (resp.ok) {
       return { ok: true, result: {} as T };

@@ -20,6 +20,7 @@ pub async fn run(client: &DaemonClient, home: &HomeLayout, args: ActorArgs) -> R
         ActorAction::Add {
             actor_id,
             title,
+            model_label,
             runtime,
             runtime_mode,
             command,
@@ -36,7 +37,7 @@ pub async fn run(client: &DaemonClient, home: &HomeLayout, args: ActorArgs) -> R
                 "actor_add",
                 json!({
                     "group_id":group(home,group_id)?,"actor_id":actor_id,"title":title,
-                    "runtime":runtime,"runtime_mode":runtime_mode,"command":command,"env":env(raw_env)?,
+                    "model_label":model_label,"runtime":runtime,"runtime_mode":runtime_mode,"command":command,"env":env(raw_env)?,
                     "default_scope_key":scope,"submit":submit,"by":by
                 }),
             )
@@ -46,10 +47,14 @@ pub async fn run(client: &DaemonClient, home: &HomeLayout, args: ActorArgs) -> R
         ActorAction::Start(target) => lifecycle(client, home, "actor_start", target).await?,
         ActorAction::Stop(target) => lifecycle(client, home, "actor_stop", target).await?,
         ActorAction::Restart(target) => lifecycle(client, home, "actor_restart", target).await?,
+        ActorAction::NewSession(target) => {
+            lifecycle(client, home, "actor_new_session", target).await?
+        }
         ActorAction::Update {
             actor_id,
             group_id,
             title,
+            model_label,
             runtime,
             runtime_mode,
             scope,
@@ -61,6 +66,7 @@ pub async fn run(client: &DaemonClient, home: &HomeLayout, args: ActorArgs) -> R
         } => {
             let mut patch = Map::new();
             optional(&mut patch, "title", title);
+            optional(&mut patch, "model_label", model_label);
             optional(&mut patch, "runtime", runtime);
             optional(&mut patch, "runtime_mode", runtime_mode);
             if let Some(scope) = scope {
@@ -85,6 +91,122 @@ pub async fn run(client: &DaemonClient, home: &HomeLayout, args: ActorArgs) -> R
                 json!({"group_id":group(home,group_id)?,"actor_id":actor_id,"patch":patch,"by":by}),
             )
             .await?
+        }
+        ActorAction::Switch {
+            actor_id,
+            group_id,
+            session,
+            runtime,
+            profile,
+            runtime_mode,
+            command,
+            env: raw_env,
+            submit,
+            scope,
+            no_start,
+            finish,
+        } => {
+            let group_id = group(home, group_id)?;
+            if finish {
+                call(
+                    client,
+                    "actor_runtime_switch_complete",
+                    json!({"group_id":group_id,"actor_id":actor_id,"by":"user"}),
+                )
+                .await?
+            } else {
+                let target = if let Some(source_id) = session {
+                    let sources = call(client, "local_session_list", json!({})).await?;
+                    let source = expect_ok(&sources)?["sources"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|source| source["source_id"] == source_id.as_str())
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("native session is not connected: {source_id}")
+                        })?;
+                    json!({
+                        "kind":"native",
+                        "source_id":source_id,
+                        "expected_native_session_id":source["native_session_id"],
+                    })
+                } else if runtime.is_some() || profile.is_some() {
+                    let mut patch = Map::new();
+                    optional(&mut patch, "runtime", runtime);
+                    optional(&mut patch, "runtime_mode", runtime_mode);
+                    optional(&mut patch, "submit", submit);
+                    if let Some(scope) = scope {
+                        patch.insert(
+                            "default_scope_key".into(),
+                            Value::String(canonical_scope_key(&scope)?),
+                        );
+                    }
+                    if let Some(command) = command {
+                        patch.insert("command".into(), json!(parse_command(&command)?));
+                    }
+                    if !raw_env.is_empty() {
+                        patch.insert("env".into(), Value::Object(env(raw_env)?));
+                    }
+                    let mut target = json!({"kind":"managed","patch":patch,"start":!no_start});
+                    if let Some(profile_id) = profile {
+                        let shown = call(
+                            client,
+                            "actor_profile_get",
+                            json!({"profile_id":profile_id,"by":"user"}),
+                        )
+                        .await?;
+                        target["profile_id"] = json!(profile_id);
+                        target["expected_profile_revision"] =
+                            expect_ok(&shown)?["profile"]["revision"].clone();
+                    }
+                    target
+                } else {
+                    anyhow::bail!("choose --session, --runtime or --profile, or use --finish");
+                };
+                // The switch applies only to the member as read here.
+                let listed = call(
+                    client,
+                    "actor_list",
+                    json!({"group_id":group_id,"by":"user"}),
+                )
+                .await?;
+                let actor = expect_ok(&listed)?["actors"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|actor| actor["id"] == actor_id.as_str())
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("actor not found: {actor_id}"))?;
+                let generation = match actor["generation"].as_str() {
+                    Some(generation) if !generation.is_empty() => generation.to_owned(),
+                    _ => format!(
+                        "legacy:{}",
+                        actor["created_at"].as_str().unwrap_or_default()
+                    ),
+                };
+                let mut args = json!({
+                    "group_id":group_id,"actor_id":actor_id,"by":"user",
+                    "expected_actor_generation":generation,
+                    "expected_actor_updated_at":actor["updated_at"],
+                    "target":target,
+                });
+                if let Some(source) = actor["external_session_id"]
+                    .as_str()
+                    .filter(|source| !source.is_empty())
+                {
+                    args["expected_source_id"] = json!(source);
+                }
+                // Not retried, and the actor was read just before: the daemon
+                // was reachable, so the switch may have finished.
+                call(client, "actor_runtime_switch", args)
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "{error}. The switch may have finished: check `cccc actor list` before trying again"
+                        )
+                    })?
+            }
         }
         ActorAction::Secrets {
             actor_id,
@@ -119,7 +241,41 @@ pub async fn run(client: &DaemonClient, home: &HomeLayout, args: ActorArgs) -> R
             }
         }
     };
+    note_session_replaced(&response);
     print(response)
+}
+
+/// A start that began a new conversation instead of the saved one says so where the
+/// operator is looking, on stderr so the JSON result stays parseable. A Group start
+/// reports each member it replaced.
+pub(crate) fn note_session_replaced(response: &cccc_contracts::DaemonResponse) {
+    if !response.ok {
+        return;
+    }
+    let single = response.result.get("runtime_session_replaced").into_iter();
+    let each = response
+        .result
+        .get("runtime_sessions_replaced")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for message in single
+        .chain(each)
+        .filter_map(|replaced| replaced["message"].as_str())
+    {
+        eprintln!("Note: {message}");
+    }
+}
+
+fn expect_ok(response: &cccc_contracts::DaemonResponse) -> Result<Value> {
+    if response.ok {
+        return Ok(Value::Object(response.result.clone()));
+    }
+    let error = response.error.as_ref().map_or_else(
+        || "unknown daemon error".to_owned(),
+        |error| format!("{}: {}", error.code, error.message),
+    );
+    anyhow::bail!(error)
 }
 
 fn canonical_scope_key(path: &str) -> Result<String> {

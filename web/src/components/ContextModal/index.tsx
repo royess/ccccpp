@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import {
   type DragEndEvent,
   type DragStartEvent,
+  KeyboardSensor,
   PointerSensor,
   TouchSensor,
   useSensor,
@@ -10,54 +11,96 @@ import {
 } from "@dnd-kit/core";
 import { useTranslation } from "react-i18next";
 import {
-  addCoordinationNote,
   apiJson,
   contextSync,
-  deleteCoordinationTask,
+  deleteCoordinationTaskConfirmed,
+  fetchTaskById,
+  isTaskRevision,
+  moveCoordinationTask,
+  restoreCoordinationTask,
   updateCoordinationBrief,
   updateCoordinationTask,
   type ApiResponse,
 } from "../../services/api";
+import { useGroupStore, useUIStore } from "../../stores";
+import { useBacklogSignals } from "../../stores/backlogSignals";
+import { SegmentedControl } from "../ui/segmented-control";
+import { BacklogPanel, type BacklogScopeState } from "./backlog/BacklogPanel";
+import {
+  backlogFormDirty,
+  findEntryById,
+  sameSource,
+  sourceInFile,
+  type BacklogForm,
+  type BacklogIntent,
+} from "./backlog/backlogModel";
+import { loadTasksView, saveTasksView, type TasksView } from "./backlog/taskViewPreference";
+import { useBacklog } from "./backlog/useBacklog";
 import { reloadContextAfterWrite } from "../../features/contextModal/contextWriteback";
 import { useTaskBoardData } from "../../features/contextModal/useTaskBoardData";
-import type { GroupContext, AgentsMdInfo, Task } from "../../types";
-import {
-  evaluateTaskWorkflow,
-  getTaskDoneTransitionBlockers,
-  getTaskTypeDefinition,
-} from "../../utils/taskWorkflow";
+import type { GroupContext, AgentsMdInfo, BacklogSource, Task } from "../../types";
+import { evaluateTaskWorkflow, getTaskTypeDefinition } from "../../utils/taskWorkflow";
 import { classNames } from "../../utils/classNames";
 import { useModalA11y } from "../../hooks/useModalA11y";
+import { useChatObscuringView } from "../../hooks/useChatObscuringView";
+import { setWorkspaceDirty } from "../../stores/workspaceNavigation";
 import { ModalFrame } from "../modals/ModalFrame";
 import { settingsDialogBodyClass, settingsDialogPanelClass } from "../modals/settings/types";
 import { AgentsView } from "./agents/AgentsView";
 import { AgentsMdPanel } from "./coordination/AgentsMdPanel";
 import { WorkingSummaryPanel } from "./coordination/WorkingSummaryPanel";
-import { CoordinationLogPanel } from "./coordination/CoordinationLogPanel";
 import { TaskBoard } from "./coordination/TaskBoard";
-import { TaskEditorPanel } from "./coordination/TaskEditorPanel";
+import { TaskDetailLayout } from "./coordination/TaskDetailLayout";
+import { TaskEditorPanel, type TaskBacklogLink } from "./coordination/TaskEditorPanel";
 import { CapabilitiesTab } from "../modals/settings/CapabilitiesTab";
 import {
   briefDraftMatches,
   briefToDraft,
-  emptyNoteDraft,
+  directSubtasks,
+  checklistToSave,
   emptyTaskDraft,
-  parseChecklist,
   parseLineList,
   isVisibleContextAgent,
-  taskDraftDirty,
-  taskDraftMatches,
+  subtaskProgressByParent,
+  taskDraftChanged,
+  taskDraftPatch,
+  taskHoldsDraftSave,
+  taskMatchesDraftBase,
   taskStatus,
   taskToDraft,
   type BoardStatus,
   type BriefDraft,
   type ContextModalView,
-  type NoteDraft,
   type TaskDraft,
   type TaskDeleteInfo,
   type TaskFilterValue,
+  type TaskStale,
 } from "./model";
 import { createContextModalUi } from "./ui";
+import { newClientId } from "../../utils/clientId";
+
+/** Errors that mean the answer to a write was lost, or did not read as an answer. */
+const ANSWER_UNCONFIRMED = new Set([
+  "NETWORK_ERROR",
+  "EMPTY_RESPONSE",
+  "HTTP_ERROR",
+  "PARSE_ERROR",
+  "daemon_unavailable",
+  "task_receipt_unconfirmed",
+]);
+
+/** Errors for a write refused before it was made. Any other may follow the write. */
+const REFUSED_BEFORE_WRITE = new Set([
+  "invalid_args",
+  "permission_denied",
+  "group_not_found",
+  "task_not_found",
+  "task_conflict",
+  "task_changed",
+  "version_conflict",
+  "task_revision_unavailable",
+  "task_delete_check_unavailable",
+]);
 
 interface ContextModalProps {
   isOpen: boolean;
@@ -106,17 +149,34 @@ export function ContextModal({
   const [briefDraft, setBriefDraft] = useState<BriefDraft>(briefToDraft(null));
   const [taskEditorMode, setTaskEditorMode] = useState<"none" | "create" | "edit">("none");
   const [selectedTaskId, setSelectedTaskId] = useState("");
+  const selectedTaskIdRef = useRef(selectedTaskId);
+  selectedTaskIdRef.current = selectedTaskId;
   const [taskDraft, setTaskDraft] = useState<TaskDraft | null>(null);
-  const [pendingTaskReadback, setPendingTaskReadback] = useState<{
-    taskId: string;
-    previousUpdatedAt: string;
+  const taskDraftRef = useRef(taskDraft);
+  taskDraftRef.current = taskDraft;
+  const taskOpenSeqRef = useRef(0);
+  // A save or delete answers only the editing session that made it.
+  const editorSessionRef = useRef(0);
+  const savingTaskSession = useRef<number | null>(null);
+  // The last failed try to create the task open in the drawer, by what it sent.
+  const lastCreateRef = useRef<{
+    session: number;
+    sent: string;
+    requestId: string;
+    mayExist: boolean;
   } | null>(null);
+  // A save or delete was refused because the task changed, or a saved task
+  // could not be read back: the draft no longer matches what is stored.
+  const [taskStale, setTaskStale] = useState<TaskStale>("");
+  const taskTitleRef = useRef<HTMLInputElement>(null);
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncError, setSyncError] = useState("");
+  const [boardError, setBoardError] = useState("");
 
   const [agentsMd, setAgentsMd] = useState<AgentsMdInfo | null>(null);
   const [agentsMdBusy, setAgentsMdBusy] = useState(false);
   const [agentsMdError, setAgentsMdError] = useState("");
+  const [agentsMdNoScope, setAgentsMdNoScope] = useState(false);
   const [agentsMdNotice, setAgentsMdNotice] = useState("");
   const [editingAgentsMd, setEditingAgentsMd] = useState(false);
   const [agentsMdText, setAgentsMdText] = useState("");
@@ -124,13 +184,42 @@ export function ContextModal({
   const [notifyAgents, setNotifyAgents] = useState(false);
   const [notifyError, setNotifyError] = useState("");
 
-  const [decisionDraft, setDecisionDraft] = useState<NoteDraft>(emptyNoteDraft());
-  const [handoffDraft, setHandoffDraft] = useState<NoteDraft>(emptyNoteDraft());
-  const [activityBusyKind, setActivityBusyKind] = useState<"decision" | "handoff" | null>(null);
-  const [activityError, setActivityError] = useState("");
   const lastOpenedGroupRef = useRef("");
   const modalVisitRef = useRef({ groupId, isOpen });
   const agentsMdReadSeqRef = useRef(0);
+
+  // The backlog belongs to the project folder the Group shows. The read-only public page has
+  // none: the daemon refuses it there, so nothing offers it.
+  const webReadOnly = useUIStore((state) => state.webReadOnly);
+  const groupDocLoaded = useGroupStore((state) => state.groupDoc?.group_id === groupId);
+  // The store keeps the selected Group's members beside its document.
+  const groupActors = useGroupStore((state) => state.actors);
+  const backlogScopeKey = useGroupStore((state) =>
+    state.groupDoc?.group_id === groupId ? String(state.groupDoc.active_scope_key || "") : "",
+  );
+  const backlogScopeUrl = useGroupStore((state) => {
+    const doc = state.groupDoc;
+    if (doc?.group_id !== groupId || !doc.active_scope_key) return "";
+    return String(doc.scopes?.find((scope) => scope.scope_key === doc.active_scope_key)?.url || "");
+  });
+  const backlogScopeState: BacklogScopeState = !groupDocLoaded
+    ? "loading"
+    : backlogScopeKey && backlogScopeUrl
+      ? "ready"
+      : "none";
+  const backlogScope = useMemo(
+    () =>
+      backlogScopeState === "ready" && !webReadOnly
+        ? { scopeKey: backlogScopeKey, scopeUrl: backlogScopeUrl }
+        : null,
+    [backlogScopeKey, backlogScopeState, backlogScopeUrl, webReadOnly],
+  );
+  const backlog = useBacklog(groupId, backlogScope);
+  const backlogRevision = useBacklogSignals((state) => state.revisions[groupId] || 0);
+  const [tasksView, setTasksView] = useState<TasksView>("board");
+  const [backlogForm, setBacklogForm] = useState<BacklogForm | null>(null);
+  const [backlogIntent, setBacklogIntent] = useState<BacklogIntent | null>(null);
+  const showingBacklog = !webReadOnly && activeView === "tasks" && tasksView === "backlog";
 
   const {
     columns: taskColumnPages,
@@ -141,6 +230,8 @@ export function ContextModal({
     facets: taskFacets,
     error: taskLoadError,
     loading: taskLoading,
+    matchingCount: taskMatchingCount,
+    searchQuery: taskSearchQuery,
     deleteInfoById,
     refresh: refreshTasks,
     loadMore: loadMoreTasks,
@@ -194,20 +285,6 @@ export function ContextModal({
     [taskFacets],
   );
 
-  const recentDecisions = useMemo(
-    () =>
-      Array.isArray(context?.coordination?.recent_decisions)
-        ? context.coordination.recent_decisions
-        : [],
-    [context],
-  );
-  const recentHandoffs = useMemo(
-    () =>
-      Array.isArray(context?.coordination?.recent_handoffs)
-        ? context.coordination.recent_handoffs
-        : [],
-    [context],
-  );
   const agentsMdPathLabel = useMemo(() => {
     const path = String(agentsMd?.path || "").trim();
     return path || "AGENTS.md";
@@ -223,10 +300,30 @@ export function ContextModal({
   );
 
   const assigneeOptions = taskFacets.assignees;
+  // Who a task can go to: the Group's members, whether or not they have reported
+  // a state, and anyone tasks already name.
+  const assigneeChoices = useMemo(
+    () =>
+      [
+        ...new Set([
+          ...(groupDocLoaded ? groupActors.map((actor) => String(actor.id || "").trim()) : []),
+          ...assigneeOptions,
+        ]),
+      ]
+        .filter((id) => id && id !== "__all__")
+        .sort(),
+    [assigneeOptions, groupActors, groupDocLoaded],
+  );
   const unassignedCount = taskFacets.unassigned;
   const activeTaskOptions = useMemo(
     () => taskIndex.filter((task) => taskStatus(task) !== "archived"),
     [taskIndex],
+  );
+  // The index covers every live task regardless of board paging and filters.
+  const subtaskProgress = useMemo(() => subtaskProgressByParent(taskIndex), [taskIndex]);
+  const selectedSubtasks = useMemo(
+    () => directSubtasks(selectedTaskId, taskIndex),
+    [selectedTaskId, taskIndex],
   );
   const hasBriefUnsaved = useMemo(
     () => editingBrief && !briefDraftMatches(brief, briefDraft),
@@ -237,11 +334,15 @@ export function ContextModal({
     [editingAgentsMd, agentsMd?.content, agentsMdText],
   );
   const hasSteeringUnsaved = hasBriefUnsaved || hasAgentsMdUnsaved;
-  const hasTaskUnsaved = useMemo(() => {
-    if (!taskDraft || taskEditorMode === "none") return false;
-    if (taskEditorMode === "create") return taskDraftDirty(taskDraft);
-    return !!selectedTask && !taskDraftMatches(selectedTask, taskDraft);
-  }, [selectedTask, taskDraft, taskEditorMode]);
+  const hasTaskUnsaved = taskEditorMode !== "none" && taskDraftChanged(taskDraft);
+  const hasBacklogUnsaved = backlogFormDirty(backlogForm);
+  // Deleted while it was open: the draft stays, so nothing typed is lost.
+  const taskGone = taskEditorMode === "edit" && !!taskDraft && !!selectedTaskId && !selectedTask;
+  const taskChangedElsewhere =
+    taskEditorMode === "edit" &&
+    !!taskDraft &&
+    !!selectedTask &&
+    !taskMatchesDraftBase(selectedTask, taskDraft);
   const selectedTaskDeleteInfo = useMemo<TaskDeleteInfo>(() => {
     const info = selectedTask ? deleteInfoById[selectedTask.id] : null;
     const reason = info?.reason;
@@ -262,6 +363,7 @@ export function ContextModal({
       const isCurrent = () => modalVisitRef.current === visit && agentsMdReadSeqRef.current === seq;
       setAgentsMdBusy(true);
       setAgentsMdError("");
+      setAgentsMdNoScope(false);
       try {
         const resp = await apiJson<AgentsMdInfo>(
           `/api/v1/groups/${encodeURIComponent(groupId)}/agents_md`,
@@ -269,6 +371,10 @@ export function ContextModal({
         if (!isCurrent()) return null;
         if (!resp.ok) {
           setAgentsMd(null);
+          if (resp.error?.code === "group_has_no_scope") {
+            setAgentsMdNoScope(true);
+            return null;
+          }
           setAgentsMdError(
             resp.error?.message || tr("context.failedToLoadAgentsMd", "Failed to load AGENTS.md"),
           );
@@ -300,26 +406,28 @@ export function ContextModal({
     setTaskQuery("");
     setArchivedExpanded(false);
     setDragTaskId("");
-    setPendingTaskReadback(null);
+    setTaskStale("");
+    editorSessionRef.current += 1;
     setTaskEditorMode("none");
     setSelectedTaskId("");
     setTaskDraft(null);
     setSyncBusy(false);
     setSyncError("");
+    setBoardError("");
     setEditingBrief(false);
     setAgentsMd(null);
     setAgentsMdBusy(false);
     setAgentsMdError("");
+    setAgentsMdNoScope(false);
     setAgentsMdNotice("");
     setEditingAgentsMd(false);
     setAgentsMdText("");
     setAgentsMdExpanded(false);
     setNotifyError("");
     setNotifyAgents(false);
-    setDecisionDraft(emptyNoteDraft());
-    setHandoffDraft(emptyNoteDraft());
-    setActivityBusyKind(null);
-    setActivityError("");
+    setTasksView(loadTasksView(groupId));
+    setBacklogForm(null);
+    setBacklogIntent(null);
     return () => {
       modalVisitRef.current = { groupId, isOpen };
       agentsMdReadSeqRef.current += 1;
@@ -336,9 +444,35 @@ export function ContextModal({
     void onOpenContext();
   }, [groupId, isOpen, onOpenContext]);
 
+  // The backlog is read when the modal opens, so a task can name the entry it came from, and
+  // again when the backlog view is shown or its file changes while it is. Never on a timer.
+  const reloadBacklog = backlog.reload;
+  const backlogReadTrigger =
+    !isOpen || !backlogScope ? "" : showingBacklog ? `shown:${backlogRevision}` : "hidden";
+  useEffect(() => {
+    if (backlogReadTrigger) void reloadBacklog();
+  }, [backlogReadTrigger, reloadBacklog]);
+
   const applyContextWriteback = useCallback(
     async <T,>(response: ApiResponse<T>) => reloadContextAfterWrite(response, onSyncContext),
     [onSyncContext],
+  );
+
+  // A task as the daemon has it now. A detail read is dropped while the board
+  // is behind the task list, so the board catches up first. A reload started
+  // meanwhile, like the one the context sync after a task write sets off, takes
+  // over from this one and the read is dropped again; one more round then reads
+  // against the board it leaves.
+  const readTaskNow = useCallback(
+    async (taskId: string) => {
+      for (let round = 0; round < 2; round += 1) {
+        await refreshTasks();
+        const task = await loadTaskDetail(taskId);
+        if (task) return task;
+      }
+      return null;
+    },
+    [loadTaskDetail, refreshTasks],
   );
 
   useEffect(() => {
@@ -347,7 +481,8 @@ export function ContextModal({
       (activeView === "instructions" || editingAgentsMd) &&
       agentsMd === null &&
       !agentsMdBusy &&
-      !agentsMdError
+      !agentsMdError &&
+      !agentsMdNoScope
     ) {
       void loadAgentsMd();
     }
@@ -358,6 +493,7 @@ export function ContextModal({
     loadAgentsMd,
     agentsMdBusy,
     agentsMdError,
+    agentsMdNoScope,
     agentsMd,
     activeView,
   ]);
@@ -411,39 +547,60 @@ export function ContextModal({
       return;
     }
     if (!selectedTask) {
-      setSelectedTaskId("");
-      setTaskDraft(null);
-      setTaskEditorMode("none");
+      // A task deleted while open keeps its draft until the editor is closed.
+      if (!taskDraft) {
+        setSelectedTaskId("");
+        setTaskEditorMode("none");
+      }
       return;
     }
-    if (!taskDraft) {
-      const nextDraft = taskToDraft(selectedTask);
-      setTaskDraft(nextDraft);
-    }
+    if (!taskDraft) setTaskDraft(taskToDraft(selectedTask));
   }, [selectedTaskId, selectedTask, taskDraft, taskEditorMode]);
 
+  // A draft without edits follows the task as it changes. One with edits
+  // stays as it is, and saving it is refused until it is reloaded, unless the
+  // task now holds exactly those edits, as after a save whose answer was lost:
+  // then they are saved, and the draft is the task again.
   useEffect(() => {
-    if (!pendingTaskReadback) return;
-    if (taskEditorMode !== "edit" || !selectedTaskId) {
-      setPendingTaskReadback(null);
+    if (taskEditorMode !== "edit" || !taskDraft || !selectedTask || syncBusy) return;
+    if (taskMatchesDraftBase(selectedTask, taskDraft)) return;
+    // Only forward: a list read before the last save can arrive after it.
+    if ((selectedTask.rev ?? 0) < (taskDraft.base.rev ?? 0)) return;
+    if (taskDraftChanged(taskDraft)) {
+      if (!isTaskRevision(selectedTask.rev) || !taskHoldsDraftSave(selectedTask, taskDraft)) return;
+      setSyncError("");
+    } else if (taskStale) {
       return;
     }
-    if (!selectedTask || selectedTask.id !== pendingTaskReadback.taskId) return;
-    if (String(selectedTask.updated_at || "") === pendingTaskReadback.previousUpdatedAt) return;
+    setTaskStale("");
     setTaskDraft(taskToDraft(selectedTask));
-    setPendingTaskReadback(null);
-  }, [pendingTaskReadback, selectedTask, selectedTaskId, taskEditorMode]);
+  }, [selectedTask, syncBusy, taskDraft, taskEditorMode, taskStale]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 180, tolerance: 6 } }),
+    useSensor(KeyboardSensor),
   );
 
-  const formatDoneTransitionGuardMessage = useCallback(
-    (missing: string[]) =>
-      tr("context.taskDoneGuard", "Complete closeout before marking this task done: {{items}}.", {
-        items: missing.join(", "),
-      }),
+  /** Why a task write was refused, in the user's terms. */
+  const taskWriteError = useCallback(
+    (error: { code?: string; message?: string } | undefined, fallback: string) =>
+      error?.code === "task_revision_unavailable"
+        ? tr(
+            "context.taskRevisionUnavailable",
+            "This task's version could not be read, so nothing was saved. Reload it and try again.",
+          )
+        : error?.code === "task_delete_check_unavailable"
+          ? tr(
+              "context.taskDeleteCheckUnavailable",
+              "The task's current state could not be read, so nothing was deleted. Check your connection and try again.",
+            )
+          : ANSWER_UNCONFIRMED.has(String(error?.code || ""))
+            ? tr(
+                "context.taskWriteUnconfirmed",
+                "It could not be confirmed whether this went through. Check the task's current state before trying again.",
+              )
+            : error?.message || fallback,
     [tr],
   );
   const selectedTaskDeleteHint = useMemo(() => {
@@ -457,7 +614,7 @@ export function ContextModal({
     }
     return tr(
       "context.deleteTaskBlockedSelf",
-      "Only tasks that never moved past planned can be deleted.",
+      "Only tasks that never left Planned can be deleted. Move it to Archived instead.",
     );
   }, [selectedTask, selectedTaskDeleteInfo, tr]);
 
@@ -468,92 +625,77 @@ export function ContextModal({
     );
   }, [hasTaskUnsaved, tr]);
 
-  const openTaskEditorForTask = useCallback(
-    (task: Task, options?: { draft?: TaskDraft; error?: string }): boolean => {
-      const sameTask = selectedTaskId === task.id && taskEditorMode === "edit";
-      if (!sameTask && !confirmDiscardTaskChanges()) return false;
-      const nextDraft = options?.draft ?? taskToDraft(task);
-      if (!sameTask) {
-        setPendingTaskReadback(null);
-      }
-      setSelectedTaskId(task.id);
-      setTaskDraft(nextDraft);
-      setTaskEditorMode("edit");
-      setSyncError(options?.error || "");
-      setActiveView("tasks");
-      return true;
-    },
-    [confirmDiscardTaskChanges, selectedTaskId, taskEditorMode],
+  const canSwitchTask = useCallback(
+    () => savingTaskSession.current !== editorSessionRef.current && confirmDiscardTaskChanges(),
+    [confirmDiscardTaskChanges],
   );
 
-  const moveTaskToStatus = useCallback(
-    async (task: Task, nextStatus: BoardStatus) => {
-      if (!groupId) return;
-      if (taskStatus(task) === nextStatus) return;
-      if (nextStatus === "done") {
-        const guardSource =
-          selectedTaskId === task.id && taskEditorMode === "edit" && taskDraft
-            ? taskDraft
-            : taskToDraft(task);
-        const blockers = getTaskDoneTransitionBlockers({
-          parentId: guardSource.parentId,
-          taskType: guardSource.taskType,
-          assignee: guardSource.assignee,
-          outcome: guardSource.outcome,
-          notes: guardSource.notes,
-          checklist: guardSource.checklist,
-        });
-        if (blockers.length > 0) {
-          openTaskEditorForTask(task, {
-            draft: { ...guardSource, status: "done" },
-            error: formatDoneTransitionGuardMessage(blockers),
-          });
-          return;
-        }
-      }
+  const showTask = useCallback((task: Task) => {
+    editorSessionRef.current += 1;
+    setTaskStale("");
+    setSelectedTaskId(task.id);
+    setTaskDraft(taskToDraft(task));
+    setTaskEditorMode("edit");
+    setSyncError("");
+    setBoardError("");
+    setActiveView("tasks");
+  }, []);
 
+  // A move or a restore from the board is fenced on the revision the board
+  // showed: a task changed since is left as it is, and the board is read
+  // again instead. What it reports stays on the board, as an editor opened
+  // while it ran is about another task.
+  const writeFromBoard = useCallback(
+    async (task: Task, write: (groupId: string) => Promise<ApiResponse<unknown>>) => {
+      if (!groupId) return;
       const visit = modalVisitRef.current;
       const isCurrent = () => modalVisitRef.current === visit;
       setSyncBusy(true);
-      setSyncError("");
+      setBoardError("");
       try {
-        const resp = await updateCoordinationTask(groupId, { ...task, status: nextStatus });
-        const nextResp = await applyContextWriteback(resp);
-        if (!nextResp.ok) {
+        const resp = await write(groupId);
+        if (!resp.ok) {
+          const error = resp.error;
           if (isCurrent()) {
-            setSyncError(
-              nextResp.error?.message ||
-                resp.error?.message ||
-                tr("context.failedToApplyChanges", "Failed to apply changes"),
+            setBoardError(
+              error?.code === "task_conflict"
+                ? tr(
+                    "context.taskMoveConflict",
+                    "{{id}} has changed since the board showed it, so it was not moved. Check its latest state and try again.",
+                    { id: task.id },
+                  )
+                : taskWriteError(
+                    error,
+                    tr("context.failedToApplyChanges", "Failed to apply changes"),
+                  ),
             );
           }
+          // What became of the task, whatever became of the write.
+          if (isCurrent()) await refreshTasks();
           return;
         }
+        await applyContextWriteback(resp);
         if (!isCurrent()) return;
-        if (selectedTaskId === task.id && taskEditorMode === "edit") {
-          setPendingTaskReadback({
-            taskId: task.id,
-            previousUpdatedAt: String(task.updated_at || ""),
-          });
-        }
         await refreshTasks();
-        if (isCurrent() && selectedTaskId === task.id) await loadTaskDetail(task.id);
       } finally {
         if (isCurrent()) setSyncBusy(false);
       }
     },
-    [
-      applyContextWriteback,
-      formatDoneTransitionGuardMessage,
-      groupId,
-      loadTaskDetail,
-      openTaskEditorForTask,
-      refreshTasks,
-      selectedTaskId,
-      taskDraft,
-      taskEditorMode,
-      tr,
-    ],
+    [applyContextWriteback, groupId, refreshTasks, taskWriteError, tr],
+  );
+
+  const moveTaskToStatus = useCallback(
+    async (task: Task, nextStatus: BoardStatus) => {
+      if (taskStatus(task) === nextStatus) return;
+      await writeFromBoard(task, (id) => moveCoordinationTask(id, task.id, nextStatus, task.rev));
+    },
+    [writeFromBoard],
+  );
+
+  // Back to where it was before it was archived, which a move cannot know.
+  const restoreTask = useCallback(
+    (task: Task) => writeFromBoard(task, (id) => restoreCoordinationTask(id, task.id, task.rev)),
+    [writeFromBoard],
   );
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
@@ -566,40 +708,61 @@ export function ContextModal({
       setDragTaskId("");
       const activeId = String(event.active.id || "");
       if (!activeId.startsWith("task:")) return;
-      const task = taskMap.get(activeId.slice(5));
+      const boardTasks = Object.values(board).flat();
+      const task = boardTasks.find((candidate) => candidate.id === activeId.slice(5));
       if (!task || !event.over) return;
       const overId = String(event.over.id || "");
       let nextStatus: BoardStatus | null = null;
       if (overId.startsWith("column:")) {
         nextStatus = overId.slice(7) as BoardStatus;
       } else if (overId.startsWith("task:")) {
-        const overTask = taskMap.get(overId.slice(5));
+        const overTask = boardTasks.find((candidate) => candidate.id === overId.slice(5));
         if (overTask) nextStatus = taskStatus(overTask) as BoardStatus;
       }
       if (nextStatus && nextStatus !== taskStatus(task)) {
         void moveTaskToStatus(task, nextStatus);
       }
     },
-    [moveTaskToStatus, taskMap],
+    [board, moveTaskToStatus],
   );
 
   const selectTask = useCallback(
     (task: Task) => {
       if (selectedTaskId === task.id && taskEditorMode === "edit") return;
-      if (!confirmDiscardTaskChanges()) return;
-      const nextDraft = taskToDraft(task);
-      setPendingTaskReadback(null);
-      setSelectedTaskId(task.id);
-      setTaskDraft(nextDraft);
-      setTaskEditorMode("edit");
-      setSyncError("");
-      setActiveView("tasks");
+      if (!canSwitchTask()) return;
+      showTask(task);
     },
-    [confirmDiscardTaskChanges, selectedTaskId, taskEditorMode],
+    [canSwitchTask, selectedTaskId, showTask, taskEditorMode],
+  );
+
+  // Read fresh full details before drafting, since cached subtasks may have changed elsewhere.
+  // Unsaved edits are confirmed at click time; only the newest click applies, and a later edit,
+  // selection or modal visit cancels a pending one instead of being overwritten by it.
+  const openSubtask = useCallback(
+    (taskId: string) => {
+      const request = ++taskOpenSeqRef.current;
+      if (!canSwitchTask()) return;
+      const visit = modalVisitRef.current;
+      const parentId = selectedTaskIdRef.current;
+      const draft = taskDraftRef.current;
+      void loadTaskDetail(taskId).then((task) => {
+        if (
+          task &&
+          taskOpenSeqRef.current === request &&
+          modalVisitRef.current === visit &&
+          savingTaskSession.current !== editorSessionRef.current &&
+          selectedTaskIdRef.current === parentId &&
+          taskDraftRef.current === draft
+        ) {
+          showTask(task);
+        }
+      });
+    },
+    [canSwitchTask, loadTaskDetail, showTask],
   );
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || savingTaskSession.current === editorSessionRef.current) return;
     const targetTaskId = String(initialTaskId || "").trim();
     if (!targetTaskId) return;
     if (selectedTaskId === targetTaskId && taskEditorMode === "edit") return;
@@ -609,7 +772,7 @@ export function ContextModal({
     let cancelled = false;
     void (async () => {
       const task = taskMap.get(targetTaskId) || (await loadTaskDetail(targetTaskId));
-      if (cancelled || !task) return;
+      if (cancelled || !task || savingTaskSession.current === editorSessionRef.current) return;
       if (taskStatus(task) === "archived") setArchivedExpanded(true);
       selectTask(task);
       onInitialTaskHandled?.();
@@ -624,24 +787,206 @@ export function ContextModal({
     onInitialTaskHandled,
     selectTask,
     selectedTaskId,
+    syncBusy,
     taskEditorMode,
     taskMap,
   ]);
 
   const closeTaskEditor = useCallback(() => {
     if (!confirmDiscardTaskChanges()) return;
-    setPendingTaskReadback(null);
+    editorSessionRef.current += 1;
+    setTaskStale("");
     setTaskEditorMode("none");
     setSelectedTaskId("");
     setTaskDraft(null);
     setSyncError("");
   }, [confirmDiscardTaskChanges]);
 
+  const chooseTasksView = useCallback(
+    (view: TasksView) => {
+      setTasksView(view);
+      saveTasksView(groupId, view);
+    },
+    [groupId],
+  );
+
+  // From a task to the backlog view, which then does what the intent asks.
+  const goToBacklog = useCallback(
+    (intent: BacklogIntent) => {
+      if (!confirmDiscardTaskChanges()) return;
+      editorSessionRef.current += 1;
+      setTaskStale("");
+      setTaskEditorMode("none");
+      setSelectedTaskId("");
+      setTaskDraft(null);
+      setSyncError("");
+      setActiveView("tasks");
+      chooseTasksView("backlog");
+      setBacklogIntent(intent);
+    },
+    [chooseTasksView, confirmDiscardTaskChanges],
+  );
+
+  // The backlog view calls back after its own writes, perhaps once the page has moved on. Each
+  // call is bound to the Group it was made for: a late call from an earlier Group does nothing,
+  // as task IDs repeat across Groups. The visit it returns marks when the call began.
+  const backlogVisit = useCallback(() => {
+    const visit = modalVisitRef.current;
+    return visit.groupId === groupId ? visit : null;
+  }, [groupId]);
+
+  // Opens a task in the drawer over the backlog view, like a subtask link: only the latest
+  // request applies, and a later selection or edit cancels it.
+  const openTaskFromBacklog = useCallback(
+    async (taskId: string, read: () => Promise<Task | null>) => {
+      const visit = backlogVisit();
+      if (!visit) return;
+      const request = ++taskOpenSeqRef.current;
+      const selected = selectedTaskIdRef.current;
+      const draft = taskDraftRef.current;
+      const task = await read();
+      if (
+        modalVisitRef.current !== visit ||
+        taskOpenSeqRef.current !== request ||
+        selectedTaskIdRef.current !== selected ||
+        taskDraftRef.current !== draft
+      ) {
+        return;
+      }
+      if (!task) {
+        setBoardError(
+          tr("context.taskNotLoaded", "{{id}} could not be loaded. Try again.", { id: taskId }),
+        );
+        return;
+      }
+      if (taskStatus(task) === "archived") setArchivedExpanded(true);
+      selectTask(task);
+    },
+    [backlogVisit, selectTask, tr],
+  );
+
+  const openTaskById = useCallback(
+    (taskId: string) =>
+      openTaskFromBacklog(
+        taskId,
+        async () =>
+          taskMap.get(taskId) || (await loadTaskDetail(taskId)) || (await readTaskNow(taskId)),
+      ),
+    [loadTaskDetail, openTaskFromBacklog, readTaskNow, taskMap],
+  );
+
+  const showPromotedTask = useCallback(
+    (taskId: string) => openTaskFromBacklog(taskId, () => readTaskNow(taskId)),
+    [openTaskFromBacklog, readTaskNow],
+  );
+
+  // Links a task to the entry it was put back as. The task is read first: one that already
+  // names this entry is done, perhaps by an earlier try, and one that names another is left
+  // alone. The linked task is read again, so archiving it later is fenced on that version.
+  const linkTaskSource = useCallback(
+    async (taskId: string, source: BacklogSource): Promise<{ task: Task } | { error: string }> => {
+      const visit = backlogVisit();
+      if (!visit) return { error: "" };
+      const isCurrent = () => modalVisitRef.current === visit;
+      const fallback = tr("context.failedToApplyChanges", "Failed to apply changes");
+      const linkedElsewhere = () => ({
+        error: tr(
+          "context.backlogTaskLinkedElsewhere",
+          "{{id}} is already linked to another entry, so it was left as it is.",
+          { id: taskId },
+        ),
+      });
+      const read = await fetchTaskById(groupId, taskId);
+      if (!isCurrent()) return { error: "" };
+      if (!read.ok) return { error: taskWriteError(read.error, fallback) };
+      const task = read.result.task;
+      if (sameSource(task.source, source)) return { task };
+      if (task.source) return linkedElsewhere();
+      const resp = await updateCoordinationTask(groupId, taskId, { source }, task.rev);
+      if (!isCurrent()) return { error: "" };
+      if (!resp.ok) return { error: taskWriteError(resp.error, fallback) };
+      await applyContextWriteback(resp);
+      if (!isCurrent()) return { error: "" };
+      await refreshTasks();
+      const linked = await fetchTaskById(groupId, taskId);
+      if (!isCurrent()) return { error: "" };
+      // Without its new version, archiving it is refused rather than guessed.
+      if (!linked.ok) return { task: { ...task, source, rev: undefined } };
+      return sameSource(linked.result.task.source, source)
+        ? { task: linked.result.task }
+        : linkedElsewhere();
+    },
+    [applyContextWriteback, backlogVisit, groupId, refreshTasks, taskWriteError, tr],
+  );
+
+  // Archives the task as it was when the question was asked; a task changed since stays.
+  const archiveTaskFromBacklog = useCallback(
+    async (task: Task): Promise<string> => {
+      const visit = backlogVisit();
+      if (!visit) return "";
+      const isCurrent = () => modalVisitRef.current === visit;
+      const resp = await moveCoordinationTask(groupId, task.id, "archived", task.rev);
+      if (!isCurrent()) return "";
+      if (!resp.ok) {
+        return resp.error?.code === "task_conflict"
+          ? tr(
+              "context.backlogArchiveChanged",
+              "{{id}} has changed since, so it was not archived.",
+              { id: task.id },
+            )
+          : taskWriteError(
+              resp.error,
+              tr("context.failedToApplyChanges", "Failed to apply changes"),
+            );
+      }
+      await applyContextWriteback(resp);
+      if (isCurrent()) await refreshTasks();
+      return "";
+    },
+    [applyContextWriteback, backlogVisit, groupId, refreshTasks, taskWriteError, tr],
+  );
+
+  const clearBacklogIntent = useCallback(() => setBacklogIntent(null), []);
+  const updateBacklogForm = useCallback(
+    (update: (current: BacklogForm | null) => BacklogForm | null) => setBacklogForm(update),
+    [],
+  );
+
+  // What the drawer shows of a task's backlog entry. An entry the file read cannot settle is
+  // left out rather than guessed; a task goes back only to the entry it came from.
+  const backlogSnapshot = backlog.snapshot;
+  const backlogLoading = backlog.loading;
+  const selectedTaskBacklogLink = useMemo<TaskBacklogLink | null>(() => {
+    if (webReadOnly || taskEditorMode !== "edit" || !selectedTask) return null;
+    const task = selectedTask;
+    const status = taskStatus(task);
+    const unfinished = status === "planned" || status === "active";
+    const putBack = () => goToBacklog({ kind: "putBack", task });
+    const source = task.source;
+    if (!source) {
+      return backlogSnapshot?.configured && backlogSnapshot.exists && unfinished
+        ? { onPutBack: putBack }
+        : null;
+    }
+    if (!backlogSnapshot) return backlogLoading ? { sourceTitle: "" } : null;
+    const located = sourceInFile(backlogSnapshot, source)
+      ? findEntryById(backlogSnapshot, source.entry_id)
+      : null;
+    if (!located) return { sourceTitle: null };
+    return {
+      sourceTitle: located.entry.title || source.entry_id,
+      onShowSource: () => goToBacklog({ kind: "show", source }),
+      onUpdateSource: () => goToBacklog({ kind: "return", task }),
+      onPutBack: unfinished ? putBack : undefined,
+    };
+  }, [backlogLoading, backlogSnapshot, goToBacklog, selectedTask, taskEditorMode, webReadOnly]);
+
   const handleSwitchActiveView = useCallback(
     (next: ContextModalView) => {
       if (next !== "tasks") {
         if (!confirmDiscardTaskChanges()) return;
-        setPendingTaskReadback(null);
+        editorSessionRef.current += 1;
+        setTaskStale("");
         setTaskEditorMode("none");
         setSelectedTaskId("");
         setTaskDraft(null);
@@ -654,7 +999,20 @@ export function ContextModal({
 
   const handleModalClose = useCallback(() => {
     if (typeof window !== "undefined") {
-      if (hasSteeringUnsaved && hasTaskUnsaved) {
+      if (hasBacklogUnsaved) {
+        const ok = window.confirm(
+          hasSteeringUnsaved || hasTaskUnsaved
+            ? tr(
+                "context.unsavedAnyConfirm",
+                "You have unsaved changes here. Discard them and close?",
+              )
+            : tr(
+                "context.unsavedBacklogConfirm",
+                "You have an unsaved backlog draft. Discard it and close?",
+              ),
+        );
+        if (!ok) return;
+      } else if (hasSteeringUnsaved && hasTaskUnsaved) {
         const ok = window.confirm(
           tr(
             "context.unsavedCloseConfirm",
@@ -681,9 +1039,31 @@ export function ContextModal({
       }
     }
     onClose();
-  }, [hasSteeringUnsaved, hasTaskUnsaved, onClose, tr]);
+  }, [hasBacklogUnsaved, hasSteeringUnsaved, hasTaskUnsaved, onClose, tr]);
 
-  const { modalRef } = useModalA11y(isOpen, handleModalClose);
+  // Escape during a keyboard drag cancels the drag alone. The board's drag
+  // handling hears it after this modal does, whatever the modal does with it.
+  const handleModalEscape = useCallback(() => {
+    if (dragTaskId) return;
+    if (taskEditorVisible && activeView === "tasks") closeTaskEditor();
+    else handleModalClose();
+  }, [activeView, closeTaskEditor, dragTaskId, handleModalClose, taskEditorVisible]);
+  const { modalRef } = useModalA11y(isOpen, handleModalEscape);
+  useChatObscuringView(isOpen);
+
+  // Navigation that replaces this Group's context, such as opening a
+  // notification for another Group, asks before unsaved edits are dropped.
+  const dirtyOwner = useRef(Symbol("project context"));
+  useEffect(() => {
+    setWorkspaceDirty(
+      dirtyOwner.current,
+      isOpen && (hasTaskUnsaved || hasSteeringUnsaved || hasBacklogUnsaved),
+    );
+  }, [hasBacklogUnsaved, hasSteeringUnsaved, hasTaskUnsaved, isOpen]);
+  useEffect(() => {
+    const owner = dirtyOwner.current;
+    return () => setWorkspaceDirty(owner, false);
+  }, []);
   const closeAgentsMdExpanded = useCallback(() => setAgentsMdExpanded(false), []);
   const { modalRef: agentsMdExpandedRef } = useModalA11y(agentsMdExpanded, closeAgentsMdExpanded);
 
@@ -725,74 +1105,32 @@ export function ContextModal({
       setSyncError(tr("context.taskTitleRequired", "Task title is required."));
       return;
     }
-    if (
-      String(taskDraft.status || "")
-        .trim()
-        .toLowerCase() === "done"
-    ) {
-      const blockers = getTaskDoneTransitionBlockers({
-        parentId: taskDraft.parentId,
-        taskType: taskDraft.taskType,
-        assignee: taskDraft.assignee,
-        outcome: taskDraft.outcome,
-        notes: taskDraft.notes,
-        checklist: taskDraft.checklist,
-      });
-      if (blockers.length > 0) {
-        setSyncError(formatDoneTransitionGuardMessage(blockers));
-        return;
-      }
-    }
 
     const visit = modalVisitRef.current;
+    const session = editorSessionRef.current;
+    if (savingTaskSession.current === session) return;
     const isCurrent = () => modalVisitRef.current === visit;
-    setSyncBusy(true);
-    setSyncError("");
-    try {
-      if (taskEditorMode === "create") {
-        const resp = await contextSync(groupId, [
-          {
-            op: "task.create",
-            title,
-            outcome: taskDraft.outcome,
-            status: taskDraft.status || "planned",
-            assignee: taskDraft.assignee.trim() || null,
-            priority: taskDraft.priority.trim() || null,
-            parent_id: taskDraft.parentId.trim() || null,
-            blocked_by: parseLineList(taskDraft.blockedBy),
-            waiting_on: taskDraft.waitingOn,
-            handoff_to: taskDraft.handoffTo.trim() || null,
-            task_type: taskDraft.taskType,
-            notes: taskDraft.notes,
-            checklist: parseChecklist(taskDraft.checklist, []),
-          },
-        ]);
-        const nextResp = await applyContextWriteback(resp);
-        if (!nextResp.ok) {
-          if (isCurrent()) {
-            setSyncError(
-              nextResp.error?.message ||
-                resp.error?.message ||
-                tr("context.failedToApplyChanges", "Failed to apply changes"),
-            );
-          }
-          return;
-        }
-        if (!isCurrent()) return;
-        await refreshTasks();
-        if (!isCurrent()) return;
-        setTaskEditorMode("none");
-        setSelectedTaskId("");
-        setTaskDraft(null);
-        return;
-      }
+    // The board is read again for any drawer; the draft, its errors and the
+    // drawer itself only while it is the one that saved.
+    const inEditor = () => isCurrent() && editorSessionRef.current === session;
 
-      if (!selectedTask) return;
-      const resp = await updateCoordinationTask(groupId, {
-        ...selectedTask,
+    // A new task is sent with a request id the daemon knows it by. A try that
+    // fails keeps its id for the task as sent: when it was written after all,
+    // as when the answer was lost, sending the same again finds that task
+    // instead of making another.
+    let create: {
+      op: Record<string, unknown>;
+      sent: string;
+      requestId: string;
+      /** An earlier try under this id may have been written. */
+      mayExist: boolean;
+    } | null = null;
+    if (taskEditorMode === "create") {
+      const op = {
+        op: "task.create",
         title,
         outcome: taskDraft.outcome,
-        status: taskDraft.status,
+        status: taskDraft.status || "planned",
         assignee: taskDraft.assignee.trim() || null,
         priority: taskDraft.priority.trim() || null,
         parent_id: taskDraft.parentId.trim() || null,
@@ -801,41 +1139,175 @@ export function ContextModal({
         handoff_to: taskDraft.handoffTo.trim() || null,
         task_type: taskDraft.taskType,
         notes: taskDraft.notes,
-        checklist: parseChecklist(taskDraft.checklist, selectedTask.checklist),
-      });
-      const nextResp = await applyContextWriteback(resp);
-      if (!nextResp.ok) {
-        if (isCurrent()) {
+        checklist: checklistToSave(taskDraft.checklist),
+      };
+      const sent = JSON.stringify(op);
+      const last = lastCreateRef.current?.session === session ? lastCreateRef.current : null;
+      // Changed since: the old id names what was sent then, so a new one is
+      // used, which makes a second task if that try went through. That is
+      // asked first.
+      if (
+        last?.mayExist &&
+        last.sent !== sent &&
+        typeof window !== "undefined" &&
+        !window.confirm(
+          tr(
+            "context.createMayExist",
+            "Your last try may have created this task already. Create it with your changes anyway? That may make a second task.",
+          ),
+        )
+      ) {
+        return;
+      }
+      const again = last?.sent === sent ? last : null;
+      create = {
+        op,
+        sent,
+        requestId: again?.requestId || newClientId(),
+        mayExist: again?.mayExist ?? false,
+      };
+    }
+
+    // The editor holds still while saving, so the draft is what gets saved.
+    savingTaskSession.current = session;
+    setSyncBusy(true);
+    setSyncError("");
+    try {
+      if (create) {
+        const { op, sent, requestId, mayExist } = create;
+        const resp = await contextSync(groupId, [{ ...op, client_request_id: requestId }]);
+        if (!resp.ok) {
+          if (!inEditor()) return;
+          const code = String(resp.error?.code || "");
+          const lost = ANSWER_UNCONFIRMED.has(code);
+          // Only a refusal before the write shows nothing was made, and only
+          // by this try: one refused under the same id says nothing about an
+          // earlier one.
+          lastCreateRef.current = {
+            session,
+            sent,
+            requestId,
+            mayExist: mayExist || !REFUSED_BEFORE_WRITE.has(code),
+          };
           setSyncError(
-            nextResp.error?.message ||
-              resp.error?.message ||
+            lost
+              ? tr(
+                  "context.createUnconfirmed",
+                  "Creating the task could not be confirmed, so it may already exist. Create it again as it is to finish without making a second one.",
+                )
+              : resp.error?.message ||
+                  tr("context.failedToApplyChanges", "Failed to apply changes"),
+          );
+          return;
+        }
+        // It exists now, made by this try or by an earlier one sent the same.
+        lastCreateRef.current = null;
+        await applyContextWriteback(resp);
+        if (!isCurrent()) return;
+        await refreshTasks();
+        if (!inEditor()) return;
+        editorSessionRef.current += 1;
+        setTaskEditorMode("none");
+        setSelectedTaskId("");
+        setTaskDraft(null);
+        return;
+      }
+
+      if (!selectedTask) {
+        setSyncError(
+          tr("context.taskGoneSave", "This task no longer exists, so it cannot be saved."),
+        );
+        return;
+      }
+      const taskId = selectedTask.id;
+      // The task as the daemon has it now, read once the board has caught up
+      // with the write.
+      const readBack = async () => {
+        if (!isCurrent()) return null;
+        const latest = await readTaskNow(taskId);
+        return inEditor() ? latest : null;
+      };
+      // Only what the draft changed is sent, fenced on the revision the draft
+      // was made from: a task changed since is not overwritten.
+      const resp = await updateCoordinationTask(
+        groupId,
+        taskId,
+        taskDraftPatch(taskDraft),
+        taskDraft.base.rev,
+      );
+      if (!resp.ok) {
+        if (!inEditor()) return;
+        const code = String(resp.error?.code || "");
+        if (code === "task_conflict") {
+          setTaskStale("changed");
+          void readTaskNow(taskId);
+          return;
+        }
+        // Gone, by the daemon's own word: the editor shows so at once,
+        // keeping the draft, even if the board cannot be read again.
+        if (code === "task_not_found") {
+          forgetTask(taskId);
+          void refreshTasks();
+          return;
+        }
+        if (REFUSED_BEFORE_WRITE.has(code)) {
+          setSyncError(
+            taskWriteError(
+              resp.error,
               tr("context.failedToApplyChanges", "Failed to apply changes"),
+            ),
+          );
+          return;
+        }
+        // Whether it was saved is not known; the task as it is now tells, if
+        // it is read with its revision. Saving again is safe either way: it is
+        // fenced on the same revision.
+        const latest = await readBack();
+        if (!inEditor()) return;
+        const read = latest && isTaskRevision(latest.rev) ? latest : null;
+        if (read && taskHoldsDraftSave(read, taskDraft)) {
+          setTaskDraft(taskToDraft(read));
+        } else if (read && read.rev === taskDraft.base.rev) {
+          setSyncError(tr("context.taskNotSaved", "Your changes were not saved. Try again."));
+        } else if (read) {
+          setTaskStale("changed");
+        } else {
+          setSyncError(
+            tr(
+              "context.taskSaveUnconfirmed",
+              "It could not be confirmed whether your changes were saved. Saving again will not apply them twice.",
+            ),
           );
         }
         return;
       }
-      if (!isCurrent()) return;
-      setPendingTaskReadback({
-        taskId: selectedTask.id,
-        previousUpdatedAt: String(selectedTask.updated_at || ""),
-      });
-      await refreshTasks();
-      if (isCurrent()) await loadTaskDetail(selectedTask.id);
+      // Saved. Reading the context again can fail without undoing that.
+      await applyContextWriteback(resp);
+      const saved = await readBack();
+      if (!inEditor()) return;
+      // Saved, but not read with its revision: the draft keeps what was saved,
+      // and saving again waits for a reload, as the next save is fenced on it.
+      if (saved && isTaskRevision(saved.rev)) setTaskDraft(taskToDraft(saved));
+      else setTaskStale("unconfirmed");
     } finally {
+      if (savingTaskSession.current === session) savingTaskSession.current = null;
       if (isCurrent()) setSyncBusy(false);
     }
   }, [
     applyContextWriteback,
-    formatDoneTransitionGuardMessage,
+    forgetTask,
     groupId,
-    loadTaskDetail,
+    readTaskNow,
     refreshTasks,
     selectedTask,
     taskDraft,
     taskEditorMode,
+    taskWriteError,
     tr,
   ]);
 
+  // A deletion removes the task's whole subtree, so it is fenced on what the
+  // user confirmed: the task and its subtree as one read showed them.
   const handleDeleteTask = useCallback(
     async (task: Task) => {
       if (!groupId) return;
@@ -843,12 +1315,13 @@ export function ContextModal({
       if (!deleteInfo?.allowed) return;
       if (!confirmDiscardTaskChanges()) return;
       if (typeof window !== "undefined") {
+        // The subtree's total counts the task itself; the user is told of the ones below it.
         const confirmed = window.confirm(
           deleteInfo.total > 1
             ? tr(
                 "context.deleteTaskCascadeConfirm",
                 'Delete task "{{title}}" and its {{count}} unexecuted tasks?',
-                { title: taskTitle(task) || task.id, count: deleteInfo.total },
+                { title: taskTitle(task) || task.id, count: deleteInfo.total - 1 },
               )
             : tr("context.deleteTaskConfirm", 'Delete task "{{title}}" permanently?', {
                 title: taskTitle(task) || task.id,
@@ -858,24 +1331,45 @@ export function ContextModal({
       }
 
       const visit = modalVisitRef.current;
+      const session = editorSessionRef.current;
       const isCurrent = () => modalVisitRef.current === visit;
+      const inEditor = () => isCurrent() && editorSessionRef.current === session;
       setSyncBusy(true);
       setSyncError("");
       try {
-        const resp = await deleteCoordinationTask(groupId, task.id);
-        const nextResp = await applyContextWriteback(resp);
-        if (!nextResp.ok) {
-          if (isCurrent()) {
+        const resp = await deleteCoordinationTaskConfirmed(groupId, task.id, {
+          rev: deleteInfo.rev,
+          total: deleteInfo.total,
+          tasksVersion: deleteInfo.tasksVersion,
+        });
+        if (!resp.ok) {
+          const error = resp.error;
+          if (!inEditor()) return;
+          if (error?.code === "task_changed" || error?.code === "task_conflict") {
             setSyncError(
-              nextResp.error?.message ||
-                resp.error?.message ||
-                tr("context.failedToDeleteTask", "Failed to delete task"),
+              tr(
+                "context.taskDeleteChanged",
+                "Something changed after you confirmed, so nothing was deleted. Check the task and confirm again.",
+              ),
             );
+            void readTaskNow(task.id);
+          } else if (error?.code === "task_not_found") {
+            // Already gone, by the daemon's own word: the editor shows so.
+            forgetTask(task.id);
+            void refreshTasks();
+          } else {
+            setSyncError(
+              taskWriteError(error, tr("context.failedToDeleteTask", "Failed to delete task")),
+            );
+            // Unless refused outright, it may be gone: reading it shows which.
+            if (!REFUSED_BEFORE_WRITE.has(String(error?.code || ""))) void readTaskNow(task.id);
           }
           return;
         }
+        await applyContextWriteback(resp);
         if (!isCurrent()) return;
-        if (selectedTaskId === task.id) {
+        if (inEditor()) {
+          editorSessionRef.current += 1;
           setTaskEditorMode("none");
           setSelectedTaskId("");
           setTaskDraft(null);
@@ -892,35 +1386,56 @@ export function ContextModal({
       deleteInfoById,
       forgetTask,
       groupId,
+      readTaskNow,
       refreshTasks,
-      selectedTaskId,
+      taskWriteError,
       tr,
     ],
   );
 
-  const handleResetTask = useCallback(() => {
+  // Drop the edits. An existing task loads its latest version, which is also
+  // the way out of a draft that went stale.
+  const handleResetTask = useCallback(async () => {
+    if (!taskDraft) return;
+    setSyncError("");
     if (taskEditorMode === "create") {
-      setTaskDraft(emptyTaskDraft("planned"));
-      setSyncError("");
+      setTaskDraft({ ...taskDraft.base.fields, base: taskDraft.base });
       return;
     }
-    if (!selectedTask) return;
-    const nextDraft = taskToDraft(selectedTask);
-    setTaskDraft(nextDraft);
-    setSyncError("");
-  }, [selectedTask, taskEditorMode]);
+    if (!selectedTaskId) return;
+    const visit = modalVisitRef.current;
+    const draft = taskDraft;
+    const latest = await readTaskNow(selectedTaskId);
+    // A later edit, selection or visit wins over this reload.
+    if (modalVisitRef.current !== visit || taskDraftRef.current !== draft) return;
+    // Only a task just read, with its revision, replaces the draft: what is
+    // cached may be what went stale, and a deleted task shows as such.
+    if (!latest || !isTaskRevision(latest.rev)) {
+      setSyncError(
+        tr(
+          "context.taskReloadFailed",
+          "The latest version could not be loaded, so your edits are kept. Try again.",
+        ),
+      );
+      return;
+    }
+    setTaskStale("");
+    setTaskDraft(taskToDraft(latest));
+  }, [readTaskNow, selectedTaskId, taskDraft, taskEditorMode, tr]);
 
   const handleOpenCreate = useCallback(
-    (status: BoardStatus = "planned") => {
-      if (!confirmDiscardTaskChanges()) return;
-      setPendingTaskReadback(null);
+    (status: BoardStatus = "planned", parentId = "") => {
+      if (!canSwitchTask()) return;
+      editorSessionRef.current += 1;
+      setTaskStale("");
       setTaskEditorMode("create");
       setSelectedTaskId("");
-      setTaskDraft(emptyTaskDraft(status));
+      setTaskDraft(emptyTaskDraft(status, parentId));
       setSyncError("");
+      setBoardError("");
       setActiveView("tasks");
     },
-    [confirmDiscardTaskChanges],
+    [canSwitchTask],
   );
 
   const handleEditAgentsMd = useCallback(async () => {
@@ -999,50 +1514,6 @@ export function ContextModal({
     }
   }, [agentsMd?.path, groupId, notifyAgents, notifyMessage, agentsMdText, tr]);
 
-  const handleAddCoordinationNote = useCallback(
-    async (kind: "decision" | "handoff") => {
-      if (!groupId) return;
-      const draft = kind === "decision" ? decisionDraft : handoffDraft;
-      const summary = String(draft.summary || "").trim();
-      if (!summary) {
-        setActivityError(tr("context.noteSummaryRequired", "Summary is required."));
-        return;
-      }
-      const visit = modalVisitRef.current;
-      const isCurrent = () => modalVisitRef.current === visit;
-      setActivityBusyKind(kind);
-      setActivityError("");
-      try {
-        const resp = await addCoordinationNote(
-          groupId,
-          kind,
-          summary,
-          String(draft.taskId || "").trim() || null,
-        );
-        const nextResp = await applyContextWriteback(resp);
-        if (!nextResp.ok) {
-          if (isCurrent()) {
-            setActivityError(
-              nextResp.error?.message ||
-                resp.error?.message ||
-                tr("context.failedToApplyChanges", "Failed to apply changes"),
-            );
-          }
-          return;
-        }
-        if (!isCurrent()) return;
-        if (kind === "decision") {
-          setDecisionDraft(emptyNoteDraft());
-        } else {
-          setHandoffDraft(emptyNoteDraft());
-        }
-      } finally {
-        if (isCurrent()) setActivityBusyKind(null);
-      }
-    },
-    [applyContextWriteback, decisionDraft, groupId, handoffDraft, tr],
-  );
-
   const startBriefEdit = useCallback(() => {
     if (!editingBrief) setBriefDraft(briefToDraft(brief));
     setEditingBrief(true);
@@ -1061,6 +1532,7 @@ export function ContextModal({
       ui={ui}
       agentsMdBusy={agentsMdBusy}
       agentsMdError={agentsMdError}
+      agentsMdNoScope={agentsMdNoScope}
       notifyError={notifyError}
       agentsMdNotice={agentsMdNotice}
       agentsMdPathLabel={agentsMdPathLabel}
@@ -1083,11 +1555,53 @@ export function ContextModal({
 
   if (!isOpen) return null;
 
+  const renderTaskEditor = (singlePane: boolean) => (
+    <TaskEditorPanel
+      key={editorSessionRef.current}
+      closeLabel={singlePane ? tr("context.backToTasks", "Back to tasks") : undefined}
+      tr={tr}
+      ui={ui}
+      taskEditorMode={taskEditorMode}
+      taskDraft={taskDraft}
+      hasTaskUnsaved={hasTaskUnsaved}
+      syncBusy={syncBusy}
+      error={syncError}
+      taskGone={taskGone}
+      taskStale={
+        taskStale || (!syncBusy && hasTaskUnsaved && taskChangedElsewhere ? "changed" : "")
+      }
+      selectedTask={selectedTask}
+      subtasks={selectedSubtasks}
+      assigneeChoices={assigneeChoices}
+      parentChoices={activeTaskOptions}
+      selectedTaskDeleteInfo={selectedTaskDeleteInfo}
+      selectedTaskDeleteHint={selectedTaskDeleteHint}
+      taskWorkflowCoverage={taskWorkflowCoverage}
+      taskTypeId={taskDraft?.taskType || "standard"}
+      selectedTaskType={selectedTaskType}
+      titleRef={taskTitleRef}
+      setTaskDraft={setTaskDraft}
+      onTaskTypeChange={(nextTaskTypeId) =>
+        setTaskDraft((prev) => (prev ? { ...prev, taskType: nextTaskTypeId } : prev))
+      }
+      onResetTask={() => void handleResetTask()}
+      onClose={closeTaskEditor}
+      onDeleteSelectedTask={() => {
+        if (selectedTask) void handleDeleteTask(selectedTask);
+      }}
+      onSaveTask={() => void handleSaveTask()}
+      onOpenTask={openSubtask}
+      onAddSubtask={() => {
+        if (selectedTask) handleOpenCreate("planned", selectedTask.id);
+      }}
+      backlogLink={selectedTaskBacklogLink}
+    />
+  );
+
   const views: { value: ContextModalView; label: string }[] = [
     { value: "tasks", label: tr("context.tasks", "Tasks") },
     { value: "instructions", label: tr("context.agentsMd", "AGENTS.md") },
     { value: "agents", label: tr("context.agents", "Agent State") },
-    { value: "log", label: tr("context.activityLog", "Coordination log") },
     { value: "self_evolving_skills", label: tr("context.skillsTab", "Skills") },
   ];
 
@@ -1116,6 +1630,7 @@ export function ContextModal({
         <div
           ref={navigationRef}
           role="tablist"
+          data-context-tabs
           aria-label={tr("context.tabsAria", "Context sections")}
           className="flex shrink-0 gap-5 overflow-x-auto scroll-px-4 sm:scroll-px-5 border-b border-[var(--glass-border-subtle)] bg-[var(--color-bg-primary)] px-4 sm:px-5"
           onKeyDown={(event) => {
@@ -1161,21 +1676,32 @@ export function ContextModal({
             </button>
           ))}
         </div>
-        <div
-          ref={contentRef}
-          className="min-h-0 flex-1 overflow-y-auto bg-[var(--color-bg-primary)]"
+        <TaskDetailLayout
+          scrollRef={contentRef}
+          isDark={isDark}
+          detailLabel={
+            taskEditorMode === "create"
+              ? tr("context.newTask", "New task")
+              : tr("context.taskDetails", "Task editor")
+          }
+          resizeLabel={tr("context.resizeTaskDetail", "Resize task details")}
+          renderDetail={taskEditorVisible && activeView === "tasks" ? renderTaskEditor : undefined}
         >
           <div className="flex min-h-full flex-col gap-4 p-4 sm:p-5">
-            {syncError ? (
-              <div
-                className={classNames(
-                  "rounded-xl border px-3 py-2 text-sm",
-                  "border-rose-500/30 bg-rose-500/15 text-rose-600 dark:text-rose-400",
-                )}
-              >
-                {syncError}
-              </div>
-            ) : null}
+            {[boardError, taskEditorVisible ? "" : syncError].map((message, index) =>
+              message ? (
+                <div
+                  key={index}
+                  role="alert"
+                  className={classNames(
+                    "rounded-xl border px-3 py-2 text-sm",
+                    "border-rose-500/30 bg-rose-500/15 text-rose-600 dark:text-rose-400",
+                  )}
+                >
+                  {message}
+                </div>
+              ) : null,
+            )}
 
             {views.map(({ value }) => (
               <div
@@ -1190,83 +1716,105 @@ export function ContextModal({
                 {activeView === value &&
                   (value === "tasks" ? (
                     <div className="space-y-4">
-                      <WorkingSummaryPanel
-                        tr={tr}
-                        ui={ui}
-                        brief={brief}
-                        tasksSummary={tasksSummary}
-                        attentionCounts={attentionCounts}
-                        unassignedCount={unassignedCount}
-                        editingBrief={editingBrief}
-                        briefDraft={briefDraft}
-                        syncBusy={syncBusy}
-                        onStartBriefEdit={startBriefEdit}
-                        onCancelBriefEdit={cancelBriefEdit}
-                        onSaveBrief={() => void handleSaveBrief()}
-                        onBriefDraftChange={(updater) => setBriefDraft((prev) => updater(prev))}
-                      />
+                      {webReadOnly ? null : (
+                        <SegmentedControl
+                          label={tr("context.tasksViewLabel", "Task view")}
+                          value={tasksView}
+                          options={[
+                            { value: "board", label: tr("context.tasks", "Tasks") },
+                            { value: "backlog", label: tr("context.backlog", "Backlog") },
+                          ]}
+                          onChange={chooseTasksView}
+                        />
+                      )}
+                      {showingBacklog ? (
+                        <BacklogPanel
+                          // What it says and asks belongs to one Group's folder.
+                          key={`${groupId}\n${backlogScopeKey}\n${backlogScopeUrl}`}
+                          backlog={backlog}
+                          scopeState={backlogScopeState}
+                          form={backlogForm}
+                          setForm={updateBacklogForm}
+                          intent={backlogIntent}
+                          onIntentDone={clearBacklogIntent}
+                          isDark={isDark}
+                          tr={tr}
+                          ui={ui}
+                          onOpenTask={(taskId) => void openTaskById(taskId)}
+                          onTaskPromoted={showPromotedTask}
+                          onLinkSource={linkTaskSource}
+                          onArchiveTask={archiveTaskFromBacklog}
+                        />
+                      ) : (
+                        <>
+                          <WorkingSummaryPanel
+                            tr={tr}
+                            ui={ui}
+                            brief={brief}
+                            tasksSummary={tasksSummary}
+                            attentionCounts={attentionCounts}
+                            unassignedCount={unassignedCount}
+                            editingBrief={editingBrief}
+                            briefDraft={briefDraft}
+                            syncBusy={syncBusy}
+                            onStartBriefEdit={startBriefEdit}
+                            onCancelBriefEdit={cancelBriefEdit}
+                            onSaveBrief={() => void handleSaveBrief()}
+                            onBriefDraftChange={(updater) => setBriefDraft((prev) => updater(prev))}
+                          />
 
-                      <TaskBoard
-                        tr={tr}
-                        ui={ui}
-                        syncBusy={syncBusy}
-                        taskQuery={taskQuery}
-                        assigneeFilter={assigneeFilter}
-                        assigneeOptions={assigneeOptions}
-                        taskFilter={taskFilter}
-                        tasksSummary={tasksSummary}
-                        attentionCounts={attentionCounts}
-                        unassignedCount={unassignedCount}
-                        hasArchivedTasks={hasArchivedTasks}
-                        archivedExpanded={archivedExpanded}
-                        hasVisibleTasks={hasVisibleTasks}
-                        hiddenArchivedMatches={hiddenArchivedMatches}
-                        filteredBoard={filteredBoard}
-                        columnPages={taskColumnPages}
-                        taskLoading={taskLoading}
-                        taskLoadError={taskLoadError}
-                        taskMap={taskMap}
-                        selectedTaskId={selectedTaskId}
-                        dragTaskId={dragTaskId}
-                        sensors={sensors}
-                        onTaskQueryChange={setTaskQuery}
-                        onAssigneeFilterChange={setAssigneeFilter}
-                        onTaskFilterChange={setTaskFilter}
-                        onClearFilters={() => {
-                          setTaskQuery("");
-                          setTaskFilter("all");
-                          setAssigneeFilter("__all__");
-                        }}
-                        onArchivedExpandedChange={setArchivedExpanded}
-                        onOpenCreate={handleOpenCreate}
-                        onDragStart={handleDragStart}
-                        onDragEnd={handleDragEnd}
-                        onDragCancel={() => setDragTaskId("")}
-                        onSelectTask={selectTask}
-                        onMoveTaskToStatus={(task, nextStatus) =>
-                          void moveTaskToStatus(task, nextStatus)
-                        }
-                        onLoadMore={(status) => void loadMoreTasks(status)}
-                        onRetryLoad={() => void refreshTasks()}
-                      />
+                          <TaskBoard
+                            tr={tr}
+                            ui={ui}
+                            syncBusy={syncBusy}
+                            taskQuery={taskQuery}
+                            assigneeFilter={assigneeFilter}
+                            assigneeOptions={assigneeOptions}
+                            taskFilter={taskFilter}
+                            tasksSummary={tasksSummary}
+                            attentionCounts={attentionCounts}
+                            unassignedCount={unassignedCount}
+                            hasArchivedTasks={hasArchivedTasks}
+                            archivedExpanded={archivedExpanded}
+                            hasVisibleTasks={hasVisibleTasks}
+                            hiddenArchivedMatches={hiddenArchivedMatches}
+                            filteredBoard={filteredBoard}
+                            columnPages={taskColumnPages}
+                            taskLoading={taskLoading}
+                            taskLoadError={taskLoadError}
+                            matchingCount={taskMatchingCount}
+                            searchQuery={taskSearchQuery}
+                            taskMap={taskMap}
+                            subtaskProgress={subtaskProgress}
+                            selectedTaskId={selectedTaskId}
+                            dragTaskId={dragTaskId}
+                            sensors={sensors}
+                            onTaskQueryChange={setTaskQuery}
+                            onAssigneeFilterChange={setAssigneeFilter}
+                            onTaskFilterChange={setTaskFilter}
+                            onClearFilters={() => {
+                              setTaskQuery("");
+                              setTaskFilter("all");
+                              setAssigneeFilter("__all__");
+                            }}
+                            onArchivedExpandedChange={setArchivedExpanded}
+                            onOpenCreate={handleOpenCreate}
+                            onDragStart={handleDragStart}
+                            onDragEnd={handleDragEnd}
+                            onDragCancel={() => setDragTaskId("")}
+                            onSelectTask={selectTask}
+                            onMoveTaskToStatus={(task, nextStatus) =>
+                              void moveTaskToStatus(task, nextStatus)
+                            }
+                            onRestoreTask={(task) => void restoreTask(task)}
+                            onLoadMore={(status) => void loadMoreTasks(status)}
+                            onRetryLoad={() => void refreshTasks()}
+                          />
+                        </>
+                      )}
                     </div>
                   ) : value === "instructions" ? (
                     agentsMdPanel
-                  ) : value === "log" ? (
-                    <CoordinationLogPanel
-                      tr={tr}
-                      ui={ui}
-                      activityBusyKind={activityBusyKind}
-                      activityError={activityError}
-                      recentDecisions={recentDecisions}
-                      recentHandoffs={recentHandoffs}
-                      decisionDraft={decisionDraft}
-                      handoffDraft={handoffDraft}
-                      activeTaskOptions={activeTaskOptions}
-                      onDecisionDraftChange={setDecisionDraft}
-                      onHandoffDraftChange={setHandoffDraft}
-                      onAddCoordinationNote={(kind) => void handleAddCoordinationNote(kind)}
-                    />
                   ) : value === "agents" ? (
                     <AgentsView agents={agents} tr={tr} ui={ui} />
                   ) : (
@@ -1280,61 +1828,8 @@ export function ContextModal({
               </div>
             ))}
           </div>
-        </div>
+        </TaskDetailLayout>
       </ModalFrame>
-
-      {taskEditorVisible && typeof document !== "undefined"
-        ? createPortal(
-            <div
-              className="fixed inset-0 z-[65] animate-fade-in"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="context-task-drawer-title"
-            >
-              <div className="absolute inset-0 glass-overlay" onPointerDown={closeTaskEditor} />
-              <div className="absolute inset-y-0 right-0 flex w-full justify-end">
-                <div className="h-full w-full sm:w-[min(860px,calc(100vw-1.5rem))]">
-                  <div className="flex h-full flex-col border-l border-[var(--glass-border-subtle)] shadow-2xl glass-modal">
-                    <div className="sr-only" id="context-task-drawer-title">
-                      {taskEditorMode === "create"
-                        ? tr("context.newTask", "New task")
-                        : tr("context.taskDetails", "Task editor")}
-                    </div>
-                    <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto">
-                      <TaskEditorPanel
-                        tr={tr}
-                        ui={ui}
-                        taskEditorMode={taskEditorMode}
-                        taskDraft={taskDraft}
-                        hasTaskUnsaved={hasTaskUnsaved}
-                        syncBusy={syncBusy}
-                        selectedTask={selectedTask}
-                        selectedTaskDeleteInfo={selectedTaskDeleteInfo}
-                        selectedTaskDeleteHint={selectedTaskDeleteHint}
-                        taskWorkflowCoverage={taskWorkflowCoverage}
-                        taskTypeId={taskDraft?.taskType || "standard"}
-                        selectedTaskType={selectedTaskType}
-                        setTaskDraft={setTaskDraft}
-                        onTaskTypeChange={(nextTaskTypeId) =>
-                          setTaskDraft((prev) =>
-                            prev ? { ...prev, taskType: nextTaskTypeId } : prev,
-                          )
-                        }
-                        onResetTask={handleResetTask}
-                        onClose={closeTaskEditor}
-                        onDeleteSelectedTask={() => {
-                          if (selectedTask) void handleDeleteTask(selectedTask);
-                        }}
-                        onSaveTask={() => void handleSaveTask()}
-                      />
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>,
-            document.body,
-          )
-        : null}
 
       {agentsMdExpanded && typeof document !== "undefined"
         ? createPortal(
@@ -1366,6 +1861,7 @@ export function ContextModal({
                     ui={ui}
                     agentsMdBusy={agentsMdBusy}
                     agentsMdError={agentsMdError}
+                    agentsMdNoScope={agentsMdNoScope}
                     notifyError={notifyError}
                     agentsMdNotice={agentsMdNotice}
                     agentsMdPathLabel={agentsMdPathLabel}

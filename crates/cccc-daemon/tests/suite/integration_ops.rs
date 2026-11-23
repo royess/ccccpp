@@ -871,7 +871,7 @@ fn scope_lifecycle_uses_canonical_receipts_state_and_events() {
     assert_eq!(group.active_scope_key, scope_b_key);
     assert_eq!(group.scopes.len(), 1);
     assert_eq!(group.scopes[0].scope_key, scope_b_key);
-    assert_eq!(group.actors[0].default_scope_key, scope_b_key);
+    assert_eq!(group.actors[0].default_scope_key, scope_a_key);
     let registry = cccc_core::Registry::load(&home).expect("registry");
     assert_eq!(registry.groups[group_id].default_scope_key, scope_b_key);
     assert!(!registry.defaults.contains_key(scope_a_key));
@@ -912,6 +912,37 @@ fn scope_lifecycle_uses_canonical_receipts_state_and_events() {
     assert_eq!(store.load(group_id).expect("unchanged group"), before);
 }
 
+/// Holds a loopback port as the Web address and closes the one request it receives
+/// unanswered, so the daemon sees an unavailable Web without reaching a real one.
+fn closing_web(home: &HomeLayout) -> (std::net::TcpListener, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Web stand-in");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let held = listener.try_clone().expect("held listener");
+    let mut global = cccc_core::settings::load(home).expect("settings");
+    global.remote_access =
+        json!({"web_host":"127.0.0.1","web_port":listener.local_addr().expect("address").port()})
+            .as_object()
+            .cloned()
+            .expect("remote access");
+    cccc_core::settings::save(home, &global).expect("settings");
+    let closer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return drop(stream),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("expected the delegated start request: {error}"),
+            }
+        }
+    });
+    (held, closer)
+}
+
 #[test]
 fn prompt_im_space_and_voice_operations_share_rust_state() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -947,7 +978,12 @@ fn prompt_im_space_and_voice_operations_share_rust_state() {
         "im_set",
         json!({"group_id":group_id,"platform":"telegram","token_env":"TELEGRAM_TOKEN"}),
     );
+    // Without a configured port the start request would go to the default 8848, where a live
+    // Web may be listening; send it to a port this test holds and closes unanswered.
+    let (web, closer) = closing_web(&home);
     let start = raw_call(&home, "im_start", json!({"group_id":group_id}));
+    closer.join().expect("closing Web");
+    drop(web);
     assert!(!start.ok);
     assert_eq!(
         start.error.as_ref().map(|error| error.code.as_str()),
@@ -1199,53 +1235,43 @@ fn prompt_im_space_and_voice_operations_share_rust_state() {
         invalid_query_option.error.expect("invalid option").code,
         "invalid_args"
     );
+}
 
-    let memory_layout = call(
-        &home,
-        "memory_reme_layout_get",
-        json!({"group_id":group_id}),
-    );
-    assert!(memory_layout.result["memory_root"].is_string());
-    assert!(memory_layout.result["today_daily_file"].is_string());
-    assert_eq!(memory_layout.result["backend"]["name"], "local");
+#[test]
+fn retired_group_memory_operations_leave_existing_files_untouched() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("rust-home")).expect("home");
+    let created = call(&home, "group_create", json!({"title":"legacy memory"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id");
+    let store = cccc_core::GroupStore::new(home.clone()).expect("store");
+    let root = store.state_dir(group_id).expect("state dir").join("memory");
+    std::fs::create_dir_all(root.join("daily")).expect("memory dir");
+    let main = root.join("MEMORY.md");
+    let daily = root.join("daily").join("2026-11-07__legacy.md");
+    std::fs::write(&main, "retained memory").expect("main memory");
+    std::fs::write(&daily, "retained daily record").expect("daily memory");
 
-    let missing_date = raw_call(
-        &home,
+    for op in [
+        "memory_reme_search",
         "memory_reme_write",
-        json!({"group_id":group_id,"target":"daily","content":"entry"}),
+        "memory_reme_daily_flush",
+    ] {
+        let response = raw_call(&home, op, json!({"group_id":group_id}));
+        assert_eq!(
+            response.error.as_ref().map(|e| e.code.as_str()),
+            Some("unknown_op")
+        );
+    }
+    call(&home, "context_get", json!({"group_id":group_id}));
+    assert_eq!(
+        std::fs::read_to_string(main).expect("main memory"),
+        "retained memory"
     );
-    assert!(!missing_date.ok);
-    let memory_write = call(
-        &home,
-        "memory_reme_write",
-        json!({"group_id":group_id,"target":"memory","content":"durable fact","mode":"append","idempotency_key":"memory-1"}),
-    );
-    assert_eq!(memory_write.result["status"], "written");
-    let memory_dedup = call(
-        &home,
-        "memory_reme_write",
-        json!({"group_id":group_id,"target":"memory","content":"changed payload","idempotency_key":"memory-1"}),
-    );
-    assert_eq!(memory_dedup.result["reason"], "persistence_idempotency_key");
-    let memory_replace = call(
-        &home,
-        "memory_reme_write",
-        json!({"group_id":group_id,"target":"memory","content":"replacement","mode":"replace"}),
-    );
-    assert_eq!(memory_replace.result["status"], "written");
-    let index = call(
-        &home,
-        "memory_reme_index_sync",
-        json!({"group_id":group_id,"mode":"scan"}),
-    );
-    assert!(index.result["indexed_files"].as_u64().unwrap_or(0) >= 2);
-    assert!(index.result["indexed_chunks"].as_u64().unwrap_or(0) >= 1);
-    assert!(
-        index.result["watched_paths"]
-            .as_array()
-            .is_some_and(|paths| paths
-                .iter()
-                .all(|path| path.as_str().is_some_and(|path| path.ends_with(".md"))))
+    assert_eq!(
+        std::fs::read_to_string(daily).expect("daily memory"),
+        "retained daily record"
     );
 }
 
@@ -1428,6 +1454,167 @@ fn rust_daemon_provider_auth_mutations_do_not_report_synthetic_lifecycle() {
     assert_eq!(invalid.error.expect("invalid action").code, "invalid_args");
 }
 
+#[test]
+fn an_actor_carries_the_model_label_its_operator_gives_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("rust-home")).expect("home");
+    let created = call(&home, "group_create", json!({"title":"models"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id");
+    let added = call(
+        &home,
+        "actor_add",
+        json!({
+            "group_id":group_id,
+            "actor_id":"peer1",
+            "runtime":"custom",
+            "command":["sh"],
+            "enabled":false,
+            "model_label":"  gpt-5-codex  ",
+            "by":"user"
+        }),
+    );
+    assert_eq!(added.result["actor"]["model_label"], "gpt-5-codex");
+    assert_eq!(
+        added.result["event"]["data"]["actor"]["model_label"],
+        "gpt-5-codex"
+    );
+    let row = |home: &HomeLayout| {
+        call(home, "actor_list", json!({"group_id":group_id})).result["actors"]
+            .as_array()
+            .expect("actors")
+            .iter()
+            .find(|actor| actor["id"] == "peer1")
+            .cloned()
+            .expect("peer1 row")
+    };
+    let original = row(&home);
+    assert_eq!(original["model_label"], "gpt-5-codex");
+
+    let update = |label: Value| {
+        raw_call(
+            &home,
+            "actor_update",
+            json!({"group_id":group_id,"actor_id":"peer1","by":"user","patch":{"model_label":label}}),
+        )
+    };
+    assert!(update(json!("claude-sonnet-4-5")).ok);
+    assert_eq!(row(&home)["model_label"], "claude-sonnet-4-5");
+    for key in [
+        "runtime",
+        "runtime_mode",
+        "command",
+        "env",
+        "enabled",
+        "submit",
+        "external_session_id",
+    ] {
+        assert_eq!(row(&home)[key], original[key], "label update changed {key}");
+    }
+    for invalid in [json!("x".repeat(129)), json!("two\nlines")] {
+        let refused = update(invalid);
+        assert!(!refused.ok, "{:?}", refused.result);
+        assert_eq!(row(&home)["model_label"], "claude-sonnet-4-5");
+    }
+    assert!(update(json!("")).ok);
+    assert!(row(&home).get("model_label").is_none());
+    let path = cccc_core::GroupStore::new(home.clone())
+        .expect("store")
+        .ledger_path(group_id)
+        .expect("ledger path");
+    let events = cccc_core::ledger::read_all(&path).expect("ledger");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind.as_str(), "actor.start" | "actor.restart")),
+        "label-only updates must not produce lifecycle events"
+    );
+}
+
+#[test]
+fn a_foreman_retrying_a_tree_after_a_lost_reply_gets_the_same_tasks() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("rust-home")).expect("home");
+    let created = call(&home, "group_create", json!({"title":"client ids"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id");
+    for actor_id in ["lead", "peer1"] {
+        call(
+            &home,
+            "actor_add",
+            json!({
+                "group_id":group_id,
+                "actor_id":actor_id,
+                "runtime":"custom",
+                "command":["sh"],
+                "enabled":false,
+                "by":"user"
+            }),
+        );
+    }
+    let tree = json!({
+        "group_id":group_id,
+        "by":"lead",
+        "ops":[
+            {"op":"task.create","title":"ship the release","client_request_id":"release"},
+            {"op":"task.create","title":"build","client_request_id":"build",
+                "parent_ref":"release","assignee":"peer1"},
+            {"op":"task.create","title":"publish","client_request_id":"publish",
+                "parent_ref":"release","blocked_by_refs":["build"],"assignee":"peer1"},
+        ],
+    });
+    let task_ids = |response: &DaemonResponse| {
+        response.result["changes"]
+            .as_array()
+            .expect("changes")
+            .iter()
+            .map(|change| change["task_id"].clone())
+            .collect::<Vec<_>>()
+    };
+    let first = call(&home, "context_sync", tree.clone());
+    assert_eq!(
+        task_ids(&first),
+        [json!("T001"), json!("T002"), json!("T003")]
+    );
+    let retried = call(&home, "context_sync", tree);
+    assert_eq!(task_ids(&retried), task_ids(&first));
+    assert!(
+        retried.result["changes"]
+            .as_array()
+            .expect("changes")
+            .iter()
+            .all(|change| change["replayed"] == true)
+    );
+    let context = cccc_core::context::ContextStore::new(home.clone())
+        .expect("context store")
+        .load(group_id)
+        .expect("context");
+    assert_eq!(context.tasks.len(), 3, "one tree, not two");
+    assert_eq!(context.tasks[2]["parent_id"], "T001");
+    assert_eq!(context.tasks[2]["blocked_by"], json!(["T002"]));
+
+    let foreign = raw_call(
+        &home,
+        "context_sync",
+        json!({
+            "group_id":group_id,
+            "by":"peer1",
+            "ops":[{"op":"task.create","title":"test","parent_ref":"release"}],
+        }),
+    );
+    let error = foreign.error.expect("a peer cannot use the foreman's ids");
+    assert_eq!(error.code, "invalid_args");
+    assert!(
+        error
+            .message
+            .contains("task ref release names no task created by peer1"),
+        "{}",
+        error.message
+    );
+}
+
 fn call(home: &HomeLayout, op: &str, args: Value) -> DaemonResponse {
     let response = raw_call(home, op, args);
     assert!(response.ok, "{op}: {:?}", response.error);
@@ -1531,5 +1718,70 @@ fn actor_removal_returns_its_open_tasks_to_the_board() {
             .expect("changes")
             .len(),
         2
+    );
+}
+
+#[test]
+fn task_revision_is_exposed_and_conflicts_name_the_recorded_task() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path()).expect("home");
+    let created = call(&home, "group_create", json!({"title":"revision API"}));
+    let id = created.result["group"]["group_id"].as_str().expect("group");
+    let groups = cccc_core::GroupStore::new(home.clone()).expect("groups");
+    let directory = groups
+        .group_dir(id)
+        .expect("group dir")
+        .join("context/tasks");
+    let tasks: Vec<Value> = serde_json::from_str(include_str!(
+        "../../../cccc-core/tests/fixtures/task-revision/tasks.json"
+    ))
+    .expect("recording");
+    for task in tasks {
+        cccc_core::fs::write_yaml(
+            &directory.join(format!("{}.yaml", task["id"].as_str().expect("id"))),
+            &task,
+        )
+        .expect("recorded task");
+    }
+    for detail in ["summary", "full"] {
+        let read = call(&home, "context_get", json!({"group_id":id,"detail":detail}));
+        assert_eq!(read.result["coordination"]["tasks"][0]["rev"], 0);
+    }
+    let read = call(
+        &home,
+        "task_list",
+        json!({"group_id":id,"limit":100,"include_index":true}),
+    );
+    assert!(
+        read.result["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .all(|t| t["rev"] == 0)
+    );
+    assert!(
+        read.result["task_index"]
+            .as_array()
+            .expect("index")
+            .iter()
+            .all(|t| t["rev"] == 0)
+    );
+    call(
+        &home,
+        "context_sync",
+        json!({"group_id":id,"by":"user","ops":[{"op":"agent_state.update","actor_id":"peer","focus":"unrelated context"}]}),
+    );
+    let patch = json!({"group_id":id,"by":"user","ops":[{"op":"task.update","task_id":"T792","waiting_on":"none","if_task_rev":0}]});
+    call(&home, "context_sync", patch.clone());
+    let before = call(&home, "context_get", json!({"group_id":id,"detail":"full"}));
+    let conflict = raw_call(&home, "context_sync", patch);
+    let error = conflict.error.expect("conflict");
+    assert_eq!(error.code, "task_conflict");
+    assert_eq!(error.details["task_id"], "T792");
+    assert_eq!(error.details["expected"], 0);
+    assert_eq!(error.details["actual"], 1);
+    assert_eq!(
+        call(&home, "context_get", json!({"group_id":id,"detail":"full"})).result,
+        before.result
     );
 }

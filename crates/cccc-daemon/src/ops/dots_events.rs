@@ -84,6 +84,7 @@ fn active(group: &GroupDoc, actor: &Actor) -> bool {
     actor.enabled
         && group.running
         && !matches!(group.state, GroupState::Paused | GroupState::Stopped)
+        && super::runtime_state::pull_admitted(group, actor)
 }
 
 fn binding(connector: &Value, group: &GroupDoc, actor: &Actor) -> Option<Value> {
@@ -137,6 +138,11 @@ pub(super) fn project(
         .map(|c| &c["dots"])
         .unwrap_or(&Value::Null);
     let runtime = super::runtime_state::actor_state(home, &group.group_id, &actor.id)?;
+    let elapsed = super::runtime_state::active_turn_elapsed_seconds(
+        &runtime,
+        &dots["execution"],
+        chrono::Utc::now(),
+    );
     let pending = super::runtime_delivery::pending_sources(home, group, actor, 10_000)?.len();
     let has_turn = runtime["active_turn_id"]
         .as_str()
@@ -178,6 +184,7 @@ pub(super) fn project(
         json!({"group_id":group.group_id,"actor_id":actor.id,"enabled":actor.enabled,
         "connected":connector.is_some(),"paired":paired,"subscribed":subscribed,"phase":phase,"pending_count":pending,
         "active_turn_id":runtime["active_turn_id"].as_str().unwrap_or(""),
+        "active_turn_elapsed_seconds":elapsed,
         "active_event_ids":runtime["active_event_ids"].as_array().cloned().unwrap_or_default(),
         "last_execution":if last.is_object() { json!({"turn_id":last["turn_id"],"event_ids":last["event_ids"],
             "status":last["status"],"completed_at":last["completed_at"]}) } else { Value::Null },
@@ -215,6 +222,7 @@ fn unresolved(home: &HomeLayout, group: &GroupDoc, actor: &Actor) -> Result<(), 
 fn connect(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     user(request)?;
     let (group, actor) = group_actor(home, request)?;
+    super::actor_switch::refuse_pending(home, &group.group_id, &actor.id)?;
     if super::actor_runtime::actor_is_running(&group, &actor) {
         return Err(OpError::new(
             "actor_must_be_stopped",
@@ -271,6 +279,7 @@ pub(super) fn accept_pairing(home: &HomeLayout, id: &str, pair: &Value) -> OpRes
             .clone(),
     };
     let (group, actor) = group_actor(home, &request)?;
+    super::actor_switch::refuse_pending(home, &group.group_id, &actor.id)?;
     if pair["generation"] != cccc_core::actors::generation_identity(&actor) {
         return Err(OpError::new(
             "pairing_changed",

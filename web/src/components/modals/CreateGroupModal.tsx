@@ -2,11 +2,16 @@ import { useTranslation } from "react-i18next";
 import { useRef } from "react";
 import { DirItem, DirSuggestion } from "../../types";
 import { useModalA11y } from "../../hooks/useModalA11y";
+import { useChatObscuringViewOnPhone } from "../../hooks/useChatObscuringView";
 import { ArrowDownIcon, DownloadIcon, FileIcon, FolderIcon, HomeIcon } from "../Icons";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { CreateGroupDirectoryBrowser } from "./CreateGroupDirectoryBrowser";
-import { directoryNameFromPath, driveSuggestions } from "./createGroupDirectoryModel";
+import {
+  directoryNameFromPath,
+  driveSuggestions,
+  suggestionLabelKey,
+} from "./createGroupDirectoryModel";
 import { ModalFrame } from "./ModalFrame";
 
 export interface CreateGroupModalProps {
@@ -26,6 +31,9 @@ export interface CreateGroupModalProps {
   setCreateGroupName: (name: string) => void;
 
   dirBrowseError?: string;
+  dirCreateError?: string;
+  onClearDirCreateError?: () => void;
+  onRetryDir?: () => void;
   creatingDirectory: boolean;
   onFetchDirContents: (path: string) => void;
   onCreateDirectory: (parent: string, name: string) => Promise<boolean>;
@@ -48,6 +56,9 @@ export function CreateGroupModal({
   createGroupName,
   setCreateGroupName,
   dirBrowseError,
+  dirCreateError,
+  onClearDirCreateError,
+  onRetryDir,
   creatingDirectory,
   onFetchDirContents,
   onCreateDirectory,
@@ -56,26 +67,31 @@ export function CreateGroupModal({
   onCancelAndReset,
 }: CreateGroupModalProps) {
   const { t } = useTranslation("modals");
+  useChatObscuringViewOnPhone(isOpen);
   const pathInputRef = useRef<HTMLInputElement>(null);
   const { modalRef } = useModalA11y(isOpen, onClose, { initialFocusRef: pathInputRef });
   if (!isOpen) return null;
 
+  // By the kind the server sends, not the name: the name of home and the current folder is
+  // translated for display.
   const renderDirSuggestionIcon = (suggestion: DirSuggestion) => {
-    const name = String(suggestion.name || "")
-      .trim()
-      .toLowerCase();
-    const path = String(suggestion.path || "")
-      .trim()
-      .toLowerCase();
     const iconClassName = "h-[1.05rem] w-[1.05rem]";
-
-    if (name.includes("home")) return <HomeIcon className={iconClassName} />;
-    if (name.includes("desktop")) return <FolderIcon className={iconClassName} />;
-    if (name.includes("download")) return <DownloadIcon className={iconClassName} />;
-    if (name.includes("document")) return <FileIcon className={iconClassName} />;
-    if (name.includes("current") || path.endsWith("/.cccc"))
-      return <ArrowDownIcon className={iconClassName} />;
-    return <FolderIcon className={iconClassName} />;
+    switch (suggestion.icon) {
+      case "home":
+        return <HomeIcon className={iconClassName} />;
+      case "download":
+        return <DownloadIcon className={iconClassName} />;
+      case "document":
+        return <FileIcon className={iconClassName} />;
+      case "current":
+        return <ArrowDownIcon className={iconClassName} />;
+      default:
+        return <FolderIcon className={iconClassName} />;
+    }
+  };
+  const suggestionLabel = (suggestion: DirSuggestion) => {
+    const key = suggestionLabelKey(suggestion);
+    return key ? t(key) : suggestion.name;
   };
 
   return (
@@ -124,7 +140,7 @@ export function CreateGroupModal({
             <label className="block text-xs font-medium mb-2 text-[var(--color-text-muted)]">
               {t("createGroup.quickSelect")}
             </label>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
               {dirSuggestions.slice(0, 6).map((s) => (
                 <button
                   key={s.path}
@@ -140,7 +156,7 @@ export function CreateGroupModal({
                   </span>
                   <div className="min-w-0">
                     <div className="text-sm font-medium truncate text-[var(--color-text-secondary)]">
-                      {s.name}
+                      {suggestionLabel(s)}
                     </div>
                     <div className="text-xs truncate text-[var(--color-text-muted)]">{s.path}</div>
                   </div>
@@ -182,6 +198,9 @@ export function CreateGroupModal({
             parentDir={parentDir}
             driveLocations={driveSuggestions(dirSuggestions)}
             error={dirBrowseError}
+            createError={dirCreateError}
+            onClearCreateError={onClearDirCreateError}
+            onRetry={onRetryDir}
             creatingDirectory={creatingDirectory}
             onSelect={(path, name) => {
               setCreateGroupPath(path);

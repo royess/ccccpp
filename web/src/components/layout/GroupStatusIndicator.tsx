@@ -1,16 +1,9 @@
 import { useTranslation } from "react-i18next";
 
 import { useSseErrorDetailText } from "../../hooks/useSseErrorDetailText";
-import type { GroupStatus, GroupStatusKey } from "../../utils/groupStatus";
-import { GROUP_STATUS_DOT_BASE_CLASS } from "../../utils/groupStatus";
+import type { GroupStatus } from "../../utils/groupStatus";
+import { GROUP_STATUS_LABEL_KEYS } from "../../utils/groupStatus";
 import { classNames } from "../../utils/classNames";
-
-const statusLabelKey: Record<GroupStatusKey, string> = {
-  run: "statusRunning",
-  paused: "statusPaused",
-  idle: "statusIdle",
-  stop: "statusStopped",
-};
 
 interface GroupStatusIndicatorProps {
   status: GroupStatus;
@@ -26,7 +19,7 @@ export function GroupStatusIndicator({
   connectionStatus,
 }: GroupStatusIndicatorProps) {
   const { t } = useTranslation("layout");
-  const label = t(statusLabelKey[status.key]);
+  const label = t(GROUP_STATUS_LABEL_KEYS[status.key]);
   const interrupted = connectionStatus && connectionStatus !== "connected";
   const errorDetail = useSseErrorDetailText();
   const connectionLabel = interrupted
@@ -35,20 +28,36 @@ export function GroupStatusIndicator({
   const description = interrupted
     ? `${label} · ${connectionLabel}${errorDetail ? ` · ${errorDetail}` : ""}. ${t("connectionInterruptedHint")}`
     : label;
-  const dotClass = interrupted
-    ? connectionStatus === "connecting"
-      ? "bg-amber-400 animate-pulse motion-reduce:animate-none"
-      : "bg-rose-500"
-    : status.dotClass;
+  const lcdSymbol =
+    connectionStatus === "connecting" ? (
+      <span className="lcd-reconnect-dots" aria-hidden="true">
+        <i />
+        <i />
+        <i />
+      </span>
+    ) : interrupted ? (
+      "\u00D7"
+    ) : status.key === "unknown" ? (
+      "?"
+    ) : (
+      ""
+    );
+  // The screen has no green, so each state has its own shape, drawn in
+  // CSS from this key rather than taken from a font (fonts differ; some draw U+25B6
+  // as emoji). Offline is a dash: nothing else uses it, and no one reads it as a checkbox.
+  const lcdShape = interrupted || status.key === "unknown" ? undefined : status.key;
 
   if (variant === "dot") {
     return (
       <span
-        className={classNames(GROUP_STATUS_DOT_BASE_CLASS, dotClass, className)}
+        className={classNames("lcd-group-symbol", className)}
+        data-lcd-shape={lcdShape}
         role="img"
         aria-label={description}
         title={description}
-      />
+      >
+        {lcdSymbol}
+      </span>
     );
   }
 
@@ -63,7 +72,9 @@ export function GroupStatusIndicator({
       role={connectionStatus ? "status" : undefined}
       data-connection-state={connectionStatus}
     >
-      <span className={classNames(GROUP_STATUS_DOT_BASE_CLASS, dotClass)} aria-hidden="true" />
+      <span className="lcd-group-symbol" data-lcd-shape={lcdShape} aria-hidden="true">
+        {lcdSymbol}
+      </span>
       {/* While the page is cut off the run state may be stale, so the visible text
           names what the dot shows; the run state stays in the description. */}
       <span>{interrupted ? connectionLabel : label}</span>

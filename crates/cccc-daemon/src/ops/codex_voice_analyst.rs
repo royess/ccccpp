@@ -8,12 +8,15 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 mod acp;
+pub(crate) use acp::{sanitize_diagnostic, sanitize_multiline as sanitize_multiline_diagnostic};
 mod antigravity;
 mod claude;
+pub(crate) use claude::capture_host_environment as claude_host_environment;
 mod control;
 mod grok;
 mod grok_voice_auth;
 pub(crate) use grok_voice_auth::{grok_voice_bearer, grok_voice_credentials_available};
+mod kilo_input;
 mod launch;
 pub(crate) use launch::ANALYST_INSTRUCTIONS;
 pub(crate) use launch_secretary::{
@@ -21,7 +24,9 @@ pub(crate) use launch_secretary::{
 };
 mod launch_antigravity;
 mod native_acp;
-pub(crate) use native_acp::{name as native_acp_name, valid_id as valid_native_acp_id};
+pub(crate) use native_acp::{
+    hermes_profile, hermes_setup, name as native_acp_name, valid_id as valid_native_acp_id,
+};
 mod launch_claude;
 mod launch_codex;
 mod launch_command;
@@ -51,6 +56,9 @@ pub(crate) fn managed_runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            // Unoptimized Claude launch/resume paths exceed the default 2 MiB.
+            // Reserve bounded headroom for this runtime's worker/pool threads.
+            .thread_stack_size(4 * 1024 * 1024)
             .thread_name("cccc-managed-agent")
             .enable_all()
             .build()
@@ -58,8 +66,12 @@ pub(crate) fn managed_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+pub(crate) fn claude_confirmation_launch(error: &io::Error) -> Option<&claude::ConfirmationLaunch> {
+    claude::confirmation_launch(error)
+}
+
 /// The workspace Claude Code refused to launch in because its trust prompt was never accepted.
-pub(crate) fn untrusted_claude_workspace(error: &io::Error) -> Option<&std::path::Path> {
+pub fn untrusted_claude_workspace(error: &io::Error) -> Option<&std::path::Path> {
     claude::untrusted_workspace(error)
 }
 
@@ -85,6 +97,9 @@ use pi_rpc::PiRpcClient;
 use process::ChildOwner;
 use protocol::ProtocolClient;
 
+pub(crate) const MANAGED_RESUMED_INBOX_DRAINED_METHOD: &str =
+    "cccc/managedAgent/resumedInboxDrained";
+pub(crate) const MANAGED_INBOX_CANCELLED_METHOD: &str = "cccc/managedAgent/inboxCancelled";
 pub(crate) const MANAGED_AGENT_DISCONNECTED_METHOD: &str = "cccc/managedAgent/disconnected";
 pub(crate) const MANAGED_AGENT_DELEGATION_ATTACHED_METHOD: &str =
     "cccc/managedAgent/delegationAttached";
@@ -109,6 +124,19 @@ pub(crate) struct ActorLaunchConfig {
     pub(crate) runtime_mode: RuntimeMode,
     pub(crate) command: Vec<String>,
     pub(crate) environment: BTreeMap<String, String>,
+}
+
+struct AcpActorLaunch<'a> {
+    ids: (&'a str, &'a str),
+    diagnostic_values: &'a [String],
+}
+
+fn nonempty_environment_values(environment: &BTreeMap<String, String>) -> Vec<String> {
+    environment
+        .values()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect()
 }
 
 impl LaunchConfig {
@@ -153,6 +181,8 @@ pub struct TurnReceipt {
 #[derive(Debug)]
 enum DelegationState {
     Started(TurnReceipt),
+    /// OpenCode accepted this input without assigning it a turn yet.
+    InboxAccepted,
     Unresolved(String),
 }
 
@@ -242,6 +272,7 @@ impl std::error::Error for StartupCleanupFailure {}
 enum ManagedProtocol {
     Codex(ProtocolClient),
     Acp(AcpClient),
+    OpenCode(opencode::v2::OpenCodeClient),
     Claude(ClaudeClient),
     Pi(PiRpcClient),
 }
@@ -304,6 +335,7 @@ impl ManagedProtocol {
         match self {
             Self::Codex(protocol) => protocol.subscribe(),
             Self::Acp(protocol) => protocol.subscribe(),
+            Self::OpenCode(protocol) => protocol.subscribe(),
             Self::Claude(protocol) => protocol.subscribe(),
             Self::Pi(protocol) => protocol.subscribe(),
         }
@@ -313,7 +345,7 @@ impl ManagedProtocol {
         match self {
             Self::Codex(protocol) => protocol.respond(id, result).await,
             Self::Acp(protocol) => protocol.respond(id, result).await,
-            Self::Claude(_) | Self::Pi(_) => Err(io::Error::new(
+            Self::Claude(_) | Self::Pi(_) | Self::OpenCode(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "This managed Runtime does not expose generic JSON-RPC responses",
             )),
@@ -324,7 +356,7 @@ impl ManagedProtocol {
         match self {
             Self::Codex(protocol) => protocol.respond_error(id, error).await,
             Self::Acp(protocol) => protocol.respond_error(id, error).await,
-            Self::Claude(_) | Self::Pi(_) => Err(io::Error::new(
+            Self::Claude(_) | Self::Pi(_) | Self::OpenCode(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "This managed Runtime does not expose generic JSON-RPC responses",
             )),
@@ -338,10 +370,16 @@ impl ManagedProtocol {
                 Ok(())
             }
             Self::Acp(protocol) => {
-                protocol.close().await;
+                if !protocol.close().await {
+                    tracing::warn!("managed ACP client did not close in time and was aborted");
+                }
                 Ok(())
             }
             Self::Claude(protocol) => protocol.close().await,
+            Self::OpenCode(protocol) => {
+                protocol.close().await;
+                Ok(())
+            }
             Self::Pi(protocol) => {
                 protocol.close().await;
                 Ok(())
@@ -350,10 +388,10 @@ impl ManagedProtocol {
     }
 
     /// Best-effort stop request for sessions that are not owned process trees.
-    /// Codex and ACP providers are child processes and die with this process.
+    /// Process-backed providers are children and die with this process.
     async fn kill_request(&self) -> io::Result<()> {
         match self {
-            Self::Codex(_) | Self::Acp(_) | Self::Pi(_) => Ok(()),
+            Self::Codex(_) | Self::Acp(_) | Self::Pi(_) | Self::OpenCode(_) => Ok(()),
             Self::Claude(protocol) => protocol.kill_request().await,
         }
     }
@@ -365,6 +403,7 @@ impl ManagedProtocol {
             // by the lifecycle owner.
             Self::Codex(_) => Ok(()),
             Self::Acp(protocol) => protocol.register_native_input(delegation_id, text).await,
+            Self::OpenCode(protocol) => protocol.register_native_input(delegation_id, text).await,
             Self::Claude(protocol) => protocol.register_native_input(delegation_id, text).await,
             Self::Pi(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -377,6 +416,7 @@ impl ManagedProtocol {
         match self {
             Self::Codex(_) => Ok(()),
             Self::Acp(protocol) => protocol.forget_native_input(delegation_id).await,
+            Self::OpenCode(protocol) => protocol.forget_native_input(delegation_id).await,
             Self::Claude(protocol) => protocol.forget_native_input(delegation_id).await,
             Self::Pi(_) => Ok(()),
         }
@@ -386,6 +426,7 @@ impl ManagedProtocol {
         match self {
             Self::Claude(protocol) => protocol.running(),
             Self::Pi(protocol) => protocol.running(),
+            Self::OpenCode(protocol) => protocol.running(),
             Self::Codex(_) | Self::Acp(_) => true,
         }
     }
@@ -403,6 +444,7 @@ impl ManagedProtocol {
                 let _ = protocol.events.send(event);
             }
             Self::Pi(protocol) => protocol.publish_for_test(event),
+            Self::OpenCode(protocol) => protocol.publish_for_test(event),
         }
     }
 }
@@ -431,8 +473,14 @@ fn required_value<'a>(value: &'a str, name: &str) -> io::Result<&'a str> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl AnalystSession {
+    pub(crate) fn into_opencode_lifecycle_fixture(mut self) -> Self {
+        self.runtime = ActorRuntime::Opencode;
+        self
+    }
+
+    #[cfg(unix)]
     /// Exercise Actor output using the existing inert shutdown transport. The
     /// selected runtime only chooses the actual structured projection branch.
     pub(crate) fn for_output_test(

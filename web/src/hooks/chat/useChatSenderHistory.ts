@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchLedgerStatuses, searchChatMessages } from "../../services/api";
 import { useGroupStore } from "../../stores";
-import type { LedgerEvent, LedgerEventStatusPayload } from "../../types";
-import { mergeEventWithExistingStatus } from "../../utils/mergeLedgerEvents";
+import type { LedgerEvent } from "../../types";
+import { keepLiveReceipts, mergeEventWithExistingStatus } from "../../utils/mergeLedgerEvents";
 
 type Page = { before: string; hasMore: boolean; loaded: boolean; loading: boolean; error: string };
 type Direction = "older" | "forward" | "receipts";
@@ -21,56 +21,6 @@ type Visit = {
 const EMPTY: Page = { before: "", hasMore: true, loaded: false, loading: false, error: "" };
 const EMPTY_EVENTS: LedgerEvent[] = [];
 
-/** These receipt records contain scalar fields. Preserve only fields changed by a later live fact. */
-function keepLiveFields<T extends object>(
-  snapshot: T | undefined,
-  before: T | undefined,
-  live: T | undefined,
-): T | undefined {
-  if (!live) return snapshot;
-  const next = { ...(snapshot ?? live) };
-  for (const key of Object.keys(live) as (keyof T)[])
-    if (live[key] !== before?.[key]) next[key] = live[key];
-  return next;
-}
-
-function keepLiveReceipts(
-  snapshot: LedgerEventStatusPayload,
-  before: LedgerEvent,
-  live: LedgerEvent,
-): LedgerEventStatusPayload {
-  return {
-    ...snapshot,
-    connect_delivery: keepLiveFields(
-      snapshot.connect_delivery,
-      before._connect_delivery,
-      live._connect_delivery,
-    ),
-    connect_cancellation: keepLiveFields(
-      snapshot.connect_cancellation,
-      before._connect_cancellation,
-      live._connect_cancellation,
-    ),
-    obligation_status:
-      snapshot.obligation_status &&
-      Object.fromEntries(
-        Object.entries(snapshot.obligation_status).map(([actor, status]) => {
-          const prior = before._obligation_status?.[actor];
-          const current = live._obligation_status?.[actor];
-          const next = keepLiveFields(status, prior, current)!;
-          if (
-            current &&
-            (current.replied !== prior?.replied || current.cancelled !== prior?.cancelled)
-          ) {
-            next.replied = current.replied;
-            next.cancelled = current.cancelled;
-          }
-          return [actor, next];
-        }),
-      ),
-  };
-}
-
 /** Sparse history has independent cursors; only daemon reads establish new rows' ledger order. */
 export function useChatSenderHistory(groupId: string, senders: readonly string[]) {
   const senderKey = JSON.stringify([...new Set(senders)].sort());
@@ -83,8 +33,8 @@ export function useChatSenderHistory(groupId: string, senders: readonly string[]
   currentKey.current = key;
 
   const read = useCallback(async (visit: Visit, direction: Direction = "older") => {
-    if (!visit.groupId || !visit.senders.length || visit.pending) return;
-    if (direction === "older" && !visit.page.hasMore) return;
+    if (!visit.groupId || !visit.senders.length || visit.pending) return false;
+    if (direction === "older" && !visit.page.hasMore) return false;
     const active = () =>
       current.current === visit &&
       currentKey.current === visit.key &&
@@ -94,7 +44,7 @@ export function useChatSenderHistory(groupId: string, senders: readonly string[]
       return active() && value?.key === visit.key ? value : null;
     };
     const initial = projection();
-    if (!initial) return;
+    if (!initial) return false;
     visit.pending = true;
     visit.retry = null;
     visit.page = { ...visit.page, loading: direction !== "forward", error: "" };
@@ -254,7 +204,8 @@ export function useChatSenderHistory(groupId: string, senders: readonly string[]
 
   const loadMore = useCallback(async () => {
     const visit = current.current;
-    if (visit?.key === key) await read(visit, visit.retry ?? "older");
+    if (visit?.key !== key) return false;
+    return read(visit, visit.retry ?? "older");
   }, [key, read]);
 
   return {

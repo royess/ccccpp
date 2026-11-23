@@ -1,6 +1,6 @@
 use super::outbound_attachment::safe_filename;
 use super::outbound_chunks::{fits_message, split_message};
-use super::outbound_stream_state::trim_active;
+use super::outbound_stream_state::{event_string, trim_active};
 use super::{AuthorizedChat, outbound_text};
 use cccc_contracts::Event;
 use cccc_core::HomeLayout;
@@ -342,16 +342,6 @@ impl SlackOutbound {
     }
 }
 
-fn event_string(event: &Event, key: &str) -> String {
-    event
-        .data
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_owned()
-}
-
 async fn decode_api_response(response: reqwest::Response) -> Result<Value, String> {
     let status = response.status();
     let value: Value = response.json().await.map_err(|error| error.to_string())?;
@@ -538,7 +528,7 @@ mod tests {
 
         outbound
             .send(
-                &[target.clone()],
+                std::slice::from_ref(&target),
                 &event(
                     "chat.stream",
                     json!({"op":"start","stream_id":"short","text":"hel"}),
@@ -547,7 +537,7 @@ mod tests {
             .await;
         outbound
             .send(
-                &[target.clone()],
+                std::slice::from_ref(&target),
                 &event(
                     "chat.stream",
                     json!({"op":"end","stream_id":"short","text":"hello"}),
@@ -567,7 +557,7 @@ mod tests {
         );
         outbound
             .send(
-                &[target.clone()],
+                std::slice::from_ref(&target),
                 &event(
                     "chat.message",
                     json!({"stream_id":"short","text":"hello","to":["user"]}),
@@ -579,7 +569,7 @@ mod tests {
         let long = "你".repeat(MAX_MESSAGE_CHARS + 1);
         outbound
             .send(
-                &[target.clone()],
+                std::slice::from_ref(&target),
                 &event(
                     "chat.stream",
                     json!({"op":"start","stream_id":"long","text":"start"}),
@@ -588,7 +578,7 @@ mod tests {
             .await;
         outbound
             .send(
-                &[target.clone()],
+                std::slice::from_ref(&target),
                 &event(
                     "chat.stream",
                     json!({"op":"end","stream_id":"long","text":long}),

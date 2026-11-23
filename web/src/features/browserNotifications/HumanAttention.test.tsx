@@ -55,7 +55,7 @@ let previousModal: ReturnType<typeof useModalStore.getState>;
 const select = vi.fn((id: string) =>
   useGroupStore.setState({ selectedGroupId: id, selectedGroupActorsHydrating: true }),
 );
-const openChat = vi.fn(async () => {});
+const openChat = vi.fn(async () => true);
 const openTask = vi.fn();
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });

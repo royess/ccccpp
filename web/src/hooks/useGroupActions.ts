@@ -4,6 +4,8 @@ import { useGroupStore, useUIStore } from "../stores";
 import * as api from "../services/api";
 import type { GroupControl } from "../utils/groupControls";
 import i18n from "../i18n";
+import { getCachedGroupActors } from "../stores/groupStoreCore";
+import { noticeGroupSessionsReplaced } from "./runtimeSessionReplacedNotice";
 
 export function useGroupActions() {
   const pending = useRef(false);
@@ -24,7 +26,10 @@ export function useGroupActions() {
     try {
       if (control === "delete") {
         const response = await api.deleteGroup(gid);
-        if (!response.ok) showError(`${title}: ${response.error.message}`);
+        if (!response.ok)
+          showError(
+            `${title}: ${response.error.code === "actor_browser_busy" ? i18n.t("actors:runtimeSwitch.browserBusy") : response.error.message}`,
+          );
         else if (useGroupStore.getState().selectedGroupId === gid) {
           // This setter already clears the selected view and handles its draft.
           useGroupStore.getState().setSelectedGroupId("");
@@ -39,11 +44,23 @@ export function useGroupActions() {
         if (
           response.ok &&
           control === "activate" &&
-          !(response.result.group.runtime_status?.runtime_running ?? response.result.group.running)
+          // An unobservable runtime is not a stopped one: never start agents on a guess.
+          response.result.group.runtime_status?.available !== false &&
+          (response.result.group.runtime_status?.runtime_running ??
+            response.result.group.running) === false
         ) {
           response = await api.startGroup(gid);
         }
         if (!response.ok) showError(`${title}: ${response.error.message}`);
+        else if (control === "launch" || control === "activate") {
+          const current = useGroupStore.getState();
+          const actors =
+            current.selectedGroupId === gid ? current.actors : getCachedGroupActors(gid);
+          noticeGroupSessionsReplaced(
+            (actorId) => actors.find((actor) => actor.id === actorId)?.title || actorId,
+            response.result,
+          );
+        }
       }
     } catch {
       showError(i18n.t("layout:groupRun.failed", { group: title }));

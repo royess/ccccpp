@@ -106,7 +106,20 @@ async fn serializes_delivery_and_keeps_read_as_a_separate_fact() {
         .as_str()
         .expect("reply event id");
 
-    wait_for(&client, &group_id, &format!("[event_id={reply_event_id}]")).await;
+    // The envelope carries the event's original timestamp to the second.
+    let sent = |result: &Map<String, Value>| {
+        let ts = result["event"]["ts"].as_str().expect("event ts");
+        format!("{}Z", &ts[..19])
+    };
+    let (first_sent, second_sent) = (sent(&first.result), sent(&second.result));
+    let (notify_sent, reply_sent) = (sent(&notify.result), sent(&reply.result));
+
+    wait_for(
+        &client,
+        &group_id,
+        &format!("[event_id={reply_event_id} sent={reply_sent}]"),
+    )
+    .await;
     let tail = daemon_call(
         &client,
         "terminal_tail",
@@ -116,14 +129,16 @@ async fn serializes_delivery_and_keeps_read_as_a_separate_fact() {
     let text = tail.result["text"].as_str().unwrap_or_default();
     assert!(text.contains("PREAMBLE:[CCCC] You are peer1"));
     assert!(text.contains(&format!(
-        "FIRST:[cccc] user → peer1 [event_id={first_event_id}]: one"
+        "FIRST:[cccc] user → peer1 [event_id={first_event_id} sent={first_sent}]: one"
     )));
     assert!(text.contains(&format!(
-        "SECOND:[cccc] user → peer1 [event_id={second_event_id}]: two"
+        "SECOND:[cccc] user → peer1 [event_id={second_event_id} sent={second_sent}]: two"
     )));
-    assert!(text.contains("THIRD:[cccc] SYSTEM (info): notice"));
     assert!(text.contains(&format!(
-        "FOURTH:[cccc] user → peer1 (reply:{}) [event_id={reply_event_id}]",
+        "THIRD:[cccc] SYSTEM (info) [sent={notify_sent}]: notice"
+    )));
+    assert!(text.contains(&format!(
+        "FOURTH:[cccc] user → peer1 (reply:{}) [event_id={reply_event_id} sent={reply_sent}]",
         &first_event_id[..8]
     )));
     assert!(text.contains("> \"one\": fix it"));
@@ -386,6 +401,234 @@ fn inbox_read_consumes_only_mail_in_append_order() {
     );
     assert_eq!(empty.result["messages"], json!([]));
     assert!(empty.result["event"].is_null());
+}
+
+#[test]
+fn exact_message_history_is_visible_generation_scoped_and_non_consuming() {
+    let temp = tempfile::tempdir().expect("fixture");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let group_id = stopped_peer_group(&home, "exact history");
+    call(
+        &home,
+        "actor_add",
+        json!({"group_id":group_id,"actor_id":"peer2","by":"user"}),
+    );
+    let body = "quoted \"message\" 界😀\n".repeat(1_000);
+    let old = call(
+        &home,
+        "send",
+        json!({"group_id":group_id,"by":"user","to":["peer1"],"text":body,"message_mode":"request_reply"}),
+    );
+    let private = call(
+        &home,
+        "send",
+        json!({"group_id":group_id,"by":"user","to":["peer2"],"text":"other Actor only","message_mode":"send"}),
+    );
+    let store = GroupStore::new(home.clone()).expect("store");
+    let path = store.ledger_path(&group_id).expect("ledger");
+    for _ in 0..110 {
+        let mut newer = Event::new("chat.message", &group_id);
+        newer.by = "user".into();
+        newer.data = json!({"to":["peer1"],"text":"newer","message_mode":"send"})
+            .as_object()
+            .expect("data")
+            .clone();
+        ledger::append(&path, &newer).expect("newer event");
+    }
+    let before = std::fs::read(&path).expect("ledger before read");
+    let exact = call(
+        &home,
+        "message_history",
+        json!({"group_id":group_id,"actor_id":"peer1","by":"peer1","event_id":old.result["event"]["id"]}),
+    );
+    assert_eq!(exact.result["messages"].as_array().map(Vec::len), Some(1));
+    assert_eq!(exact.result["messages"][0]["data"]["text"], body);
+    assert!(
+        exact.result["delivery_text"]
+            .as_str()
+            .expect("rendered message")
+            .contains(&body)
+    );
+    assert_eq!(exact.result["has_more"], false);
+    assert_eq!(std::fs::read(&path).expect("ledger after read"), before);
+    let notice = call(
+        &home,
+        "system_notify",
+        json!({
+            "group_id":group_id,"by":"system","title":"notice","message":"Complete system guidance",
+            "target_actor_id":"peer1"
+        }),
+    );
+    let exact_notice = call(
+        &home,
+        "message_history",
+        json!({"group_id":group_id,"actor_id":"peer1","by":"peer1","event_id":notice.result["event"]["id"]}),
+    );
+    assert_eq!(exact_notice.result["messages"][0]["kind"], "system.notify");
+    assert!(
+        exact_notice.result["delivery_text"]
+            .as_str()
+            .expect("notice text")
+            .contains("Complete system guidance")
+    );
+    for event_id in [private.result["event"]["id"].clone(), json!("missing")] {
+        let denied = call_raw(
+            &home,
+            "message_history",
+            json!({"group_id":group_id,"actor_id":"peer1","by":"peer1","event_id":event_id}),
+        );
+        assert_eq!(denied.error.expect("not visible").code, "event_not_found");
+    }
+    let conflict = call_raw(
+        &home,
+        "message_history",
+        json!({"group_id":group_id,"actor_id":"peer1","by":"peer1","event_id":old.result["event"]["id"],"limit":1}),
+    );
+    assert_eq!(
+        conflict.error.expect("exclusive exact lookup").code,
+        "invalid_args"
+    );
+    call(
+        &home,
+        "actor_remove",
+        json!({"group_id":group_id,"actor_id":"peer1","by":"user"}),
+    );
+    call(
+        &home,
+        "actor_add",
+        json!({"group_id":group_id,"actor_id":"peer1","by":"user"}),
+    );
+    let stale = call_raw(
+        &home,
+        "message_history",
+        json!({"group_id":group_id,"actor_id":"peer1","by":"peer1","event_id":old.result["event"]["id"]}),
+    );
+    assert_eq!(stale.error.expect("old generation").code, "event_not_found");
+}
+
+#[test]
+fn short_event_ids_resolve_only_among_events_the_caller_can_read() {
+    let temp = tempfile::tempdir().expect("fixture");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let group_id = stopped_peer_group(&home, "short ids");
+    call(
+        &home,
+        "actor_add",
+        json!({"group_id":group_id,"actor_id":"peer2","by":"user"}),
+    );
+    let path = GroupStore::new(home.clone())
+        .expect("store")
+        .ledger_path(&group_id)
+        .expect("ledger");
+    // Fixed IDs make shared prefixes deterministic.
+    let append = |id: &str, to: &str, text: &str| {
+        let mut event = Event::new("chat.message", &group_id);
+        event.id = id.into();
+        event.by = "user".into();
+        event.data = json!({"to":[to],"text":text,"message_mode":"send"})
+            .as_object()
+            .expect("data")
+            .clone();
+        ledger::append(&path, &event).expect("fixture event");
+    };
+    let first = format!("abcdef01{}", "a".repeat(24));
+    let second = format!("abcdef01{}", "b".repeat(24));
+    let hidden = format!("abcdef02{}", "c".repeat(24));
+    let shadowed = format!("fedcba98{}", "d".repeat(24));
+    let visible = format!("fedcba98{}", "e".repeat(24));
+    append(&first, "peer1", "first");
+    append(&second, "peer1", "second");
+    append(&hidden, "peer2", "hidden");
+    append(&shadowed, "peer2", "other Actor only");
+    append(&visible, "peer1", "visible");
+    let read = |event_id: &str| {
+        call_raw(
+            &home,
+            "message_history",
+            json!({"group_id":group_id,"actor_id":"peer1","by":"peer1","event_id":event_id}),
+        )
+    };
+
+    let unique = read(&first[..9]);
+    assert_eq!(unique.result["messages"][0]["id"], first.as_str());
+    // An event the caller cannot read neither matches nor makes a prefix ambiguous.
+    assert_eq!(
+        read("fedcba98").result["messages"][0]["id"],
+        visible.as_str()
+    );
+    let ambiguous = read("abcdef01").error.expect("two readable matches");
+    assert_eq!(ambiguous.code, "event_id_ambiguous");
+    assert!(ambiguous.message.contains(&first) && ambiguous.message.contains(&second));
+    assert!(!ambiguous.message.contains(&hidden));
+    for denied in [
+        "abcdef02",
+        "abcdef0",
+        "ABCDEF01A",
+        format!("{first}0").as_str(),
+    ] {
+        assert_eq!(
+            read(denied).error.expect("not resolvable").code,
+            "event_not_found",
+            "{denied}"
+        );
+    }
+
+    let before = std::fs::read(&path).expect("ledger before");
+    let rejected = call_raw(
+        &home,
+        "reply",
+        json!({"group_id":group_id,"by":"peer1","reply_to":"abcdef01","text":"which one?"}),
+    );
+    assert_eq!(
+        rejected.error.expect("ambiguous parent").code,
+        "event_id_ambiguous"
+    );
+    assert_eq!(std::fs::read(&path).expect("ledger after"), before);
+    // The user's ports always send full IDs; a short one is not resolved for them.
+    let user_short = call_raw(
+        &home,
+        "reply",
+        json!({"group_id":group_id,"by":"user","to":["peer1"],"reply_to":&first[..9],"text":"hi"}),
+    );
+    assert_eq!(
+        user_short.error.expect("user needs the full ID").code,
+        "event_not_found"
+    );
+
+    let reply = call(
+        &home,
+        "reply",
+        json!({
+            "group_id":group_id,"by":"peer1","reply_to":&first[..9],
+            "text":"answer","client_id":"short-parent-retry"
+        }),
+    );
+    assert_eq!(reply.result["event"]["data"]["reply_to"], first.as_str());
+    // A retry naming the full parent is the same logical reply.
+    let retry = call(
+        &home,
+        "reply",
+        json!({
+            "group_id":group_id,"by":"peer1","reply_to":first,
+            "text":"answer","client_id":"short-parent-retry"
+        }),
+    );
+    assert_eq!(retry.result["event"]["id"], reply.result["event"]["id"]);
+
+    call(
+        &home,
+        "actor_remove",
+        json!({"group_id":group_id,"actor_id":"peer1","by":"user"}),
+    );
+    call(
+        &home,
+        "actor_add",
+        json!({"group_id":group_id,"actor_id":"peer1","by":"user"}),
+    );
+    assert_eq!(
+        read(&visible[..8]).error.expect("old generation").code,
+        "event_not_found"
+    );
 }
 
 #[test]
@@ -969,7 +1212,7 @@ fn slash_skill_dispatch_persists_hidden_control_contract_and_replays_by_client_i
     assert!(text.starts_with("[CCCC] INTERNAL CONTROL"));
     assert!(text.contains("skill_command: /using-superpowers"));
     assert!(text.contains("capability_id: skill:test:using-superpowers"));
-    assert!(text.contains("run `cccc_help` first"));
+    assert!(text.contains("call `cccc_capability_use` with this capability_id"));
     assert!(text.ends_with("User task:\n开始执行"));
     assert_eq!(event.data["attachments"], json!([]));
     assert!(event.data.get("task_text").is_none());
@@ -1989,7 +2232,66 @@ fn message_domain_contracts_cover_install_reply_idle_stream_and_validation() {
 }
 
 #[test]
-fn delegation_relays_to_target_foreman_with_legacy_cross_group_schema() {
+fn a_message_takes_its_scope_only_from_a_path_the_daemon_checked() {
+    let temp = tempfile::tempdir().expect("temp");
+    let home = HomeLayout::from_path(temp.path().join("rust-home")).expect("home");
+    let created = call(
+        &home,
+        "group_create",
+        json!({"title":"scoped message","by":"user"}),
+    );
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id")
+        .to_owned();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(project.join("src")).expect("project");
+    let attached = call(
+        &home,
+        "attach",
+        json!({"group_id":group_id,"path":project,"by":"user"}),
+    );
+    let scope_key = attached.result["scope_key"]
+        .as_str()
+        .expect("scope")
+        .to_owned();
+
+    let scoped = call(
+        &home,
+        "send",
+        json!({
+            "group_id":group_id,"by":"user","to":["user"],"text":"scoped",
+            "message_mode":"send","path":project.join("src").to_string_lossy()
+        }),
+    );
+    assert_eq!(scoped.result["event"]["scope_key"], scope_key);
+    assert_eq!(scoped.result["event"]["data"]["scope_key"], scope_key);
+
+    // A scope comes only from a checked path; a caller cannot claim one.
+    let ledger = GroupStore::new(home.clone())
+        .expect("store")
+        .ledger_path(&group_id)
+        .expect("ledger");
+    let before = std::fs::read_to_string(&ledger).expect("ledger before");
+    let claimed = call_raw(
+        &home,
+        "send",
+        json!({
+            "group_id":group_id,"by":"user","to":["user"],"text":"claimed",
+            "message_mode":"send","scope_key":scope_key
+        }),
+    );
+    let error = claimed.error.expect("claimed scope");
+    assert_eq!(error.code, "unknown_arguments");
+    assert_eq!(error.details["unknown"], json!(["scope_key"]));
+    assert_eq!(
+        std::fs::read_to_string(&ledger).expect("ledger after"),
+        before
+    );
+}
+
+#[test]
+fn retired_delegation_is_rejected_and_user_cross_group_reply_still_works() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = HomeLayout::from_path(temp.path().join("rust-home")).expect("home");
     let source = call(&home, "group_create", json!({"title":"source","by":"user"}));
@@ -2012,19 +2314,50 @@ fn delegation_relays_to_target_foreman_with_legacy_cross_group_schema() {
         "actor_add",
         json!({"group_id":destination_id,"actor_id":"target-lead","by":"user"}),
     );
+    let store = GroupStore::new(home.clone()).expect("store");
+    for group_id in [source_id, destination_id] {
+        store
+            .mutate(group_id, |group| {
+                group.state = cccc_contracts::GroupState::Paused;
+                Ok(())
+            })
+            .expect("pause fixture");
+    }
 
     let direct = call(
         &home,
         "send_cross_group",
         json!({
-            "group_id":source_id,"dst_group_id":destination_id,"by":"source-lead",
+            "group_id":source_id,"dst_group_id":destination_id,"by":"user",
             "to":["target-lead"],"text":"schema","message_mode":"send"
         }),
     );
     assert_eq!(direct.result["src_event"], direct.result["source_event"]);
     assert_eq!(direct.result["dst_event"], direct.result["event"]);
+    assert_eq!(direct.result["source_event"]["by"], "user");
+    assert_eq!(direct.result["event"]["by"], format!("{source_id}::user"));
 
-    let delegated = call(
+    let reply = call(
+        &home,
+        "reply",
+        json!({
+            "group_id":destination_id,"by":"target-lead",
+            "reply_to":direct.result["event"]["id"],
+            "text":"answer","message_mode":"send"
+        }),
+    );
+    assert_eq!(reply.result["dst_event"]["group_id"], source_id);
+    assert_eq!(reply.result["dst_event"]["data"]["to"], json!(["user"]));
+    assert_eq!(
+        reply.result["dst_event"]["data"]["reply_to"],
+        direct.result["source_event"]["id"]
+    );
+
+    let source_ledger = store.ledger_path(source_id).expect("source ledger");
+    let target_ledger = store.ledger_path(destination_id).expect("target ledger");
+    let before_source = std::fs::read(&source_ledger).expect("source history");
+    let before_target = std::fs::read(&target_ledger).expect("target history");
+    let delegated = call_raw(
         &home,
         "relay_user_delegation",
         json!({
@@ -2032,22 +2365,15 @@ fn delegation_relays_to_target_foreman_with_legacy_cross_group_schema() {
             "text":"#destination 请处理","source_event_id":"source-message"
         }),
     );
-    assert_eq!(delegated.result["relay"]["sender"], "source-lead");
-    assert_eq!(delegated.result["relay"]["target_actor_id"], "target-lead");
-    assert!(
-        delegated.result["relay"]["delegation_id"]
-            .as_str()
-            .is_some_and(|value| value.starts_with("dlg_"))
+    assert!(!delegated.ok);
+    assert_eq!(delegated.error.expect("error").code, "unknown_op");
+    assert_eq!(
+        std::fs::read(source_ledger).expect("source history"),
+        before_source
     );
-    assert!(
-        delegated.result["relay"]["src_event_id"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
-    );
-    assert!(
-        delegated.result["relay"]["dst_event_id"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
+    assert_eq!(
+        std::fs::read(target_ledger).expect("target history"),
+        before_target
     );
 }
 
@@ -2136,6 +2462,200 @@ fn block_ledger_writes(path: &std::path::Path) -> bool {
 fn allow_ledger_writes(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("writable");
+}
+
+#[test]
+fn message_writes_reject_unknown_arguments_before_any_effect() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let scope = temp.path().join("scope");
+    std::fs::create_dir_all(&scope).expect("scope");
+    std::fs::write(scope.join("payload.bin"), b"never stored").expect("payload");
+    let home = HomeLayout::from_path(temp.path().join("rust-home")).expect("home");
+    let create = |title: &str| {
+        call(&home, "group_create", json!({"title":title,"by":"user"})).result["group"]["group_id"]
+            .as_str()
+            .expect("group id")
+            .to_owned()
+    };
+    let group_id = create("unknown-arguments");
+    let destination_id = create("unknown-arguments-destination");
+    call(
+        &home,
+        "attach",
+        json!({"group_id":group_id,"path":scope,"by":"user"}),
+    );
+    // A command that exits at once, so no real provider starts even if a
+    // check is removed and a message wakes an Actor.
+    for actor in ["lead", "peer1"] {
+        call(
+            &home,
+            "actor_add",
+            json!({
+                "group_id":group_id,"actor_id":actor,"runtime":"custom",
+                "command":["/bin/true"],"by":"user"
+            }),
+        );
+    }
+    let parent = call(
+        &home,
+        "send",
+        json!({"group_id":group_id,"by":"user","to":["lead"],"text":"question","message_mode":"mail"}),
+    )
+    .result["event"]["id"]
+        .as_str()
+        .expect("parent")
+        .to_owned();
+
+    let store = GroupStore::new(home.clone()).expect("store");
+    let blob_dir = store.state_dir(&group_id).expect("state").join("blobs");
+    // The ledger, blob, task and Group document changes these requests could
+    // make; an Actor wake-up changes the Group document.
+    let effects = || {
+        let ledger = |id: &str| {
+            std::fs::read_to_string(store.ledger_path(id).expect("ledger")).unwrap_or_default()
+        };
+        let blobs = std::fs::read_dir(&blob_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .count();
+        let tasks = call(
+            &home,
+            "context_get",
+            json!({"group_id":group_id,"by":"user"}),
+        )
+        .result["coordination"]["tasks"]
+            .clone();
+        let group = serde_json::to_value(store.load(&group_id).expect("group")).expect("doc");
+        (
+            ledger(&group_id),
+            ledger(&destination_id),
+            blobs,
+            tasks,
+            group,
+        )
+    };
+    let rejected = |op: &str, args: Value, unknown: &[&str]| {
+        let error = call_raw(&home, op, args)
+            .error
+            .unwrap_or_else(|| panic!("{op} accepted an unknown argument"));
+        assert_eq!(error.code, "unknown_arguments", "{op}: {}", error.message);
+        assert_eq!(error.details["unknown"], json!(unknown), "{op}");
+        assert_eq!(error.details["new_side_effects"], false, "{op}");
+        assert!(
+            !error.message.contains("never-echoed"),
+            "{op}: {}",
+            error.message
+        );
+    };
+    let before = effects();
+
+    // A misspelt mode, question options at the top level, a guessed
+    // recipients field: each was stored or ignored before.
+    rejected(
+        "send",
+        json!({"group_id":group_id,"by":"user","to":["peer1"],"text":"t","message_mode":"send","mdoe":"never-echoed"}),
+        &["mdoe"],
+    );
+    rejected(
+        "message_send",
+        json!({
+            "group_id":group_id,"by":"lead","to":["user"],"text":"t","message_mode":"request_reply",
+            "question":{"v":1,"prompt":"Which?"},"options":[{"label":"A"},{"label":"B"}]
+        }),
+        &["options"],
+    );
+    rejected(
+        "send",
+        json!({"group_id":group_id,"by":"user","recipients":["peer1"],"text":"t","message_mode":"send","scope_key":"s"}),
+        &["recipients", "scope_key"],
+    );
+    rejected(
+        "reply",
+        json!({"group_id":group_id,"by":"lead","reply_to":parent,"text":"t","thread":"t1"}),
+        &["thread"],
+    );
+    rejected(
+        "send_files",
+        json!({"group_id":group_id,"by":"user","paths":["payload.bin"],"to":["peer1"],"message_mode":"send","caption":"c"}),
+        &["caption"],
+    );
+    for operation in ["connect_send", "connect_send_files"] {
+        rejected(
+            operation,
+            json!({
+                "group_id":group_id,"by":"user","instance_id":"unresolved-peer",
+                "target_group_id":"remote-group","client_id":"never-accepted",
+                "text":"never-echoed","paths":["payload.bin"],
+                "message_mode":"send","mdoe":"never-echoed"
+            }),
+            &["mdoe"],
+        );
+    }
+    rejected(
+        "message_upload_preflight",
+        json!({
+            "operation":"send","has_attachments":true,"group_id":group_id,"by":"user",
+            "to":["peer1"],"text":"t","message_mode":"send","paths":["payload.bin"]
+        }),
+        &["paths"],
+    );
+    rejected(
+        "send_cross_group",
+        json!({"group_id":group_id,"dst_group_id":destination_id,"by":"user","text":"t","message_mode":"send","dst_to":["@foreman"]}),
+        &["dst_to"],
+    );
+    rejected(
+        "tracked_send",
+        json!({"group_id":group_id,"by":"user","to":["peer1"],"title":"T","text":"t","message_mode":"mail"}),
+        &["message_mode"],
+    );
+    rejected(
+        "system_notify",
+        json!({"group_id":group_id,"by":"system","kind":"info","title":"T","text":"t","format":"markdown"}),
+        &["format"],
+    );
+    rejected(
+        "slash_skill_dispatch",
+        json!({"group_id":group_id,"by":"user","task_text":"t","command":"/x","capability_id":"skill:x","text":"overwritten"}),
+        &["text"],
+    );
+    assert!(effects() == before, "a rejected request had an effect");
+
+    // Fields a handler refuses itself keep their own error.
+    let legacy = call_raw(
+        &home,
+        "reply",
+        json!({"group_id":group_id,"by":"lead","reply_to":parent,"text":"t","priority":"urgent"}),
+    );
+    assert_eq!(
+        legacy.error.as_ref().map(|error| error.code.as_str()),
+        Some("unsupported_message_fields")
+    );
+
+    // An accepted request still replays; a retry that adds an unknown key
+    // fails without replaying.
+    let request = json!({"group_id":group_id,"by":"user","to":["peer1"],"text":"once","message_mode":"mail","client_id":"stable"});
+    let first = call(&home, "send", request.clone());
+    let again = call(&home, "send", request.clone());
+    assert_eq!(again.result["duplicate"], true);
+    assert_eq!(again.result["event"]["id"], first.result["event"]["id"]);
+    let mut changed = request.as_object().cloned().expect("request");
+    changed.insert("mdoe".into(), json!("mail"));
+    rejected("send", Value::Object(changed), &["mdoe"]);
+
+    // Shapes earlier MCP versions send are still accepted: a raw
+    // idempotency key and no mode on a reply, `actor_id` on a notification.
+    call(
+        &home,
+        "reply",
+        json!({"group_id":group_id,"by":"lead","actor_id":"lead","reply_to":parent,"text":"ok","idempotency_key":"old-reply"}),
+    );
+    call(
+        &home,
+        "system_notify",
+        json!({"group_id":group_id,"by":"lead","actor_id":"peer1","kind":"info","title":"T","message":"m"}),
+    );
 }
 
 fn call(home: &HomeLayout, op: &str, args: Value) -> DaemonResponse {
@@ -2684,3 +3204,5 @@ fn scope_identity_keeps_existing_git_rewrite_attachment_addressable() {
         result.error
     );
 }
+
+cccc_daemon::session_owner_test_entry!();

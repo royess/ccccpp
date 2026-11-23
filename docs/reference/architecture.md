@@ -105,6 +105,15 @@ This boundary is intentionally separate from persistent sessions and provider
 commands such as Claude Agent View background launch, which must retain their
 provider-owned service after the launcher exits.
 
+The CLI and standalone Web/MCP application packages compile the same content
+fingerprint of workspace sources and bundled resources. Their entry points
+register it before starting services. Core holds the immutable process identity;
+it and the daemon do not depend on the full-workspace hash producer. Web/MCP
+libraries still share their application's build script and can rebuild when its
+hash changes. An embedding without a compiled application identity reports no
+source fingerprint rather than reading the checkout or inventing a value. Web
+assets keep their separate served-bundle identity.
+
 ### Logical Modules
 
 | Module | Responsibility | Boundary |
@@ -313,7 +322,7 @@ A message addresses either the human user or one or more actors, never both.
 
 - **Foreman = Coordinator + Worker**
   - Does actual work, not just task assignment
-  - Extra coordination duties (receives actor_idle and quiet-review `silence_check` notifications)
+  - Extra coordination duties (by default receives messages sent without a target)
   - Can add/start/stop any actor
 
 - **Peer = Independent Expert**
@@ -343,22 +352,38 @@ file access can read it through the existing `cccc_file` tool. The Web editor
 reads and writes only the active workspace root's file through
 `GET/PUT /api/v1/groups/{group_id}/agents_md`. GET returns `content`, `path`, and
 `exists`; PUT takes `content` and the displayed `expected_path`, rejecting a
-changed workspace with HTTP 409. File saves do not mutate Context state or reload
-runtime sessions. The optional team notification is a separate chat send.
+changed workspace with HTTP 409. For a Group without a project folder, both
+answer HTTP 404 with the error code `group_has_no_scope`. File saves do not
+mutate Context state or reload runtime sessions. The optional team notification
+is a separate chat send.
+
+The repository backlog is a Markdown file the user keeps in the Group's project
+folder: `##` headings are sections and `###` headings are topics. The file is
+the only copy; CCCC does not export, sync or commit it, and Git tracking is
+optional. Creating it from the Web proposes `BACKLOG.md` and, in a Git
+repository, a rule in the clone's local exclude file, so `git add -A` leaves it
+out.
+The daemon parses and edits the file in place for both the Web
+(`GET /api/v1/groups/{group_id}/backlog`, `POST /api/v1/groups/{group_id}/backlog/{op}`)
+and the `cccc_backlog` tool. Every write to an existing topic is fenced on the
+whole-file SHA-256, and a task made from a topic records
+`source:{scope_key,path,entry_id}` while the file never records task IDs. The
+read-only exhibit Web refuses all backlog routes. Operations, the snapshot and
+error codes are specified in the daemon IPC standard under "Repository backlog".
 
 ### Core Collaboration Capability Groups
 
 - Session and guidance: `cccc_bootstrap`, `cccc_help`
 - Messaging and files: `cccc_inbox_read`, `cccc_message_history`, `cccc_message_send`, `cccc_message_reply`, `cccc_file`, `cccc_file_send`
 - Group and actor control: `cccc_group`, `cccc_actor`
-- Coordination and state: `cccc_context_get`, `cccc_coordination`, `cccc_task`, `cccc_agent_state`, `cccc_context_sync`
-- Automation and memory: `cccc_automation`, `cccc_automation_manage`, `cccc_memory`, `cccc_memory_admin`
+- Coordination and state: `cccc_context_get`, `cccc_coordination`, `cccc_task`, `cccc_backlog`, `cccc_agent_state`, `cccc_context_sync`
+- Automation: `cccc_automation`
 
 ### Capability-Managed and Optional Groups
 
 - These capability groups expand the surface without hardcoding a fixed namespace count. The current grouped tools include lifecycle and pack control (`cccc_capability_search`, `cccc_capability_enable`, `cccc_capability_block`, `cccc_capability_state`, `cccc_capability_import`, `cccc_capability_uninstall`, `cccc_capability_use`).
 - Space / notebook integrations: `cccc_space`
-- Terminal and diagnostics: `cccc_terminal`, `cccc_terminal_tail`, `cccc_debug_*`
+- Terminal and diagnostics: `cccc_terminal`, `cccc_debug`
 - IM binding: `cccc_im_bind`
 
 ## Tech Stack

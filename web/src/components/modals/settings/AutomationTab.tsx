@@ -1,4 +1,4 @@
-// AutomationTab configures built-in automation loops and user-authored scheduled rules.
+// AutomationTab configures scheduled rules.
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -20,7 +20,6 @@ import {
   isValidId,
   nowId,
 } from "./automationUtils";
-import { AutomationPoliciesSection } from "./AutomationPoliciesSection";
 import { AutomationRuleEditorModal } from "./AutomationRuleEditorModal";
 import { AutomationRuleList } from "./AutomationRuleList";
 import { AutomationSnippetModal } from "./AutomationSnippetModal";
@@ -29,24 +28,8 @@ import { cardClass, dangerButtonClass, primaryButtonClass, secondaryButtonClass 
 interface AutomationTabProps {
   isDark: boolean;
   groupId?: string;
+  groupState?: string;
   devActors: Actor[];
-  busy: boolean;
-
-  idleSeconds: number;
-  setIdleSeconds: (v: number) => void;
-  keepaliveSeconds: number;
-  setKeepaliveSeconds: (v: number) => void;
-  keepaliveMax: number;
-  setKeepaliveMax: (v: number) => void;
-  silenceSeconds: number;
-  setSilenceSeconds: (v: number) => void;
-
-  helpNudgeIntervalSeconds: number;
-  setHelpNudgeIntervalSeconds: (v: number) => void;
-  helpNudgeMinMessages: number;
-  setHelpNudgeMinMessages: (v: number) => void;
-  onSavePolicies: () => void;
-  onResetPolicies: () => void;
 }
 
 type PersistCopy = { failureMessage: string; versionConflictMessage: string };
@@ -75,6 +58,13 @@ export function AutomationTab(props: AutomationTabProps) {
   const [rulesBusy, setRulesBusy] = useState(false);
   const [rulesErr, setRulesErr] = useState("");
   const [ruleset, setRuleset] = useState<AutomationRuleSet | null>(null);
+  // The rules as last loaded: `ruleset` doubles as the unsaved draft.
+  const [savedRuleset, setSavedRuleset] = useState<AutomationRuleSet | null>(null);
+  const [runNotice, setRunNotice] = useState<{
+    ruleId: string;
+    text: string;
+    tone: "ok" | "warning";
+  } | null>(null);
   const [snippetCatalog, setSnippetCatalog] = useState<AutomationSnippetCatalog>({
     built_in: {},
     built_in_overrides: {},
@@ -82,6 +72,8 @@ export function AutomationTab(props: AutomationTabProps) {
   });
   const [rulesVersion, setRulesVersion] = useState<number | undefined>(undefined);
   const [status, setStatus] = useState<Record<string, AutomationRuleStatus>>({});
+  // The daemon's clock when `status` was computed, so a due rule can be told apart.
+  const [serverNow, setServerNow] = useState<string | undefined>(undefined);
   const [configPath, setConfigPath] = useState("");
   const [supportedVars, setSupportedVars] = useState<string[]>([]);
 
@@ -122,11 +114,13 @@ export function AutomationTab(props: AutomationTabProps) {
         return;
       }
       setRuleset(resp.result.ruleset);
+      setSavedRuleset(resp.result.ruleset);
       setSnippetCatalog(
         resp.result.snippet_catalog || { built_in: {}, built_in_overrides: {}, custom: {} },
       );
       setRulesVersion(typeof resp.result.version === "number" ? resp.result.version : undefined);
       setStatus(resp.result.status || {});
+      setServerNow(resp.result.server_now);
       setConfigPath(String(resp.result.config_path || ""));
       setSupportedVars(
         Array.isArray(resp.result.supported_vars) ? resp.result.supported_vars.map(String) : [],
@@ -141,9 +135,12 @@ export function AutomationTab(props: AutomationTabProps) {
   useEffect(() => {
     const visit = groupVisit.current;
     setRuleset(null);
+    setSavedRuleset(null);
+    setRunNotice(null);
     setSnippetCatalog({ built_in: {}, built_in_overrides: {}, custom: {} });
     setRulesVersion(undefined);
     setStatus({});
+    setServerNow(undefined);
     setConfigPath("");
     setSupportedVars([]);
     setRulesErr("");
@@ -213,13 +210,12 @@ export function AutomationTab(props: AutomationTabProps) {
     return out;
   }, [props.devActors]);
 
-  const completedOneTimeRuleIds = useMemo(() => {
+  const completedRuleIds = useMemo(() => {
     return draft.rules
       .filter((rule) => {
         const rid = String(rule.id || "").trim();
-        const triggerKind = String(rule.trigger?.kind || "");
         const st = status[rid] || {};
-        return Boolean(rid) && triggerKind === "at" && Boolean(st.completed);
+        return Boolean(rid) && Boolean(st.completed);
       })
       .map((rule) => String(rule.id || "").trim());
   }, [draft.rules, status]);
@@ -228,9 +224,8 @@ export function AutomationTab(props: AutomationTabProps) {
     if (showCompletedRules) return draft.rules;
     return draft.rules.filter((rule) => {
       const rid = String(rule.id || "").trim();
-      const triggerKind = String(rule.trigger?.kind || "");
       const st = status[rid] || {};
-      return !(triggerKind === "at" && Boolean(st.completed));
+      return !st.completed;
     });
   }, [draft.rules, status, showCompletedRules]);
 
@@ -417,6 +412,11 @@ export function AutomationTab(props: AutomationTabProps) {
       } else {
         return t("automation.validationTriggerUnsupported", { id, kind: triggerKind });
       }
+      if (rule.trigger && rule.trigger.kind !== "at" && rule.trigger.max_runs !== undefined) {
+        const maxRuns = rule.trigger.max_runs;
+        if (!Number.isSafeInteger(maxRuns) || maxRuns < 1)
+          return t("automation.validationMaxRuns", { id });
+      }
 
       const scope = String(rule.scope || "group");
       if (scope !== "group" && scope !== "personal")
@@ -557,18 +557,66 @@ export function AutomationTab(props: AutomationTabProps) {
     if (editingRuleSourceId === ruleId) closeRuleEditor();
   };
 
+  // Runs the saved rule once. Only the status is refreshed afterwards, so
+  // unsaved edits elsewhere in the list stay; a run is never retried.
+  const runRuleNow = async (ruleId: string) => {
+    if (!props.groupId) return;
+    const drafted = draft.rules.find((rule) => rule.id === ruleId);
+    const saved = savedRuleset?.rules.find((rule) => rule.id === ruleId);
+    if (!drafted || !saved || JSON.stringify(drafted) !== JSON.stringify(saved)) {
+      setRunNotice({ ruleId, text: t("automation.runSaveFirst"), tone: "warning" });
+      return;
+    }
+    const groupId = props.groupId;
+    const isCurrent = beginOperation();
+    setRunNotice(null);
+    let notice: { text: string; tone: "ok" | "warning" };
+    try {
+      const resp = await api.runAutomationRule(groupId, ruleId, rulesVersion);
+      if (!isCurrent()) return;
+      if (resp.ok) {
+        const recipients = resp.result.notified.join(", ");
+        notice = { text: t("automation.runSent", { recipients }), tone: "ok" };
+      } else {
+        const code = String(resp.error?.code || "").trim();
+        const known: Record<string, string> = {
+          group_paused: "automation.runPaused",
+          group_stopped: "automation.runStopped",
+          no_notification: "automation.runNothingSent",
+          version_conflict: "automation.runConflict",
+        };
+        notice = { text: t(known[code] || "automation.runUnknown"), tone: "warning" };
+      }
+    } catch {
+      if (!isCurrent()) return;
+      notice = { text: t("automation.runUnknown"), tone: "warning" };
+    }
+    setRunNotice({ ruleId, ...notice });
+    try {
+      const refreshed = await api.fetchAutomation(groupId);
+      if (isCurrent() && refreshed.ok) {
+        setStatus(refreshed.result.status || {});
+        setServerNow(refreshed.result.server_now);
+      }
+    } catch {
+      // The notice already says what is known; the status refreshes on reopen.
+    } finally {
+      if (isCurrent()) setRulesBusy(false);
+    }
+  };
+
   const clearCompletedRules = async () => {
     if (!props.groupId) return;
-    if (completedOneTimeRuleIds.length <= 0) {
+    if (completedRuleIds.length <= 0) {
       setRulesErr(t("automation.noCompletedToClear"));
       return;
     }
     const ok = window.confirm(
-      t("automation.clearCompletedConfirm", { count: completedOneTimeRuleIds.length }),
+      t("automation.clearCompletedConfirm", { count: completedRuleIds.length }),
     );
     if (!ok) return;
 
-    const removing = new Set(completedOneTimeRuleIds);
+    const removing = new Set(completedRuleIds);
     const nextDraft: AutomationRuleSet = {
       ...draft,
       rules: draft.rules.filter((rule) => !removing.has(String(rule.id || "").trim())),
@@ -629,7 +677,10 @@ export function AutomationTab(props: AutomationTabProps) {
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
       <div>
-        <h3 className="text-sm font-medium text-[var(--color-text-secondary)]">
+        <h3
+          className="text-sm font-medium text-[var(--color-text-secondary)]"
+          data-settings-page-title
+        >
           {t("automation.title")}
         </h3>
         <p className="text-xs mt-1 text-[var(--color-text-muted)]">
@@ -641,25 +692,6 @@ export function AutomationTab(props: AutomationTabProps) {
         </p>
       </div>
 
-      <AutomationPoliciesSection
-        isDark={isDark}
-        busy={props.busy}
-        keepaliveSeconds={props.keepaliveSeconds}
-        setKeepaliveSeconds={props.setKeepaliveSeconds}
-        keepaliveMax={props.keepaliveMax}
-        setKeepaliveMax={props.setKeepaliveMax}
-        helpNudgeIntervalSeconds={props.helpNudgeIntervalSeconds}
-        setHelpNudgeIntervalSeconds={props.setHelpNudgeIntervalSeconds}
-        helpNudgeMinMessages={props.helpNudgeMinMessages}
-        setHelpNudgeMinMessages={props.setHelpNudgeMinMessages}
-        idleSeconds={props.idleSeconds}
-        setIdleSeconds={props.setIdleSeconds}
-        silenceSeconds={props.silenceSeconds}
-        setSilenceSeconds={props.setSilenceSeconds}
-        onSavePolicies={props.onSavePolicies}
-        onResetPolicies={props.onResetPolicies}
-      />
-
       <Section
         isDark={isDark}
         icon={SparkIcon}
@@ -667,7 +699,9 @@ export function AutomationTab(props: AutomationTabProps) {
         description={t("automation.rulesDescription")}
       >
         {rulesErr ? (
-          <div className="text-xs text-rose-600 dark:text-rose-300">{rulesErr}</div>
+          <div className="text-xs text-rose-600 dark:text-rose-300" data-status-tone="error">
+            {rulesErr}
+          </div>
         ) : null}
 
         <div className="space-y-2">
@@ -718,15 +752,19 @@ export function AutomationTab(props: AutomationTabProps) {
 
         <AutomationRuleList
           isDark={isDark}
+          groupState={props.groupState}
           visibleRules={visibleRules}
           status={status}
+          serverNow={serverNow}
           rulesBusy={rulesBusy}
           showCompletedRules={showCompletedRules}
-          completedOneTimeRuleIds={completedOneTimeRuleIds}
+          completedRuleIds={completedRuleIds}
           onToggleShowCompleted={setShowCompletedRules}
           onClearCompleted={clearCompletedRules}
           onToggleRuleEnabled={(ruleId, enabled) => updateRule(ruleId, { enabled })}
           onEditRule={openExistingRule}
+          onRunRule={(ruleId) => void runRuleNow(ruleId)}
+          runNotice={runNotice}
           onDeleteRule={removeRule}
         />
 
@@ -739,6 +777,7 @@ export function AutomationTab(props: AutomationTabProps) {
         isDark={isDark}
         ruleDraft={editingRuleDraft}
         ruleStatus={editingRuleStatus}
+        serverNow={serverNow}
         isNewRule={editingRuleIsNew}
         errorMessage={rulesErr}
         saveBusy={rulesBusy}

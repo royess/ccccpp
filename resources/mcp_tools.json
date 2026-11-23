@@ -16,7 +16,7 @@
   },
   {
     "name": "cccc_bootstrap",
-    "description": "Cold-start bootstrap: session + recovery + inbox_preview + context_hygiene + memory_recall_gate + next_calls. Use it first on cold start or resume. Call cccc_help only when a CCCC route or state boundary is unclear; follow next_calls for colder detail because hidden tools are routed through cccc_capability_use.",
+    "description": "Cold-start bootstrap for the authenticated caller: session + recovery + inbox_preview + context_hygiene + next_calls. session.members lists this Group's recipients (Actor ID, runtime, role, enabled access and optional native source_id); use those Actor IDs with ordinary message tools. session.active_scope is the Group selection; session.effective_scope is your tool workspace, retaining the running managed launch directory until exit or restart. Use it first on cold start or resume. Call cccc_help only when a CCCC route or state boundary is unclear; follow next_calls for colder detail because hidden tools are routed through cccc_capability_use.",
     "annotations": {
       "readOnlyHint": true,
       "destructiveHint": false,
@@ -32,7 +32,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Bootstrap always reports the authenticated caller; this field cannot select another Actor."
         },
         "inbox_limit": {
           "type": "integer",
@@ -56,7 +56,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "limit": {
           "type": "integer",
@@ -76,7 +76,7 @@
   },
   {
     "name": "cccc_message_history",
-    "description": "Inspect actor-visible chat history without changing Mail read state. Use this when you explicitly need past Send, Send + Reply, or Mail messages; routine Mail handling should use cccc_inbox_read instead.",
+    "description": "Inspect actor-visible chat history without changing Mail read state. Pass event_id from a native notification to read that exact message or system notice: delivery_text has its full rendered text and receiving context, with native protocol instructions when due, and message has the event; mcp_omitted_fields lists fields omitted because they are already shown there. Do not combine event_id with filters or pagination. Otherwise list past Send, Send + Reply, or Mail messages; routine Mail handling should use cccc_inbox_read instead.",
     "annotations": {
       "readOnlyHint": true,
       "destructiveHint": false,
@@ -92,7 +92,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "mode": {
           "type": "string",
@@ -109,9 +109,21 @@
           "type": "string",
           "description": "Optional case-insensitive text search."
         },
+        "sender": {
+          "type": "string",
+          "description": "Only messages from this sender: an Actor ID or user."
+        },
         "before_event_id": {
           "type": "string",
           "description": "Return messages older than this visible history event."
+        },
+        "event_id": {
+          "type": "string",
+          "description": "Read this exact visible message or system notice, returned as full delivery_text plus message. Exclusive with mode, query, sender, before_event_id and limit."
+        },
+        "with_obligation_status": {
+          "type": "boolean",
+          "description": "With event_id, include reply and delivery status for a visible chat message. Agents see their own recipient status on incoming messages and their recipients' status on outgoing messages."
         },
         "limit": {
           "type": "integer",
@@ -135,7 +147,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Your local Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Your local Actor ID; leave it out to use your own."
         },
         "instance_id": {
           "type": "string",
@@ -167,7 +179,7 @@
   },
   {
     "name": "cccc_message_send",
-    "description": "Start a new visible chat message. Default to mode=mail for agents. Use mode=send only when delayed awareness costs more than interrupting the recipient, and mode=request_reply only when a concrete reply is also required. Mail is agent-only; messages to user must use send or request_reply. One message may address user alone or one/more agents, never both; send separate messages for separate audience domains. Do not send routine noise. Do not use this to answer an existing delivered message/event; use cccc_message_reply with that event_id instead. Choose `to` deliberately; request_reply requires concrete recipients and @all should be rare.",
+    "description": "Start a new visible chat message. Default to mode=mail for agents. Use mode=send only when delayed awareness costs more than interrupting the recipient, and mode=request_reply only when a concrete reply is also required. Mail is agent-only; messages to user must use send or request_reply. One message may address user alone or one/more agents, never both; send separate messages for separate audience domains. Do not send routine noise. Do not use this to answer an existing delivered message/event; use cccc_message_reply with that event_id instead. Choose `to` deliberately; request_reply requires concrete recipients and @all should be rare. When the user's decision or information is needed, add a question so they answer it in place.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -177,7 +189,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "dst_group_id": {
           "type": "string",
@@ -203,7 +215,7 @@
               }
             }
           ],
-          "description": "One audience domain only: user alone, or one/more agent IDs/selectors. Never mix user and agents."
+          "description": "One audience domain only: user alone, @chet alone for Chet, the user's global assistant (Send or Request reply, not Mail), or one/more agent IDs/selectors. Never mix domains."
         },
         "mode": {
           "type": "string",
@@ -212,18 +224,86 @@
             "send",
             "request_reply"
           ],
-          "default": "mail",
-          "description": "mail stores for agent Inbox without an immediate prompt and cannot target user; send requests best-effort prompt delivery now; request_reply uses the same delivery path and creates a reply obligation for concrete recipients."
+          "description": "If omitted: send when a recipient is the user, who has no Inbox, or the caller is a native session; otherwise mail. mail stores for agent Inbox without an immediate prompt and cannot target user; a new Mail's result may list named recipients that cannot act on it yet in mail_recipient_advisories, and no list does not mean every recipient will read it; send requests best-effort prompt delivery now, and its result may list named recipients it cannot reach for now in send_recipient_advisories; request_reply uses the same delivery path and creates a reply obligation for concrete recipients. Use mode in MCP calls; message_mode is an IPC field and is rejected here, including when both fields are present."
         },
         "idempotency_key": {
           "type": "string",
-          "description": "Stable retry key for a remote delivery. Reuse unchanged parameters after an uncertain tool response."
+          "description": "Stable retry key for this message, local or remote. Reuse it only with identical parameters after an uncertain tool response."
         },
         "refs": {
           "type": "array",
           "items": {
             "type": "object"
           }
+        },
+        "question": {
+          "type": "object",
+          "description": "Ask the user for a decision or information, answered in place. Only with mode=request_reply and to=\"user\" alone, in a new message (not a reply). Ask only for what you cannot responsibly supply yourself: the user's authority or judgment (a change of scope, an irreversible or outward action, spending money or credits, a product preference with a real tradeoff, or conflicting instructions) or information only the user has; otherwise decide and report. For a choice, offer 2-4 mutually exclusive, actionable options, each with its consequence, and recommend one with a reason when you know enough; the user can always answer in their own words instead. Omit options for a value only the user knows (a path, a number, a clarification). Never ask for secrets. text becomes the question's context (at most 4000 characters). Limits count characters. Keep working on what does not depend on the answer, and withdraw a question that is no longer needed with cccc_reply_request_cancel.",
+          "properties": {
+            "v": {
+              "type": "integer",
+              "enum": [
+                1
+              ]
+            },
+            "prompt": {
+              "type": "string",
+              "maxLength": 500,
+              "description": "The decision itself, in one or two sentences."
+            },
+            "options": {
+              "type": "array",
+              "maxItems": 4,
+              "description": "None for a free answer, otherwise 2-4. They are labelled A, B, C, D in this order.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "maxLength": 80
+                  },
+                  "consequence": {
+                    "type": "string",
+                    "maxLength": 240,
+                    "description": "What choosing it means, in one line."
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "recommended": {
+              "type": "object",
+              "description": "Only when you know enough to recommend. It is shown as advice, never preselected.",
+              "properties": {
+                "option_id": {
+                  "type": "string",
+                  "enum": [
+                    "A",
+                    "B",
+                    "C",
+                    "D"
+                  ]
+                },
+                "reason": {
+                  "type": "string",
+                  "maxLength": 240
+                }
+              },
+              "required": [
+                "option_id",
+                "reason"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "v",
+            "prompt"
+          ],
+          "additionalProperties": false
         },
         "suggested_user_message": {
           "type": "string",
@@ -258,7 +338,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "title": {
           "type": "string",
@@ -362,7 +442,7 @@
   },
   {
     "name": "cccc_message_reply",
-    "description": "Reply to a visible chat message by its current event_id. Defaults to Send; choose Mail only when the recipient is an agent and the reply may wait in Inbox without an immediate prompt. Replies to user must use Send. One reply may address user alone or one/more agents, never both. Either mode fulfills the original reply request. Use only for the thread you are answering; set `to` explicitly if the audience differs. For Connect, use the received local event_id; omit to to address the original participants. Routing comes from that event, without looking up or passing a remote Group ID.",
+    "description": "Reply to a visible chat message by its current event_id. Defaults to Send; choose Mail only when the recipient is an agent and the reply may wait in Inbox without an immediate prompt. Replies to user must use Send. One reply may address user alone or one/more agents, never both. Either mode fulfills the original reply request. Use only for the thread you are answering; set `to` explicitly if the audience differs. For Connect, use the received local event_id; omit to to address the original participants. Routing comes from that event, without looking up or passing a remote Group ID. A reply cannot carry a question: when the user's decision or information is needed, send a new request_reply message to user with a question.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -372,7 +452,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "event_id": {
           "type": "string",
@@ -384,7 +464,19 @@
         },
         "text": {
           "type": "string",
-          "description": "Reply content visible to the recipient in CCCC."
+          "description": "Required for an ordinary reply. Omit when supplying a structured answer."
+        },
+        "answer": {
+          "type": "object",
+          "description": "For Chet in unattended mode only. Answer a request to the user with its event_id and a stable idempotency_key. Supply answer without top-level text, to, or other message content. Use v:1 with option_id or free text, or v:2 with option_id and a note explaining the choice.",
+          "properties": {
+            "v": { "type": "integer", "enum": [1, 2] },
+            "option_id": { "type": "string" },
+            "text": { "type": "string" },
+            "note": { "type": "string" }
+          },
+          "required": ["v"],
+          "additionalProperties": false
         },
         "insight": {
           "type": "string",
@@ -403,7 +495,7 @@
               }
             }
           ],
-          "description": "One audience domain only: user alone, or one/more agent IDs/selectors. Never mix user and agents."
+          "description": "One audience domain only: user alone, @chet alone, or one/more agent IDs/selectors. Never mix domains. Omit to use the original conversation's reply route."
         },
         "mode": {
           "type": "string",
@@ -412,7 +504,7 @@
             "mail"
           ],
           "default": "send",
-          "description": "send: prompt the recipient now; mail: agent-only Inbox storage without an immediate prompt. Either fulfills the original reply request."
+          "description": "send: prompt the recipient now, and its result may list named recipients it cannot reach for now in send_recipient_advisories; mail: agent-only Inbox storage without an immediate prompt, whose result may list named recipients that cannot act on it yet in mail_recipient_advisories; no list does not mean every recipient will read it. Either fulfills the original reply request. Use mode in MCP calls; message_mode is an IPC field and is rejected here, including when both fields are present."
         },
         "refs": {
           "type": "array",
@@ -428,10 +520,7 @@
           "type": "string",
           "description": "Stable retry key for this logical reply. Reuse only with identical parameters."
         }
-      },
-      "required": [
-        "text"
-      ]
+      }
     },
     "annotations": {
       "readOnlyHint": false,
@@ -453,7 +542,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Sender actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Sender Actor ID; leave it out to send as yourself."
         },
         "source_event_id": {
           "type": "string",
@@ -497,7 +586,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Sender actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Sender Actor ID; leave it out to send as yourself."
         },
         "source_event_id": {
           "type": "string",
@@ -517,7 +606,7 @@
   },
   {
     "name": "cccc_file",
-    "description": "Read a file in the active workspace or a delivered attachment. read returns UTF-8 text, native PNG/JPEG/WebP images, or original PDF/PPTX resources for the client file reader. Binary limit: 20 MiB; no local conversion or OCR. info/blob_path return metadata/path only. In cccc_code_exec, native media is emitted automatically and JavaScript receives metadata. This tool never sends files or changes messages; use cccc_file_send for attachments.",
+    "description": "Read a file in your effective workspace (running managed launch, otherwise Actor default or Group active) or a delivered attachment. read returns UTF-8 text, native PNG/JPEG/WebP images, or original PDF/PPTX resources for the client file reader. Binary limit: 20 MiB; no local conversion or OCR. info/blob_path return metadata/path only. In cccc_code_exec, native media is emitted automatically and JavaScript receives metadata. This tool never sends files or changes messages; use cccc_file_send for attachments.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -527,7 +616,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "action": {
           "type": "string",
@@ -540,7 +629,7 @@
         },
         "rel_path": {
           "type": "string",
-          "description": "Path for read/blob_path/info: an active-scope relative file path or delivered attachment path such as state/blobs/<hash>. Images, PDF and PPTX files are detected from file content, including extensionless blobs."
+          "description": "Path for read/blob_path/info: a file relative to your effective workspace, an absolute path inside it, or a delivered attachment path such as state/blobs/<hash>. Images, PDF and PPTX files are detected from file content, including extensionless blobs."
         },
         "max_bytes": {
           "type": "integer",
@@ -563,7 +652,7 @@
   },
   {
     "name": "cccc_file_send",
-    "description": "Attach an active-workspace file to a CCCC message. Choose the human user alone or agent recipients, never both. Send prompts recipients; Mail stores agent Inbox mail without prompting. For a connected instance, provide both dst_instance_id and dst_group_id from cccc_connect. Returns the message/queue receipt; it does not confirm that a recipient has read the file. Use cccc_file to read files without sending them.",
+    "description": "Attach a file, or up to 10 files as one message, from your effective workspace (running managed launch, otherwise Actor default or Group active) to a CCCC message. Choose the human user alone or agent recipients, never both. Send prompts recipients; Mail stores agent Inbox mail without prompting. For a connected instance, provide both dst_instance_id and dst_group_id from cccc_connect. Returns the message/queue receipt; it does not confirm that a recipient has read the file. Use cccc_file to read files without sending them.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -573,11 +662,23 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "path": {
-          "type": "string",
-          "description": "Relative to the active scope, or an absolute path under that scope."
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "maxItems": 10
+            }
+          ],
+          "description": "A file, or a list of up to 10 files sent together as one message with one caption. Each is relative to your effective tool workspace, or an absolute path under that workspace."
         },
         "dst_group_id": {
           "type": "string",
@@ -613,8 +714,7 @@
             "send",
             "request_reply"
           ],
-          "default": "mail",
-          "description": "mail stores in an agent Inbox without an immediate prompt and cannot target user; send uses best-effort immediate Push; request_reply adds a concrete reply request."
+          "description": "If omitted: send when a recipient is the user, who has no Inbox, or the caller is a native session; otherwise mail. mail stores in an agent Inbox without an immediate prompt and cannot target user; send uses best-effort immediate Push; request_reply adds a concrete reply request. Use mode in MCP calls; message_mode is an IPC field and is rejected here."
         },
         "dst_instance_id": {
           "type": "string",
@@ -622,7 +722,7 @@
         },
         "idempotency_key": {
           "type": "string",
-          "description": "Stable retry key across instances."
+          "description": "Stable retry key for this file message, local or remote. Reuse it only with identical parameters."
         }
       },
       "required": [
@@ -639,7 +739,7 @@
   },
   {
     "name": "cccc_code_exec",
-    "description": "Preferred/default ChatGPT Web Model tool for non-trivial local development work. Run JavaScript that orchestrates CCCC MCP tools through global tools.<toolName>(args), with ALL_TOOLS, COMMON_WORK_LOOPS, tool_help(query[, {detail:'schema'}]), tool_names(query), list_tools(query), text(), store(), load(), and yield_control(). Use this instead of many separate tool calls for multi-step loops such as read -> patch -> test -> diff -> report; direct repo/shell/git tools are still fine for simple one-step actions. The JS runtime has no Node require/import/fs/network/console access; use nested MCP tools for all real work. If the result says running with a cell_id, call cccc_code_wait. If output is truncated, narrow the commands/ranges or raise max_output_tokens up to 50000. Nested cccc_file reads automatically emit images and original PDF/PPTX resources (up to 4 binary items and 20 MiB total per result); JS receives file metadata, not base64. No image() helper is needed. Read fewer files or yield before reading more.",
+    "description": "Preferred/default ChatGPT Web Model tool for non-trivial local development work. Run JavaScript that orchestrates CCCC MCP tools through global tools.<toolName>(args), with ALL_TOOLS, COMMON_WORK_LOOPS, tool_help(query[, {detail:'schema'}]), tool_names(query), list_tools(query), text(), store(), load(), and yield_control(). Use this instead of many separate tool calls for multi-step loops such as read -> patch -> test -> diff -> report; direct repo/shell/git tools are still fine for simple one-step actions. The JS runtime has no Node require/import/fs/network/console access; use nested MCP tools for all real work. If the result says running with a cell_id, call cccc_code_wait. If output is truncated, verify the effects of earlier calls before repeating anything; obtain more detail using only necessary read-only steps with narrower ranges or a higher max_output_tokens (up to 50000) for subsequent output. Nested cccc_file reads automatically emit images and original PDF/PPTX resources (up to 4 binary items and 20 MiB total per result); JS receives file metadata, not base64. No image() helper is needed. Read fewer files or yield before reading more.",
     "annotations": {
       "readOnlyHint": false,
       "destructiveHint": true,
@@ -718,7 +818,7 @@
   },
   {
     "name": "cccc_repo",
-    "description": "Read-only active workspace inspection: info|list|list_dir|read|search. Editing actions are rejected. list is shallow; list_dir honors depth and offset. Paths and file_path aliases are scope-relative; discovered symlinks are not followed. Search honors path, globs, case, context and limits. Check truncated/incomplete and skipped_files before concluding no match. Read returns whole-file sha256; use next_start_line to continue a truncated range. If partial_last_line is true, reread that line with a larger max_bytes (do not skip it). Use cccc_repo_edit or cccc_apply_patch for writes.",
+    "description": "Read-only inspection of your effective workspace (running managed launch, otherwise Actor default or Group active): info|list|list_dir|read|search. Editing actions are rejected. list is shallow; list_dir honors depth and offset. Paths and file_path aliases are scope-relative; discovered symlinks are not followed. Search honors path, globs, case, context and limits. Check truncated/incomplete and skipped_files before concluding no match. Read returns whole-file sha256; use next_start_line to continue a truncated range. If partial_last_line is true, reread that line with a larger max_bytes (do not skip it). Use cccc_repo_edit or cccc_apply_patch for writes.",
     "annotations": {
       "readOnlyHint": true,
       "destructiveHint": false,
@@ -745,7 +845,7 @@
         },
         "path": {
           "type": "string",
-          "description": "Path under the active workspace root (or file_path alias). Required for read; list/search default to root. Search accepts a directory or one file. Conflicting aliases are rejected."
+          "description": "Path under your effective workspace root (or file_path alias). Required for read; list/search default to root. Search accepts a directory or one file. Conflicting aliases are rejected."
         },
         "file_path": {
           "type": "string",
@@ -840,7 +940,7 @@
   },
   {
     "name": "cccc_repo_edit",
-    "description": "Write to the active workspace repository for remote runtimes: action=replace|multi_replace|write|mkdir|delete|move. For exact small edits, prefer cccc_repo(action=read) -> replace/multi_replace with expected_sha256, then cccc_git diff. Use cccc_apply_patch for structural or multi-file Codex *** Begin Patch patches.",
+    "description": "Write to your effective workspace repository (Actor default scope, otherwise Group active): action=replace|multi_replace|write|mkdir|delete|move. For exact small edits, prefer cccc_repo(action=read) -> replace/multi_replace with expected_sha256, then cccc_git diff. Use cccc_apply_patch for structural or multi-file Codex *** Begin Patch patches.",
     "annotations": {
       "readOnlyHint": false,
       "destructiveHint": true,
@@ -960,7 +1060,7 @@
   },
   {
     "name": "cccc_shell",
-    "description": "Short one-shot process execution in the group's active workspace. Uses the host process's OS permissions; cwd is not a filesystem/network sandbox. The command is split into program/arguments using shell-style quoting and executed directly: shell operators, redirection, variables, and wildcards are not expanded. For shell syntax, explicitly invoke an installed shell, e.g. sh -c 'pwd && git status --short' on Unix or powershell.exe -NoProfile -Command 'Get-Location; Get-ChildItem' on Windows. Returns exit_code, stdout, stderr, and output-truncation flags. For long-running or interactive commands use cccc_exec_command plus cccc_write_stdin.",
+    "description": "Short one-shot process execution in your effective workspace (running managed launch, otherwise Actor default or Group active). Uses the host process's OS permissions; cwd is not a filesystem/network sandbox. The command is split into program/arguments using shell-style quoting and executed directly: shell operators, redirection, variables, and wildcards are not expanded. For shell syntax, explicitly invoke an installed shell, e.g. sh -c 'pwd && git status --short' on Unix or powershell.exe -NoProfile -Command 'Get-Location; Get-ChildItem' on Windows. Returns exit_code, stdout, stderr, and output-truncation flags. For long-running or interactive commands use cccc_exec_command plus cccc_write_stdin.",
     "annotations": {
       "readOnlyHint": false,
       "destructiveHint": true,
@@ -980,7 +1080,7 @@
         },
         "cwd": {
           "type": "string",
-          "description": "Relative cwd under the active workspace root.",
+          "description": "Relative cwd under your effective workspace root.",
           "default": "."
         },
         "timeout_s": {
@@ -1010,7 +1110,7 @@
   },
   {
     "name": "cccc_exec_command",
-    "description": "Start a long-running or interactive foreground process in the group's active workspace. Like cccc_shell, command strings use shell-style quoting but execute the program directly; operators and expansions require an explicit installed shell (e.g. sh -c on Unix or powershell.exe -NoProfile -Command on Windows). Returns session_id, status, initial output, cursor, has_more, cursor_expired, timed_out and closed. Waits up to yield_time_ms for output or exit. timeout_s is a hard lifetime limit (default/max 600 seconds), enforced without polling. Use cccc_write_stdin for incremental output/input/termination until closed=true, even when status.running=false but has_more=true. Output is bounded; max_output_bytes may extend by up to 3 bytes to finish a UTF-8 character. At most 64 sessions per host/Home; abandoned results expire 10 minutes after the command deadline. Use cccc_shell for short one-shot commands. Commands retain the host process's OS file/network permissions; workspace scope is not a sandbox.",
+    "description": "Start a long-running or interactive foreground process in your effective workspace (running managed launch, otherwise Actor default or Group active). Runs in a PTY; output can contain colors and CRLF. On Unix, PAGER, GIT_PAGER, GH_PAGER and MANPAGER default to cat; on Windows only GIT_PAGER and GH_PAGER do; PAGER and MANPAGER remain inherited. Set pager variables in this call's env to override these defaults. Like cccc_shell, command strings use shell-style quoting but execute the program directly; operators and expansions require an explicit installed shell (e.g. sh -c on Unix or powershell.exe -NoProfile -Command on Windows). Returns session_id, status, initial output, cursor, has_more, cursor_expired, timed_out and closed. Waits up to yield_time_ms for output or exit. timeout_s is a hard lifetime limit (default/max 600 seconds), enforced without polling. Use cccc_write_stdin for incremental output/input/termination until closed=true, even when status.running=false but has_more=true. Output is bounded; max_output_bytes may extend by up to 3 bytes to finish a UTF-8 character. At most 64 sessions per host/Home; abandoned results expire 10 minutes after the command deadline. Use cccc_shell for short one-shot commands. Commands retain the host process's OS file/network permissions; workspace scope is not a sandbox.",
     "annotations": {
       "readOnlyHint": false,
       "destructiveHint": true,
@@ -1034,7 +1134,7 @@
         },
         "cwd": {
           "type": "string",
-          "description": "Relative cwd under the active workspace root.",
+          "description": "Relative cwd under your effective workspace root.",
           "default": "."
         },
         "workdir": {
@@ -1113,7 +1213,7 @@
   },
   {
     "name": "cccc_git",
-    "description": "Web Model local-power git operations in the group's active workspace: action=status|diff|log|add|commit. Returns exit_code, stdout, stderr and output-truncation flags. Use cccc_shell for unusual git commands. Commands retain the host process's OS file/network permissions; workspace scope is not a sandbox.",
+    "description": "Local git operations in your effective workspace (running managed launch, otherwise Actor default or Group active): action=status|diff|log|add|commit. Returns exit_code, stdout, stderr and output-truncation flags. Use cccc_shell for unusual git commands. Commands retain the host process's OS file/network permissions; workspace scope is not a sandbox.",
     "annotations": {
       "readOnlyHint": false,
       "destructiveHint": true,
@@ -1157,7 +1257,7 @@
         "all_changes": {
           "type": "boolean",
           "default": false,
-          "description": "For action=add, stage all changes under the active workspace."
+          "description": "For action=add, stage all changes under your effective workspace."
         },
         "message": {
           "type": "string",
@@ -1192,7 +1292,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "action": {
           "type": "string",
@@ -1261,7 +1361,7 @@
   },
   {
     "name": "cccc_group",
-    "description": "Group operations: action=info|list|resolve|set_state. Use resolve to turn natural #group/title tokens into a real group_id before cross-group messaging.",
+    "description": "Group operations: action=info|list|resolve|set_state|activity. Use resolve to turn natural #group/title tokens into a real group_id before cross-group messaging. activity (foreman only) counts the messages you may read, scheduled reminders and open tasks per member for a team review; counts are leads, not verdicts.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1271,7 +1371,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "action": {
           "type": "string",
@@ -1279,7 +1379,8 @@
             "info",
             "list",
             "resolve",
-            "set_state"
+            "set_state",
+            "activity"
           ],
           "default": "info"
         },
@@ -1295,7 +1396,14 @@
             "paused",
             "stopped"
           ],
-          "description": "Required when action=set_state"
+          "description": "Required when action=set_state. stopped calls group_stop to stop managed runtimes and Group delivery."
+        },
+        "days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 365,
+          "default": 14,
+          "description": "action=activity only: how many days back to count."
         }
       },
       "required": []
@@ -1343,6 +1451,10 @@
         },
         "title": {
           "type": "string"
+        },
+        "model_label": {
+          "type": "string",
+          "description": "On add: optional operator-maintained model declaration; absence means undeclared. Does not configure launch or verify the serving model."
         },
         "command": {
           "type": "array",
@@ -1411,7 +1523,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "limit": {
           "type": "integer",
@@ -1441,7 +1553,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "turn_id": {
           "type": "string"
@@ -1479,7 +1591,7 @@
   },
   {
     "name": "cccc_capability_search",
-    "description": "Search the configured local and built-in capability registry. Returns matching capabilities without enabling, installing or executing them.",
+    "description": "Find optional skills and MCP tools for the task at hand, such as research with cited sources, current web facts, papers, reading office files, spreadsheets, data checks, contract redlines, public repository questions and code that must match a library's version. Set recommended=true to browse CCCC's recommended entries for you without guessing a word. Otherwise search the local catalog, built-in packs and release recommendations by name or a short word; each space-separated term must appear in an entry (case-insensitive), and an empty query lists the whole catalog. Consider ones that fill a gap or improve quality or efficiency; keep your existing tools when the added option does not help. Returns summaries with use cases, cases to avoid, requirements, verification and suitability for you, without enabling, installing or executing them. Skill bodies and full tool schemas are not included; use cccc_capability_use with an exact capability_id for complete skill rules. Unverified historical SkillsMP search snapshots are excluded; saved records and existing bindings are unchanged.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1489,38 +1601,17 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "query": {
           "type": "string",
+          "description": "A capability or tool name, or one short word such as a file type; each space-separated term must appear in the entry (case-insensitive).",
           "default": ""
         },
-        "kind": {
-          "type": "string",
-          "default": ""
-        },
-        "source_id": {
-          "type": "string",
-          "default": ""
-        },
-        "trust_tier": {
-          "type": "string",
-          "default": ""
-        },
-        "qualification_status": {
-          "type": "string",
-          "default": ""
-        },
-        "limit": {
-          "type": "integer",
-          "default": 30,
-          "minimum": 1,
-          "maximum": 200
-        },
-        "include_external": {
+        "recommended": {
           "type": "boolean",
-          "default": false,
-          "description": "Reserved. This implementation searches the configured local registry only; it does not query remote sources."
+          "description": "true lists CCCC's recommended entries for you, at most ten: blocked entries and ones known not to work for you are left out; entries that still need setup are listed with their requirements. A query narrows them as usual.",
+          "default": false
         }
       },
       "required": []
@@ -1663,7 +1754,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         }
       },
       "required": []
@@ -1723,7 +1814,7 @@
   },
   {
     "name": "cccc_capability_import",
-    "description": "Foreman/admin governance tool to import an agent-prepared normalized capability record (mcp_toolpack or skill). Alternatively pass source_uri for a GitHub skill repository; repositories containing multiple skills/*/SKILL.md files are expanded into one CCCC skill capability per SKILL.md and may be enabled together. Use source_id=agent_self_proposed and capability_id=skill:agent_self_proposed:<stable-slug> for low-risk autonomous capsule skill proposals. Self-proposed skills must include When to use, Avoid when, Procedure, Pitfalls, and Verification sections; reuse the same capability_id for updates instead of duplicating. record.source_id is optional; empty/unknown values are normalized to manual_import. Use dry_run before unclear-risk records or immediate enablement; reuse the same capability_id to update stale/incomplete/wrong self-proposed skills instead of duplicating; import results report scope/import_action/record_changed/already_active/active_after_import; import_action is the primary create/update/unchanged signal, while record_changed only compares an existing record; already_active is the pre-import binding and active_after_import is the post-import runnable binding; when active/readiness_preview.active, do not enable again; verify full active capsule updates via capability_state.active_capsule_skills[].capsule_text; use scope=session for a temporary trial, scope=actor for cross-session reusable self-proposed skills, and scope=group only for shared team-wide behavior. Dry runs return readiness_preview; external capability actionability follows external capability safety mode.",
+    "description": "Foreman/admin governance tool to import an agent-prepared normalized capability record (mcp_toolpack or skill). Alternatively pass source_uri for a GitHub skill repository; repositories containing multiple skills/*/SKILL.md files are expanded into one CCCC skill capability per SKILL.md and may be enabled together. Use source_id=agent_self_proposed and capability_id=skill:agent_self_proposed:<stable-slug> for low-risk autonomous capsule skill proposals. Self-proposed skills must include When to use, Avoid when, Procedure, Pitfalls, and Verification sections; reuse the same capability_id for updates instead of duplicating. record.source_id is optional; empty/unknown values are normalized to manual_import. Use dry_run before unclear-risk records or immediate enablement; reuse the same capability_id to update stale/incomplete/wrong self-proposed skills instead of duplicating; import results report scope/import_action/record_changed/already_active/active_after_import; import_action is the primary create/update/unchanged signal, while record_changed only compares an existing record; already_active is the pre-import binding and active_after_import is the post-import runnable binding; when active/readiness_preview.active, do not enable again; verify activation in capability_state and read the full capsule with cccc_capability_use(capability_id=...); use scope=session for a temporary trial, scope=actor for cross-session reusable self-proposed skills, and scope=group only for shared team-wide behavior. Dry runs return readiness_preview; external capability actionability follows external capability safety mode.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1828,7 +1919,7 @@
                   }
                 }
               ],
-              "description": "Command mode shortcut; alternatively provide install_spec.command"
+              "description": "Command mode shortcut; alternatively provide install_spec.command. A string is one executable, never split by a shell; give arguments as an argv array such as [\"npx\",\"-y\",\"<package>\"]."
             },
             "command_candidates": {
               "type": "array",
@@ -1974,7 +2065,7 @@
   },
   {
     "name": "cccc_capability_use",
-    "description": "Use an existing capability: enable it and optionally call one target tool. This is the preferred path for built-in capability pack tools that may be hidden from tools/list. For skill:* capabilities this activates the runtime capsule, not a local package install. Use scope=session for temporary activation and scope=actor for reuse by the selected actor; group scope requires foreman. If enable returns activation_pending, relist/reconnect before claiming success; inspect diagnostics/resolution_plan for blockers.",
+    "description": "Use an optional skill or MCP capability, usually one found with cccc_capability_search, by its exact capability_id or an unambiguous tool name: enable it and optionally call one target tool. For an external MCP with an explicit capability_id, tool_name accepts its real name or its advertised cccc_ext_ name. This is the preferred path for built-in capability pack tools that may be hidden from tools/list. For skill:* capabilities this activates the skill and returns its rules in capsule_text, ready to follow; it is not a local package install. For a release recommendation, every result also carries CCCC's notes in avoid_when, gotchas and requirements_summary; read them before following the text or relying on a tool result. Use scope=session for temporary activation and scope=actor for reuse by the selected actor; group scope requires foreman. If a capability that adds tools returns activation_pending, relist/reconnect before claiming success; inspect diagnostics/resolution_plan for blockers.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2180,7 +2271,7 @@
   },
   {
     "name": "cccc_automation",
-    "description": "Automation hub tool: action=state|manage.",
+    "description": "Scheduled reminders for this Group: action=state|manage|run_now. state lists the rules you can see, their timing status, fired_count and the version. manage applies actions in order and saves all of them or none. run_now writes a real notification and offers it for delivery; it can wake members and use model credits, does not change the schedule or max_runs, and does not prove delivery. A peer manages only its own reminders (scope personal, owner_actor_id and to set to itself; these are the defaults when it leaves them out). The foreman manages every notify rule. Scheduled group_state and actor_control rules belong to the user; a request that would change, remove or reorder them is refused.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2196,23 +2287,25 @@
           "type": "string",
           "enum": [
             "state",
-            "manage"
+            "manage",
+            "run_now"
           ],
           "default": "state"
-        },
-        "op": {
-          "type": "string",
-          "description": "Simple mode op for manage"
         },
         "actions": {
           "type": "array",
           "items": {
             "type": "object"
           },
-          "description": "Advanced manage actions"
+          "description": "manage only. Items: {type:create_rule|update_rule, rule}, {type:set_rule_enabled, rule_id, enabled}, {type:delete_rule, rule_id}, {type:replace_all_rules, ruleset:{rules, snippets}}. A rule is {id, enabled?, scope?: group|personal, owner_actor_id?, to?: [recipient], trigger: {kind:interval, every_seconds, max_runs?} | {kind:cron, cron, timezone?, max_runs?} | {kind:at, at:RFC3339}, action: {kind:notify, message or snippet_ref, title?, priority?: low|normal|high|urgent}}. A one-time reminder to yourself: {type:create_rule, rule:{id:check-ci, trigger:{kind:at, at:<RFC3339 time after server_now from state>}, action:{kind:notify, message:Check CI}}}. A fired one-time rule is disabled. An interval or cron rule repeats until disabled or deleted, or until its optional positive integer max_runs is reached. Changing the limit or disabling the rule retains its count; removing the limit resets it."
         },
         "expected_version": {
-          "type": "integer"
+          "type": "integer",
+          "description": "The version from state; a stale value returns version_conflict before changing or running a newer rule."
+        },
+        "rule_id": {
+          "type": "string",
+          "description": "run_now only: the exact ID of a saved notification rule. A lost response may mean it ran; verify before repeating."
         }
       },
       "required": []
@@ -2288,7 +2381,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "ops": {
           "type": "array",
@@ -2317,7 +2410,7 @@
   },
   {
     "name": "cccc_coordination",
-    "description": "Shared control-plane tool: action=get|update_brief|add_decision|add_handoff.",
+    "description": "Shared control-plane tool: action=get|update_brief. get returns the brief and task counts, with the tasks needing attention as summary rows, at most 10 per list; a longer list adds <list>_total. For blocked, waiting_user or pending_handoffs, use cccc_task with attention=blocked, waiting_user or handoff respectively and page through the results.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2327,21 +2420,15 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "action": {
           "type": "string",
           "enum": [
             "get",
-            "update_brief",
-            "add_decision",
-            "add_handoff"
+            "update_brief"
           ],
           "default": "get"
-        },
-        "include_archived": {
-          "type": "boolean",
-          "default": false
         },
         "objective": {
           "type": "string"
@@ -2351,6 +2438,7 @@
         },
         "constraints": {
           "type": "array",
+          "description": "update_brief replaces the whole list with the one you send; include every constraint to keep.",
           "items": {
             "type": "string"
           }
@@ -2360,12 +2448,6 @@
         },
         "project_brief_stale": {
           "type": "boolean"
-        },
-        "summary": {
-          "type": "string"
-        },
-        "task_id": {
-          "type": "string"
         }
       },
       "required": []
@@ -2379,7 +2461,7 @@
   },
   {
     "name": "cccc_task",
-    "description": "Shared collaboration task hub (not runtime todo): action=list|create|update|move|restore|delete. Use for multi-actor, long-horizon, or user-tracked work. Lifecycle transitions are canonical via move; update with status auto-applies the matching lifecycle move.",
+    "description": "Shared task board the user and teammates see; it survives restarts and context resets: action=list|create|update|move|restore|delete. Use it for user requests and commitments that need multiple steps, coordination or follow-up; keep one task per coherent piece of work, with routine steps in its checklist. Link a task to the backlog entry it works on with source; the entry stays in the file. Lifecycle transitions are canonical via move; update with status auto-applies the matching lifecycle move. list returns planned and active tasks as one summary row each, with counts per status; pass task_id to read one task in full, with its subtasks as summary rows that you read by their own task_id.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2389,7 +2471,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "action": {
           "type": "string",
@@ -2403,12 +2485,45 @@
           ],
           "default": "list"
         },
+        "if_task_rev": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional task revision guard for update, move, restore or delete. Read rev from the task first; a stale value returns task_conflict."
+        },
         "task_id": {
           "type": "string"
         },
         "include_archived": {
           "type": "boolean",
-          "default": false
+          "default": false,
+          "description": "With action=list, also lists archived tasks; reading an archived task by task_id needs it too."
+        },
+        "query": {
+          "type": "string",
+          "description": "List only: text to find in task ids, titles, notes and outcomes; the rows then include done tasks."
+        },
+        "attention": {
+          "type": "string",
+          "enum": [
+            "blocked",
+            "waiting_user",
+            "handoff",
+            "unassigned"
+          ],
+          "description": "List only: tasks that are blocked, waiting on the user, handed off, or unassigned."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 50,
+          "description": "List only: most rows in one page."
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "List only: rows to skip; continue while has_more is true. If tasks_version changes between pages, start again from offset 0."
         },
         "title": {
           "type": "string"
@@ -2433,13 +2548,22 @@
             "done",
             "archived"
           ],
-          "description": "Lifecycle status. Required for action=move. If passed with action=update, the wrapper also applies the corresponding lifecycle transition. Use action=update when the same call must also change outcome, notes, checklist, or type."
+          "description": "Lifecycle status. Required for action=move. If passed with action=update, the wrapper also applies the corresponding lifecycle transition. Use action=update when the same call must also change outcome, notes, checklist, or type. With action=list, lists only tasks in this status."
         },
         "parent_id": {
           "type": "string"
         },
+        "client_request_id": {
+          "type": "string",
+          "description": "Create only. Your own id for this task. Creating again with the same id returns the task you already created instead of a second one, so a retry is safe."
+        },
+        "parent_ref": {
+          "type": "string",
+          "description": "Create only, instead of parent_id: the client_request_id of a task you created."
+        },
         "assignee": {
-          "type": "string"
+          "type": "string",
+          "description": "The actor responsible for the task. On create or update, a peer may assign only itself; the foreman or the user may assign anyone. With action=list, lists only this actor's tasks."
         },
         "priority": {
           "type": "string"
@@ -2450,6 +2574,13 @@
             "type": "string"
           }
         },
+        "blocked_by_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Create only: client_request_ids of tasks you created that block this one; added to blocked_by."
+        },
         "waiting_on": {
           "type": "string",
           "enum": [
@@ -2457,17 +2588,20 @@
             "user",
             "actor",
             "external"
-          ]
+          ],
+          "description": "Set user when the next step needs the user (a decision, a test, or an action only they can take); this marks the task but does not notify the user, so hand over the action in a message. Set external when it waits on something outside the Group, such as a contributor's report, and actor when it waits on another member; these two count the task as blocked. Set it back, usually to none, when the wait ends."
         },
         "handoff_to": {
-          "type": "string"
+          "type": "string",
+          "description": "Actor the task is handed to. Besides the foreman and the user, only the assignee or the handoff target may update, move, restore or delete a task; a peer may also claim a planned or active task that has neither by assigning itself."
         },
         "notes": {
           "type": "string",
-          "description": "Freeform task notes. Keep them compact; use structured sections only when the workflow genuinely needs them."
+          "description": "Freeform task notes. On update, the text you send replaces all existing notes; to add to them, list the task first and send the combined text with if_task_rev. Keep them compact; use structured sections only when the workflow genuinely needs them."
         },
         "checklist": {
           "type": "array",
+          "description": "On update, this replaces the entire checklist. List the task first, then send the complete updated list, unchanged items included, with if_task_rev.",
           "items": {
             "type": "object",
             "properties": {
@@ -2490,6 +2624,144 @@
               "text"
             ]
           }
+        },
+        "source": {
+          "type": "object",
+          "description": "Create or update: the backlog entry this task comes from, as cccc_backlog shows it. The entry is not read or changed.",
+          "properties": {
+            "scope_key": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "entry_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "scope_key",
+            "path",
+            "entry_id"
+          ]
+        }
+      },
+      "required": []
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "cccc_backlog",
+    "description": "The project's backlog file: long-lived topics and ideas; tasks made from an entry track the work on it. action=get|add|edit|move|close|promote|use|create|exclude. get lists the sections and entry titles with their linked tasks; pass entry to read one entry in full. The other actions need scope_key, scope_url and path from your last get (use and create take the path of the file to choose); edit, move, close and promote also need its sha256 as if_file_sha256, and a stale one returns backlog_file_conflict, so get again. promote starts a task from an entry, or returns the entry's unfinished task. close moves an entry to Closed with a one-line outcome. use and create choose the file, and exclude adds a local Git exclude rule for it (a file Git already tracks is refused); these three are for the foreman or the user.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "group_id": {
+          "type": "string",
+          "description": "Working group ID (optional if CCCC_GROUP_ID is set)"
+        },
+        "actor_id": {
+          "type": "string",
+          "description": "Actor ID; leave it out to act as yourself."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "get",
+            "add",
+            "edit",
+            "move",
+            "close",
+            "promote",
+            "use",
+            "create",
+            "exclude"
+          ],
+          "default": "get"
+        },
+        "scope_key": {
+          "type": "string",
+          "description": "From get. On get, omit it to read the backlog of your own workspace scope."
+        },
+        "scope_url": {
+          "type": "string",
+          "description": "From get."
+        },
+        "path": {
+          "type": "string",
+          "description": "From get; for use or create, the file to choose, relative to the project root."
+        },
+        "if_file_sha256": {
+          "type": "string",
+          "description": "The sha256 from your last get."
+        },
+        "entry": {
+          "type": "object",
+          "description": "The entry to read or change: {\"id\": ...} for an entry with an id, or {\"line\": ...}, its heading line from get, for one without.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "line": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "section": {
+          "type": "string",
+          "description": "add and move: a section name from get; \"\" is the part before the first section. Only close puts an entry in Closed."
+        },
+        "title": {
+          "type": "string",
+          "description": "add and edit: one line."
+        },
+        "body": {
+          "type": "string",
+          "description": "add and edit: the text under the title. Use #### for headings in it, never ## or ###."
+        },
+        "outcome": {
+          "type": "string",
+          "description": "close: one line, added to the entry with today's date."
+        },
+        "task": {
+          "type": "object",
+          "description": "promote: the task to create, with the cccc_task create fields; its source is set from the entry.",
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "planned",
+                "active"
+              ]
+            },
+            "assignee": {
+              "type": "string"
+            },
+            "priority": {
+              "type": "string"
+            },
+            "notes": {
+              "type": "string"
+            },
+            "client_request_id": {
+              "type": "string",
+              "description": "Retrying with the same id returns the task already created."
+            }
+          }
+        },
+        "keep_local": {
+          "type": "boolean",
+          "default": true,
+          "description": "create, in a Git project: keep the new file out of Git through this clone's local exclude list."
         }
       },
       "required": []
@@ -2512,7 +2784,8 @@
           "description": "Working group ID (optional if CCCC_GROUP_ID is set)"
         },
         "actor_id": {
-          "type": "string"
+          "type": "string",
+          "description": "With action=get, the member whose state to read; leave it out to read your own. update and clear always act on your own state."
         },
         "action": {
           "type": "string",
@@ -2621,252 +2894,6 @@
     }
   },
   {
-    "name": "cccc_memory",
-    "description": "Local shared Markdown memory: action=layout_get|search|get|write. Search uses lexical matching, not embeddings; use get to read the matching source lines.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "group_id": {
-          "type": "string",
-          "description": "Working group ID (optional if CCCC_GROUP_ID is set)"
-        },
-        "action": {
-          "type": "string",
-          "enum": [
-            "layout_get",
-            "search",
-            "get",
-            "write"
-          ],
-          "default": "search"
-        },
-        "query": {
-          "type": "string"
-        },
-        "max_results": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 50,
-          "default": 5
-        },
-        "min_score": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1,
-          "default": 0.1
-        },
-        "sources": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "vector_weight": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1,
-          "description": "Accepted for existing clients; the local lexical backend does not use this value."
-        },
-        "candidate_multiplier": {
-          "type": "number",
-          "minimum": 1,
-          "maximum": 20
-        },
-        "path": {
-          "type": "string"
-        },
-        "offset": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "limit": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 5000
-        },
-        "target": {
-          "type": "string",
-          "enum": [
-            "memory",
-            "daily"
-          ]
-        },
-        "content": {
-          "type": "string"
-        },
-        "date": {
-          "type": "string",
-          "description": "YYYY-MM-DD (required when target=daily)"
-        },
-        "mode": {
-          "type": "string",
-          "enum": [
-            "append",
-            "replace"
-          ],
-          "default": "append"
-        },
-        "idempotency_key": {
-          "type": "string"
-        },
-        "actor_id": {
-          "type": "string"
-        },
-        "source_refs": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "tags": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "supersedes": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "dedup_intent": {
-          "type": "string",
-          "enum": [
-            "new",
-            "update",
-            "supersede",
-            "silent"
-          ],
-          "default": "new"
-        },
-        "dedup_query": {
-          "type": "string"
-        }
-      },
-      "required": []
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": false
-    }
-  },
-  {
-    "name": "cccc_memory_admin",
-    "description": "Local memory helpers: index_sync scans file counts without building a persistent index; context_check estimates tokens; compact returns a bounded excerpt or a summarization prompt, not an LLM summary. daily_flush writes a bounded daily-memory extract from supplied messages, or returns a prompt. Use cccc_memory for normal search/read/write.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "group_id": {
-          "type": "string",
-          "description": "Working group ID (optional if CCCC_GROUP_ID is set)"
-        },
-        "action": {
-          "type": "string",
-          "enum": [
-            "index_sync",
-            "context_check",
-            "compact",
-            "daily_flush"
-          ],
-          "default": "index_sync"
-        },
-        "mode": {
-          "type": "string",
-          "enum": [
-            "scan",
-            "rebuild"
-          ],
-          "default": "scan"
-        },
-        "messages": {
-          "type": "array",
-          "items": {
-            "type": "object"
-          }
-        },
-        "messages_to_summarize": {
-          "type": "array",
-          "items": {
-            "type": "object"
-          },
-          "description": "Input for compact. The default summary is a bounded excerpt and can omit later facts; set return_prompt=true to obtain a prompt for the calling model to summarize."
-        },
-        "turn_prefix_messages": {
-          "type": "array",
-          "items": {
-            "type": "object"
-          }
-        },
-        "previous_summary": {
-          "type": "string"
-        },
-        "context_window_tokens": {
-          "type": "integer",
-          "minimum": 1024
-        },
-        "reserve_tokens": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "keep_recent_tokens": {
-          "type": "integer",
-          "minimum": 256
-        },
-        "return_prompt": {
-          "type": "boolean",
-          "default": false
-        },
-        "date": {
-          "type": "string",
-          "description": "YYYY-MM-DD"
-        },
-        "version": {
-          "type": "string",
-          "default": "default"
-        },
-        "language": {
-          "type": "string",
-          "default": "en"
-        },
-        "actor_id": {
-          "type": "string"
-        },
-        "signal_pack": {
-          "type": "object"
-        },
-        "signal_pack_token_budget": {
-          "type": "integer",
-          "minimum": 64,
-          "maximum": 4096,
-          "default": 320
-        },
-        "dedup_intent": {
-          "type": "string",
-          "enum": [
-            "new",
-            "update",
-            "supersede",
-            "silent"
-          ],
-          "default": "new"
-        },
-        "dedup_query": {
-          "type": "string"
-        }
-      },
-      "required": []
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": false
-    }
-  },
-  {
     "name": "cccc_headless",
     "description": "Headless runner control: action=status|set_status.",
     "inputSchema": {
@@ -2878,7 +2905,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor whose headless state to read or update; leave it out for your own."
         },
         "action": {
           "type": "string",
@@ -2925,7 +2952,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "action": {
           "type": "string",
@@ -2945,7 +2972,8 @@
           "type": "string"
         },
         "target_actor_id": {
-          "type": "string"
+          "type": "string",
+          "description": "Actor to notify. Omit to broadcast to the Group."
         },
         "priority": {
           "type": "string",
@@ -2979,7 +3007,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor whose terminal to inspect; leave it out for your own."
         },
         "action": {
           "type": "string",
@@ -3031,7 +3059,7 @@
         },
         "actor_id": {
           "type": "string",
-          "description": "Actor ID (optional if CCCC_ACTOR_ID is set)"
+          "description": "Actor ID; leave it out to act as yourself."
         },
         "action": {
           "type": "string",
@@ -3180,6 +3208,75 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
+    }
+  },
+  {
+    "name": "cccc_session",
+    "description": "Communicate with independently started, opted-in native Codex, Claude, Pi and OpenCode V2 sessions without pairwise invitations. List receive-ready sources and self_memberships (existing Group IDs/titles, your Actor ID/role, enabled access and Group state); use that read-only list after a context reset, then bootstrap the chosen explicit Group. Use action=send with source_ids and text to contact selected sessions, creating or reusing a Group. action=conversation only creates a Group and accepts source_ids and optional title; it does not send a message and rejects nonempty message fields or non-default delivery modes. action=list only lists; action=leave accepts group_id. Unused optional fields with null/empty values and the default mode=send are ignored on these non-send actions. Only available in the native-session MCP integration.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "list",
+            "send",
+            "conversation",
+            "leave"
+          ],
+          "default": "list"
+        },
+        "source_ids": {
+          "description": "For send, selected recipient sources; cannot be combined with group_id or to. For conversation, selected participants.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "group_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string",
+          "description": "Message body for action=send only. conversation creates a Group without sending."
+        },
+        "title": {
+          "type": "string",
+          "description": "Optional Group title for action=conversation only."
+        },
+        "to": {
+          "description": "Group recipients for send with an explicit group_id; cannot be used with source_ids.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "send",
+            "request_reply",
+            "mail"
+          ],
+          "default": "send",
+          "description": "Defaults to send for timely native collaboration. Choose mail explicitly for asynchronous Inbox work. Use mode in MCP calls; message_mode is an IPC field and is rejected here, including when both fields are present."
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "insight": {
+          "type": "string",
+          "maxLength": 1200,
+          "description": "A concise, visible, provisional judgment that helps the recipient assess this work beyond the message itself. Required for agent-facing messages in the MCP profile; optional for replies to the human user. Maximum 1200 characters. Include the conclusion, not private reasoning."
+        }
+      },
+      "required": []
     }
   }
 ]

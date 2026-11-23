@@ -3,19 +3,14 @@ import React from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 
-import type { AutomationRule, AutomationRuleAction } from "../../../types";
-import { BellIcon as AppBellIcon, SparklesIcon } from "../../Icons";
+import type { AutomationRule, AutomationRuleAction, AutomationRuleStatus } from "../../../types";
+import { SparklesIcon } from "../../Icons";
 import {
-  inputClass,
-  labelClass,
   settingsWorkspaceShellClass,
   settingsWorkspaceHeaderClass,
   settingsWorkspaceBodyClass,
 } from "./types";
 
-export const BellIcon = ({ className }: { className?: string }) => (
-  <AppBellIcon className={className} />
-);
 export const SparkIcon = ({ className }: { className?: string }) => (
   <SparklesIcon className={className} />
 );
@@ -67,53 +62,6 @@ export const Section = ({
     <div className={settingsWorkspaceBodyClass}>{children}</div>
   </section>
 );
-
-export const NumberInputRow = ({
-  label,
-  value,
-  onChange,
-  isDark,
-  min = 0,
-  helperText,
-  formatValue = true,
-  onAutoSave,
-}: {
-  label: string;
-  value: number;
-  onChange: (val: number) => void;
-  isDark?: boolean;
-  min?: number;
-  helperText?: React.ReactNode;
-  formatValue?: boolean;
-  onAutoSave?: () => void;
-}) => {
-  const { t } = useTranslation("settings");
-  return (
-    <div className="w-full">
-      <label className={labelClass(isDark)}>{label}</label>
-      <div className="relative">
-        <input
-          type="number"
-          min={min}
-          value={value}
-          onChange={(e) => onChange(Number(e.target.value))}
-          onBlur={() => onAutoSave?.()}
-          className={inputClass(isDark)}
-        />
-        {formatValue ? (
-          <div className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-mono pointer-events-none transition-opacity duration-200 text-[var(--color-text-muted)]">
-            {formatDuration(value, t)}
-          </div>
-        ) : null}
-      </div>
-      {helperText && (
-        <div className="mt-1.5 text-xs leading-snug text-[var(--color-text-muted)]">
-          {helperText}
-        </div>
-      )}
-    </div>
-  );
-};
 
 export const Chip = ({
   label,
@@ -198,6 +146,49 @@ export function getGroupStateCopy(
   };
 }
 
+// Minutes are enough for a schedule; seconds would only add noise.
+export const AUTOMATION_TIME_FORMAT: Intl.DateTimeFormatOptions = {
+  year: "numeric",
+  month: "numeric",
+  day: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  timeZoneName: "short",
+};
+
+export function formatAutomationTime(value: string | undefined): string {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, AUTOMATION_TIME_FORMAT);
+}
+
+// The daemon reports why a rule will not fire from its own Group state; the
+// Web's "idle" only means no member is working, so it is not used here.
+// A rule that is already due reports the time it was owed, at or before the
+// daemon's clock, until a scheduler tick carries it out.
+export function formatAutomationNext(
+  status: AutomationRuleStatus,
+  t: TFunction,
+  serverNow?: string,
+): string {
+  if (status.suppressed_reason === "group_paused") return t("layout:statusPaused");
+  if (status.suppressed_reason === "group_stopped") return t("layout:statusStopped");
+  if (status.suppressed_reason === "idle_standup") return t("ruleList.idleStandup");
+  if (!status.next_fire_at) return "—";
+  const time = formatAutomationTime(status.next_fire_at);
+  const next = Date.parse(status.next_fire_at);
+  const now = serverNow ? Date.parse(serverNow) : Number.NaN;
+  return next <= now ? t("ruleList.pending", { time }) : time;
+}
+
+// Only a notification that reached the ledger counts; older state has no such record.
+export function formatAutomationLastRun(status: AutomationRuleStatus, t: TFunction): string {
+  if (!status.last_run_at) return "";
+  const time = formatAutomationTime(status.last_run_at);
+  return status.last_run_kind === "manual" ? t("ruleList.lastRunManual", { time }) : time;
+}
+
 export function getActorOperationCopy(
   t: TFunction,
 ): Record<"start" | "stop" | "restart", { label: string; hint: string }> {
@@ -219,7 +210,9 @@ export function localTimeZone(): string {
   }
 }
 
-export type SchedulePreset = "daily" | "weekly" | "monthly";
+// "custom" is a saved expression the daily, weekly and monthly patterns cannot
+// show; the editor keeps it as written until another pattern is chosen.
+export type SchedulePreset = "daily" | "weekly" | "monthly" | "custom";
 
 export function getWeekdayOptions(t: TFunction): Array<{ value: number; label: string }> {
   return [
@@ -258,30 +251,39 @@ export function parseCronToPreset(cronExpr: string): {
   dayOfMonth: number;
 } {
   const raw = String(cronExpr || "").trim();
+  if (!raw) return { preset: "daily", hour: 9, minute: 0, weekday: 1, dayOfMonth: 1 };
+  const custom = { preset: "custom" as const, hour: 9, minute: 0, weekday: 1, dayOfMonth: 1 };
   const parts = raw.split(/\s+/).filter(Boolean);
-  if (parts.length !== 5) {
-    return { preset: "daily", hour: 9, minute: 0, weekday: 1, dayOfMonth: 1 };
-  }
+  if (parts.length !== 5) return custom;
   const [mStr, hStr, dom, mon, dow] = parts;
-  if (!/^\d+$/.test(mStr) || !/^\d+$/.test(hStr)) {
-    return { preset: "daily", hour: 9, minute: 0, weekday: 1, dayOfMonth: 1 };
-  }
-  const minute = clampInt(Number(mStr), 0, 59);
-  const hour = clampInt(Number(hStr), 0, 23);
+  if (!/^\d+$/.test(mStr) || !/^\d+$/.test(hStr)) return custom;
+  // An out-of-range value stays as written rather than being clamped into another plan.
+  const minute = Number(mStr);
+  const hour = Number(hStr);
+  if (minute > 59 || hour > 23) return custom;
 
   if (dom === "*" && mon === "*" && dow === "*") {
     return { preset: "daily", hour, minute, weekday: 1, dayOfMonth: 1 };
   }
-  if (dom === "*" && mon === "*" && /^\d+$/.test(dow)) {
+  if (dom === "*" && mon === "*" && /^\d+$/.test(dow) && Number(dow) <= 7) {
     const weekdayRaw = Number(dow);
-    const weekday = weekdayRaw === 7 ? 0 : clampInt(weekdayRaw, 0, 6);
+    const weekday = weekdayRaw === 7 ? 0 : weekdayRaw;
     return { preset: "weekly", hour, minute, weekday, dayOfMonth: 1 };
   }
-  if (/^\d+$/.test(dom) && mon === "*" && dow === "*") {
-    const dayOfMonth = clampInt(Number(dom), 1, 31);
+  if (/^\d+$/.test(dom) && mon === "*" && dow === "*" && Number(dom) >= 1 && Number(dom) <= 31) {
+    const dayOfMonth = Number(dom);
     return { preset: "monthly", hour, minute, weekday: 1, dayOfMonth };
   }
-  return { preset: "daily", hour, minute, weekday: 1, dayOfMonth: 1 };
+  return { ...custom, hour, minute };
+}
+
+// The daemon reads a cron rule without a saved time zone as UTC.
+export function cronTimeZone(trigger: unknown): string {
+  const zone =
+    trigger && typeof trigger === "object" && "timezone" in trigger
+      ? String((trigger as { timezone?: unknown }).timezone || "").trim()
+      : "";
+  return zone || "UTC";
 }
 
 export function buildCronFromPreset(args: {

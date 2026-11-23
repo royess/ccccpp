@@ -8,8 +8,30 @@ use crate::fs::{read_json, with_exclusive_lock, write_json};
 use cccc_contracts::utc_now;
 use serde_json::{Map, Value, json};
 
+pub mod revocations;
 mod state;
 pub use state::CapabilityState;
+
+/// Keep external MCP names in their own stable namespace across client ports.
+#[must_use]
+pub fn external_tool_name(capability_id: &str, real: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{capability_id}:{real}"));
+    let safe = real
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!(
+        "cccc_ext_{:02x}{:02x}{:02x}{:02x}_{safe}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
@@ -29,10 +51,32 @@ pub struct Capability {
     pub source: String,
     #[serde(default)]
     pub source_uri: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sync_state: String,
     #[serde(default = "default_qualification_status")]
     pub qualification_status: String,
     #[serde(default = "default_enable_supported")]
     pub enable_supported: bool,
+    #[serde(default, flatten)]
+    pub metadata: Map<String, Value>,
+    #[serde(skip)]
+    pub(crate) release_owned: bool,
+}
+
+impl Capability {
+    #[must_use]
+    pub const fn is_release_recommendation(&self) -> bool {
+        self.release_owned
+    }
+
+    /// Historical search snapshots can contain a title and capsule from a
+    /// different result. An explicit import is a separate action.
+    #[must_use]
+    pub fn is_unverified_remote_search(&self) -> bool {
+        self.source == "skillsmp_remote"
+            && self.tags.iter().any(|tag| tag == "remote_search")
+            && self.sync_state != "imported"
+    }
 }
 
 fn default_qualification_status() -> String {
@@ -41,6 +85,57 @@ fn default_qualification_status() -> String {
 
 const fn default_enable_supported() -> bool {
     true
+}
+
+/// Return a source URL safe to save or show alongside a skill.
+/// Local paths and non-URL identifiers retain their existing meaning.
+#[must_use]
+pub fn public_skill_source(value: &str) -> String {
+    let candidate = value.trim();
+    let looks_http = candidate
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http:"))
+        || candidate
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https:"));
+    let Ok(mut url) = url::Url::parse(candidate) else {
+        return if looks_http {
+            String::new()
+        } else {
+            value.to_owned()
+        };
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return value.to_owned();
+    }
+    if url.set_password(None).is_err() || url.set_username("").is_err() {
+        return String::new();
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    url.into()
+}
+
+/// Strip URL credentials from the public source fields of skill records.
+pub fn redact_skill_source_record(record: &mut Value) {
+    let kind = record.get("kind").and_then(Value::as_str).unwrap_or("");
+    let is_skill = kind == "skill"
+        || (kind.is_empty()
+            && record
+                .get("capability_id")
+                .or_else(|| record.get("id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("skill:")));
+    if !is_skill {
+        return;
+    }
+    if let Some(fields) = record.as_object_mut() {
+        for key in ["source_uri", "source_record_id"] {
+            if let Some(Value::String(value)) = fields.get_mut(key) {
+                *value = public_skill_source(value);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,20 +154,31 @@ impl CapabilityStore {
         Self { home }
     }
 
+    #[must_use]
+    pub fn builtin(id: &str) -> Option<Capability> {
+        capability_builtin::all()
+            .into_iter()
+            .find(|capability| capability.id == id)
+    }
+
     pub fn load(&self) -> io::Result<CapabilityState> {
         self.migrate_legacy()?;
         let path = self.path();
         if path.exists() {
             let raw = read_document_object(&path)?;
             let mut state = CapabilityState::default();
-            state.blocked.extend(
-                raw.get("global_blocked")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flatten()
-                    .filter(|(_, entry)| block_entry_is_active(entry))
-                    .map(|(id, _)| id.clone()),
-            );
+            match raw.get("global_blocked") {
+                Some(Value::Object(entries)) => state.blocked.extend(
+                    entries
+                        .iter()
+                        .filter(|(_, entry)| block_entry_is_active(entry))
+                        .map(|(id, _)| id.clone()),
+                ),
+                Some(Value::Array(entries)) => state
+                    .blocked
+                    .extend(entries.iter().filter_map(Value::as_str).map(str::to_owned)),
+                _ => {}
+            }
             Ok(state)
         } else {
             Ok(CapabilityState::default())
@@ -84,6 +190,7 @@ impl CapabilityStore {
             let blocked = object_field(raw, "global_blocked");
             blocked.clear();
             for id in &state.blocked {
+                revocations::invalidate(&self.home, id, "", "");
                 blocked.insert(
                     id.clone(),
                     json!({"reason":"","by":"user","blocked_at":utc_now(),"expires_at":""}),
@@ -96,13 +203,17 @@ impl CapabilityStore {
     pub fn catalog(&self) -> io::Result<Vec<Capability>> {
         self.migrate_legacy()?;
         let mut items = BTreeMap::new();
-        for capability in capability_builtin::all()
+        for mut capability in crate::capability_recommendations::catalog()?
             .into_iter()
             .chain(crate::capability_legacy::catalog(&self.home)?)
             .chain(self.load()?.custom.into_values())
+            // The versioned implementation owns built-in IDs; saved catalog
+            // copies can be older than the running binary.
+            .chain(capability_builtin::all())
             // Persisted catalogs must not re-advertise the retired built-in tool pack.
             .filter(|capability| capability.id != "pack:group_bridge")
         {
+            capability.source_uri = public_skill_source(&capability.source_uri);
             items.insert(capability.id.clone(), capability);
         }
         Ok(items.into_values().collect())
@@ -114,7 +225,7 @@ impl CapabilityStore {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
-        Ok(self
+        let mut found = self
             .catalog()?
             .into_iter()
             .filter(|item| {
@@ -122,16 +233,25 @@ impl CapabilityStore {
                     return true;
                 }
                 let haystack = format!(
-                    "{} {} {} {}",
+                    "{} {} {} {} {}",
                     item.id,
                     item.name,
                     item.description,
-                    item.tags.join(" ")
+                    item.tags.join(" "),
+                    searchable_metadata(&Value::Object(item.metadata.clone()))
                 )
                 .to_lowercase();
                 terms.iter().all(|term| haystack.contains(term))
             })
-            .collect())
+            .collect::<Vec<_>>();
+        let exact = query.trim().to_lowercase();
+        found.sort_by_key(|item| {
+            (
+                !(item.id.to_lowercase() == exact || item.name.to_lowercase() == exact),
+                !item.is_release_recommendation(),
+            )
+        });
+        Ok(found)
     }
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> io::Result<CapabilityState> {
@@ -147,7 +267,7 @@ impl CapabilityStore {
     }
 
     pub fn import(&self, capability: Capability) -> io::Result<CapabilityState> {
-        let record = json!({
+        let mut record = json!({
             "capability_id":capability.id,
             "kind":capability.kind,
             "name":capability.name,
@@ -157,14 +277,24 @@ impl CapabilityStore {
             "capsule_text":capability.capsule_text,
             "source_id":if capability.source.is_empty(){"manual_import"}else{&capability.source},
             "source_uri":capability.source_uri,
+            "sync_state":capability.sync_state,
             "qualification_status":capability.qualification_status,
             "enable_supported":capability.enable_supported
         });
+        record
+            .as_object_mut()
+            .expect("record")
+            .extend(capability.metadata);
         self.import_record(record)?;
         self.load()
     }
 
     pub fn import_record(&self, mut record: Value) -> io::Result<Capability> {
+        redact_skill_source_record(&mut record);
+        self.write_record(record)
+    }
+
+    fn write_record(&self, mut record: Value) -> io::Result<Capability> {
         let capability = self.validate_record(&record)?;
         let record = record
             .as_object_mut()
@@ -179,6 +309,11 @@ impl CapabilityStore {
         record
             .entry("enable_supported")
             .or_insert_with(|| json!(true));
+        self.store_record(&capability.id, Value::Object(record.clone()))?;
+        Ok(capability)
+    }
+
+    fn store_record(&self, id: &str, record: Value) -> io::Result<()> {
         let path = self.catalog_path();
         with_exclusive_lock(&path.with_extension("json.lock"), || {
             let mut raw = if path.exists() {
@@ -186,28 +321,54 @@ impl CapabilityStore {
             } else {
                 json!({"v":1,"created_at":utc_now(),"sources":{},"records":{}})
             };
+            if raw
+                .get("records")
+                .and_then(|items| items.get(id))
+                .is_some_and(|old| old != &record)
+            {
+                revocations::invalidate(&self.home, id, "", "");
+            }
             raw["updated_at"] = json!(utc_now());
-            object_field(&mut raw, "records")
-                .insert(capability.id.clone(), Value::Object(record.clone()));
+            object_field(&mut raw, "records").insert(id.to_owned(), record);
             write_json(&path, &raw)
-        })?;
-        Ok(capability)
+        })
     }
 
     pub fn validate_record(&self, record: &Value) -> io::Result<Capability> {
         let capability = capability_from_record(record)?;
         validate_id(&capability.id)?;
+        if Self::builtin(&capability.id).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "capability id is reserved for a built-in: {}",
+                    capability.id
+                ),
+            ));
+        }
+        if crate::capability_recommendations::record(&capability.id)?.is_some()
+            && self.catalog_record(&capability.id)?.is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "release recommendation is read-only; import a copy with a different id",
+            ));
+        }
         Ok(capability)
     }
 
     pub fn restore_record(&self, id: &str, record: Option<Value>) -> io::Result<()> {
         match record {
-            Some(mut record) => {
-                record
+            Some(record) => {
+                // A rollback restores the snapshot exactly, including legacy
+                // source metadata. Public catalog views redact it separately.
+                let mut validation = record.clone();
+                validation
                     .as_object_mut()
                     .ok_or_else(|| io::Error::other("capability record must be an object"))?
                     .insert("capability_id".into(), json!(id));
-                self.import_record(record).map(|_| ())
+                self.validate_record(&validation)?;
+                self.store_record(id, record)
             }
             None => self.remove_record(id).map(|_| ()),
         }
@@ -227,6 +388,7 @@ impl CapabilityStore {
             } else {
                 json!({})
             };
+            revocations::invalidate(&self.home, id, "", "");
             let removed = object_field(&mut raw, "records").remove(id).is_some();
             raw["updated_at"] = json!(utc_now());
             write_json(&path, &raw)?;
@@ -235,7 +397,10 @@ impl CapabilityStore {
     }
 
     pub fn remove_bindings_for_group(&self, id: &str, group_id: &str) -> io::Result<usize> {
-        self.mutate_state(|raw| Ok(remove_enabled_bindings(raw, id, Some(group_id))))
+        self.mutate_state(|raw| {
+            revocations::invalidate(&self.home, id, group_id, "");
+            Ok(remove_enabled_bindings(raw, id, Some(group_id)))
+        })
     }
 
     pub fn uninstall_for_group(&self, id: &str, group_id: &str) -> io::Result<(usize, bool, bool)> {
@@ -243,6 +408,7 @@ impl CapabilityStore {
             return Err(io::Error::other("group_id is required"));
         }
         self.mutate_state(|raw| {
+            revocations::invalidate(&self.home, id, group_id, "");
             let removed_bindings = remove_enabled_bindings(raw, id, Some(group_id));
             let groups = object_field(raw, "group_removed");
             let items = groups.entry(group_id).or_insert_with(|| json!([]));
@@ -257,7 +423,10 @@ impl CapabilityStore {
     }
 
     pub fn remove_all_bindings(&self, id: &str) -> io::Result<usize> {
-        self.mutate_state(|raw| Ok(remove_id(raw, id)))
+        self.mutate_state(|raw| {
+            revocations::invalidate(&self.home, id, "", "");
+            Ok(remove_id(raw, id))
+        })
     }
 
     pub fn has_bindings(&self, id: &str) -> io::Result<bool> {
@@ -298,6 +467,9 @@ impl CapabilityStore {
             return Err(io::Error::other("group_id is required"));
         }
         self.mutate_state(|raw| {
+            if removed {
+                revocations::invalidate(&self.home, id, group_id, "");
+            }
             let groups = object_field(raw, "group_removed");
             let items = groups.entry(group_id).or_insert_with(|| json!([]));
             let was_present = array_contains_id(items, id);
@@ -378,6 +550,12 @@ impl CapabilityStore {
     }
 
     pub fn delete_source(&self, source: &str) -> io::Result<Vec<String>> {
+        if source == "cccc_recommended" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "release recommendations cannot be deleted as a user source",
+            ));
+        }
         let removed = self
             .catalog()?
             .into_iter()
@@ -423,6 +601,51 @@ impl CapabilityStore {
                 .cloned(),
             _ => None,
         })
+    }
+
+    /// Resolve execution metadata without copying release content into user state.
+    pub fn resolved_record(&self, id: &str) -> io::Result<Option<Value>> {
+        self.catalog_record(id)?.map_or_else(
+            || crate::capability_recommendations::record(id),
+            |record| Ok(Some(record)),
+        )
+    }
+
+    /// Read a directory snapshot once when projecting many recommendations.
+    pub fn resolved_records(&self) -> io::Result<BTreeMap<String, Value>> {
+        self.migrate_legacy()?;
+        let mut records = crate::capability_recommendations::records()?
+            .into_iter()
+            .filter_map(|record| {
+                record
+                    .get("capability_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .map(|id| (id, record))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let path = self.catalog_path();
+        if path.exists() {
+            let raw: Value = read_json(&path)?;
+            match raw.get("records") {
+                Some(Value::Object(private)) => records.extend(
+                    private
+                        .iter()
+                        .map(|(id, value)| (id.clone(), value.clone())),
+                ),
+                Some(Value::Array(private)) => {
+                    records.extend(private.iter().filter_map(|record| {
+                        record
+                            .get("capability_id")
+                            .or_else(|| record.get("id"))
+                            .and_then(Value::as_str)
+                            .map(|id| (id.into(), record.clone()))
+                    }));
+                }
+                _ => {}
+            }
+        }
+        Ok(records)
     }
 
     pub fn set_enabled_for(
@@ -550,7 +773,23 @@ impl CapabilityStore {
             BindingMutation::SetEnabled(enabled) => (enabled, false),
             BindingMutation::EnableAndUnhide => (true, true),
         };
+        if !matches!(scope, "group" | "actor" | "session") {
+            return Err(io::Error::other("scope must be group, actor, or session"));
+        }
+        if scope != "group" && actor_id.is_empty() {
+            return Err(io::Error::other(
+                "actor_id is required for actor/session scope",
+            ));
+        }
         self.mutate_state(|raw| {
+            if !enabled {
+                revocations::invalidate(
+                    &self.home,
+                    id,
+                    group_id,
+                    if scope == "group" { "" } else { actor_id },
+                );
+            }
             if enabled {
                 let groups = object_field(raw, "group_removed");
                 if let Some(items) = groups.get_mut(group_id) {
@@ -667,6 +906,9 @@ impl CapabilityStore {
             })
         });
         let removed_bindings = self.mutate_state(|raw| {
+            if blocked {
+                revocations::invalidate(&self.home, id, group_id, "");
+            }
             {
                 let target = if group_id.is_empty() {
                     object_field(raw, "global_blocked")
@@ -701,6 +943,9 @@ impl CapabilityStore {
             return Err(io::Error::other("group_id and actor_id are required"));
         }
         self.mutate_state(|raw| {
+            if hidden {
+                revocations::invalidate(&self.home, id, group_id, actor_id);
+            }
             let groups = object_field(raw, "actor_hidden");
             let group = ensure_object(groups.entry(group_id).or_insert_with(|| json!({})));
             let items = group.entry(actor_id).or_insert_with(|| json!([]));
@@ -1011,7 +1256,7 @@ fn contains_id(value: &Value, id: &str) -> bool {
     }
 }
 
-fn capability_from_record(record: &Value) -> io::Result<Capability> {
+pub(crate) fn capability_from_record(record: &Value) -> io::Result<Capability> {
     let id = record
         .get("capability_id")
         .or_else(|| record.get("id"))
@@ -1064,6 +1309,11 @@ fn capability_from_record(record: &Value) -> io::Result<Capability> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned(),
+        sync_state: record
+            .get("sync_state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
         qualification_status: record
             .get("qualification_status")
             .and_then(Value::as_str)
@@ -1073,7 +1323,50 @@ fn capability_from_record(record: &Value) -> io::Result<Capability> {
             .get("enable_supported")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        metadata: record_metadata(record),
+        release_owned: false,
     })
+}
+
+pub(crate) fn record_metadata(record: &Value) -> Map<String, Value> {
+    [
+        "use_when",
+        "avoid_when",
+        "gotchas",
+        "source_record_version",
+        "license",
+        "recommendation",
+        "support",
+        "verification",
+        "requirements_summary",
+        "l10n",
+    ]
+    .into_iter()
+    .filter_map(|key| record.get(key).map(|value| (key.into(), value.clone())))
+    .collect()
+}
+
+fn searchable_metadata(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(searchable_metadata)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Value::Object(items) => items
+            .iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "verification" | "source_record_version" | "license"
+                )
+            })
+            .map(|(_, value)| searchable_metadata(value))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
 }
 
 fn validate_id(id: &str) -> io::Result<()> {
@@ -1102,6 +1395,77 @@ mod tests {
         let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
         home.initialize().expect("initialize");
         (temp, CapabilityStore::new(home))
+    }
+
+    #[test]
+    fn skill_source_urls_remove_credentials_query_and_fragment_without_touching_mcp() {
+        let original = "https://fixture:secret@example.test/skill.md?token=fixture_query#private";
+        let expected = "https://example.test/skill.md";
+        assert_eq!(public_skill_source(original), expected);
+        assert_eq!(public_skill_source("/tmp/skill.md"), "/tmp/skill.md");
+        assert_eq!(public_skill_source("https://fixture:secret@"), "");
+        assert_eq!(public_skill_source("  https://fixture:secret@  "), "");
+        assert_eq!(
+            public_skill_source(
+                r"http:\\fixture:secret@example.test\skill.md?token=fixture_query#private"
+            ),
+            "http://example.test/skill.md"
+        );
+
+        let (_temp, store) = store();
+        let skill = json!({"capability_id":"skill:test:url","kind":"skill","name":"fixture",
+            "source_uri":original,"source_record_id":original,"capsule_text":"Fixture"});
+        store.import_record(skill).expect("import skill");
+        let stored = store
+            .catalog_record("skill:test:url")
+            .expect("catalog")
+            .expect("skill");
+        assert_eq!(stored["source_uri"], expected);
+        assert_eq!(stored["source_record_id"], expected);
+
+        let mcp = json!({"capability_id":"mcp:test:url","kind":"mcp_toolpack","name":"fixture",
+            "source_uri":original,"source_record_id":original});
+        store.import_record(mcp).expect("import MCP");
+        let stored = store
+            .catalog_record("mcp:test:url")
+            .expect("catalog")
+            .expect("MCP");
+        assert_eq!(stored["source_uri"], original);
+        assert_eq!(stored["source_record_id"], original);
+    }
+
+    #[test]
+    fn rollback_restores_old_skill_record_while_catalog_projection_hides_its_url_secrets() {
+        let (_temp, store) = store();
+        let original = "https://fixture:secret@example.test/skill.md?token=fixture_query#private";
+        let legacy = json!({"id":"skill:test:old-url","kind":"skill","name":"fixture",
+            "source_uri":original,"source_record_id":original,"capsule_text":"Old text"});
+        crate::fs::write_json(
+            &store.catalog_path(),
+            &json!({"records":{"skill:test:old-url":legacy}}),
+        )
+        .expect("old record");
+        let snapshot = store
+            .catalog_record("skill:test:old-url")
+            .expect("read")
+            .expect("record");
+        store.import_record(json!({"capability_id":"skill:test:old-url","kind":"skill",
+            "name":"fixture","source_uri":"https://example.test/skill.md","capsule_text":"New text"}))
+            .expect("replace");
+        store
+            .restore_record("skill:test:old-url", Some(snapshot.clone()))
+            .expect("restore");
+        assert_eq!(
+            store.catalog_record("skill:test:old-url").expect("read"),
+            Some(snapshot)
+        );
+        let projected = store
+            .catalog()
+            .expect("catalog")
+            .into_iter()
+            .find(|capability| capability.id == "skill:test:old-url")
+            .expect("projected skill");
+        assert_eq!(projected.source_uri, "https://example.test/skill.md");
     }
 
     #[test]
@@ -1135,6 +1499,56 @@ mod tests {
         assert!(catalog.iter().any(|entry| entry.id == "skill:test"));
         assert!(!catalog.iter().any(|entry| entry.id == "pack:group_bridge"));
         assert!(store.set_enabled("pack:group_bridge", true).is_err());
+    }
+
+    #[test]
+    fn builtin_ids_are_reserved_and_override_older_persisted_records() {
+        let (_temp, store) = store();
+        let builtins = capability_builtin::all();
+        let records = builtins
+            .iter()
+            .map(|capability| {
+                (
+                    capability.id.clone(),
+                    json!({
+                        "capability_id": capability.id,
+                        "kind": capability.kind,
+                        "name":"old name",
+                        "capsule_text":"old rules",
+                        "tool_names":["cccc_memory"],
+                        "source_id":"cccc_builtin"
+                    }),
+                )
+            })
+            .collect::<Map<String, Value>>();
+        crate::fs::write_json(&store.catalog_path(), &json!({"records":records}))
+            .expect("old catalog");
+        let saved = std::fs::read(store.catalog_path()).expect("catalog bytes");
+        for expected in &builtins {
+            assert_eq!(
+                &store.require(&expected.id).expect("resolved builtin"),
+                expected
+            );
+            let error = store
+                .import_record(json!({
+                    "capability_id":expected.id,"kind":"skill","name":"replacement"
+                }))
+                .expect_err("built-in id is reserved");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(
+            std::fs::read(store.catalog_path()).expect("catalog bytes"),
+            saved
+        );
+        store.import_record(json!({"capability_id":"skill:test:custom","kind":"skill", "name":"custom", "capsule_text":"custom rules"})).expect("custom import");
+        store.import_record(json!({"capability_id":"skill:test:custom","kind":"skill", "name":"custom", "capsule_text":"updated rules"})).expect("custom update");
+        assert_eq!(
+            store
+                .require("skill:test:custom")
+                .expect("custom")
+                .capsule_text,
+            "updated rules"
+        );
     }
 
     #[test]

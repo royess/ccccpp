@@ -1,6 +1,7 @@
 use cccc_core::HomeLayout;
 use std::future::Future;
 use std::time::Duration;
+use tokio::sync::watch;
 
 // Stopping every runtime takes as long as the runtimes take, and measured
 // against a real home that is many seconds. A deadline shorter than an ordinary
@@ -14,26 +15,276 @@ const FORCE_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 const FORCE_STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const INTERRUPTED_EXIT_CODE: i32 = 130;
 
+#[derive(Clone, Copy, Debug, Default)]
+struct StopState {
+    requested: bool,
+    interrupts: u8,
+    /// Until the Web first listens, losing the terminal interface fails the
+    /// launch instead of stopping it.
+    loss_fails: bool,
+    /// The stop is that failure: the interface was lost before the Web
+    /// listened and before any stop was asked for.
+    failed: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct Controller {
+    state: watch::Sender<StopState>,
+}
+
+/// Tasks belong to the foreground launch, including its startup/error paths.
+/// Dropping the launch must not leave a signal listener or force-exit timer.
+/// The terminal interface reports stop keys and its own loss to a clone of
+/// `controller` directly from its thread, so nothing queues between them.
+pub(crate) struct TerminalControl {
+    pub controller: Controller,
+    signals: tokio::task::JoinHandle<()>,
+    watchdog: tokio::task::JoinHandle<()>,
+}
+
+impl TerminalControl {
+    /// `starts_daemon`: this launch starts the daemon, so its agents are this launch's to stop.
+    pub(crate) fn new(starts_daemon: bool) -> std::io::Result<Self> {
+        let controller = Controller::new();
+        let signals = watch_signals(controller.clone())?;
+        let watchdog = tokio::spawn(watch_terminal_shutdown(controller.clone(), starts_daemon));
+        Ok(Self {
+            controller,
+            signals,
+            watchdog,
+        })
+    }
+    /// An update is replacing this process: neither a signal nor a lost
+    /// terminal may force an exit or stop agents halfway through it.
+    pub(crate) fn stand_down(&mut self) {
+        self.signals.abort();
+        self.watchdog.abort();
+    }
+}
+
+impl Drop for TerminalControl {
+    fn drop(&mut self) {
+        self.signals.abort();
+        self.watchdog.abort();
+    }
+}
+
+impl Controller {
+    pub(crate) fn new() -> Self {
+        let (state, _) = watch::channel(StopState::default());
+        Self { state }
+    }
+
+    pub(crate) fn request(&self) {
+        self.state.send_if_modified(|state| {
+            let changed = !state.requested;
+            state.requested = true;
+            changed
+        });
+    }
+
+    pub(crate) fn interrupt(&self) {
+        self.state.send_modify(|state| {
+            state.requested = true;
+            state.interrupts = state.interrupts.saturating_add(1);
+        });
+    }
+
+    /// The terminal interface is gone, and with it the only way to quit, so
+    /// the host stops. A stop already asked for stays as it was; otherwise
+    /// this stop fails the launch while [`Self::fail_on_loss_until_listening`]
+    /// holds.
+    pub(crate) fn lose(&self) {
+        self.state.send_if_modified(|state| {
+            if state.requested {
+                return false;
+            }
+            state.requested = true;
+            state.failed = state.loss_fails;
+            true
+        });
+    }
+
+    /// For a launch an update relayed to while keeping agents: until its Web
+    /// first listens, a lost terminal interface means the launch failed, and
+    /// the host keeps the agents, as for any other failure before then.
+    pub(crate) fn fail_on_loss_until_listening(&self) {
+        self.state.send_modify(|state| state.loss_fails = true);
+    }
+
+    /// The Web listens, so from now on a lost interface stops the host as
+    /// usual. False when the interface was lost first: the launch is failing,
+    /// and its Web must neither show nor confirm anything.
+    pub(crate) fn web_listening(&self) -> bool {
+        let mut failed = false;
+        self.state.send_if_modified(|state| {
+            failed = state.failed;
+            std::mem::take(&mut state.loss_fails)
+        });
+        !failed
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        self.state.borrow().requested
+    }
+
+    /// The stop is a failed launch, not a request: see [`Self::lose`].
+    pub(crate) fn failed(&self) -> bool {
+        self.state.borrow().failed
+    }
+
+    pub(crate) async fn requested(&self) {
+        let _ = self
+            .state
+            .subscribe()
+            .wait_for(|state| state.requested)
+            .await;
+    }
+
+    async fn forced(&self) {
+        let _ = self
+            .state
+            .subscribe()
+            .wait_for(|state| state.interrupts >= 2)
+            .await;
+    }
+}
+
+/// Terminal key events and system signals enter the same foreground lifetime.
+pub(crate) fn watch_signals(
+    controller: Controller,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        Ok(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = interrupt.recv() => if event.is_some() { controller.interrupt(); } else { return; },
+                    event = terminate.recv() => if event.is_some() { controller.request(); } else { return; },
+                    event = hangup.recv() => if event.is_some() { controller.request(); } else { return; },
+                }
+            }
+        }))
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+        let mut interrupt = ctrl_c()?;
+        let mut r#break = ctrl_break()?;
+        let mut close = ctrl_close()?;
+        let mut logoff = ctrl_logoff()?;
+        let mut shutdown = ctrl_shutdown()?;
+        Ok(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = interrupt.recv() => if event.is_some() { controller.interrupt(); } else { return; },
+                    event = r#break.recv() => if event.is_some() { controller.request(); } else { return; },
+                    event = close.recv() => if event.is_some() { controller.request(); } else { return; },
+                    event = logoff.recv() => if event.is_some() { controller.request(); } else { return; },
+                    event = shutdown.recv() => if event.is_some() { controller.request(); } else { return; },
+                }
+            }
+        }))
+    }
+    #[cfg(not(any(unix, windows)))]
+    Ok(tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            controller.interrupt();
+        }
+    }))
+}
+
+pub(crate) async fn watch_terminal_shutdown(controller: Controller, starts_daemon: bool) {
+    controller.requested().await;
+    let reason =
+        force_exit_reason(controller.forced(), tokio::time::sleep(FORCE_EXIT_TIMEOUT)).await;
+    cccc_runtime::diagnostic(format_args!(
+        "forcing CCCC to exit: {reason:?}; graceful cleanup was not confirmed"
+    ));
+    let _ = tokio::time::timeout(
+        FORCE_STOP_REQUEST_TIMEOUT,
+        cccc_daemon::request_managed_session_stop(),
+    )
+    .await;
+    restore_terminal_before_exit(starts_daemon);
+    force_exit();
+}
+
+fn restore_terminal_before_exit(starts_daemon: bool) {
+    let (done, completed) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::Builder::new()
+        .name("cccc-terminal-restore".into())
+        .spawn(move || {
+            #[cfg(windows)]
+            crate::console_encoding::restore_original();
+            let _ = crate::tui::restore_terminal();
+            eprintln!("CCCC is forcing exit; graceful service cleanup was not confirmed.");
+            if starts_daemon && cccc_daemon::session_owner::platform_supported() {
+                eprintln!("{FORCED_EXIT_AGENT_HINT}");
+            }
+            let _ = done.send(());
+        });
+    let _ = completed.recv_timeout(Duration::from_millis(300));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForceExitReason {
     SecondInterrupt,
     Deadline,
 }
 
+#[cfg(unix)]
+type Interrupts = tokio::signal::unix::Signal;
+#[cfg(windows)]
+type Interrupts = tokio::signal::windows::CtrlC;
+
+/// Listens for interrupts from now on and watches them on a task: the first
+/// asks the host to stop, and a second, or the deadline, forces the exit.
+/// `tokio::signal::ctrl_c()` registers only once it is first polled, so a task
+/// awaiting it would leave an interrupt that arrives before the task first
+/// runs to end the process.
+pub(crate) fn watch_for_interrupt(
+    controller: Controller,
+    home: Option<HomeLayout>,
+    #[cfg(windows)] detached_daemon: crate::detached_daemon_owner::SharedOwnedDetachedDaemon,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    let interrupts = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    #[cfg(windows)]
+    let interrupts = tokio::signal::windows::ctrl_c()?;
+    #[cfg(unix)]
+    let watcher = stop_on_interrupt(controller, interrupts, home);
+    #[cfg(windows)]
+    let watcher = stop_on_interrupt(controller, interrupts, home, detached_daemon);
+    Ok(tokio::spawn(watcher))
+}
+
 /// Bound provider stop requests, then terminate owned process trees without
 /// entering normal cleanup or acquiring managed-session stop locks.
-pub(crate) async fn watch_for_interrupt(
-    _home: Option<HomeLayout>,
+async fn stop_on_interrupt(
+    controller: Controller,
+    mut interrupts: Interrupts,
+    home: Option<HomeLayout>,
     #[cfg(windows)] _detached_daemon: crate::detached_daemon_owner::SharedOwnedDetachedDaemon,
 ) {
-    if tokio::signal::ctrl_c().await.is_err() {
+    if interrupts.recv().await.is_none() {
         return;
     }
     eprintln!("Stopping CCCC... (press Ctrl-C again to force exit)");
+    // The Web library's own interrupt listener registers only once it serves,
+    // so an interrupt during its startup reaches this watcher alone.
+    controller.request();
 
     let reason = force_exit_reason(
         async {
-            let _ = tokio::signal::ctrl_c().await;
+            let _ = interrupts.recv().await;
         },
         tokio::time::sleep(FORCE_EXIT_TIMEOUT),
     )
@@ -54,12 +305,29 @@ pub(crate) async fn watch_for_interrupt(
         cccc_daemon::request_managed_session_stop(),
     )
     .await;
+    // Only a launch that owns the daemon owns its agents; an external daemon keeps its own.
+    if home.is_some() && cccc_daemon::session_owner::platform_supported() {
+        eprintln!("{FORCED_EXIT_AGENT_HINT}");
+    }
+    if let Some(hint) = home
+        .as_ref()
+        .and_then(crate::update_host::forced_exit_update_hint)
+    {
+        eprintln!("{hint}");
+    }
     force_exit();
 }
 
+/// A forced exit does not wait for agents to be confirmed stopped, and agents held by a
+/// session owner can outlive this process. Give the stop command when this host uses an owner.
+const FORCED_EXIT_AGENT_HINT: &str =
+    "Some agents may still be running; run `cccc daemon stop` to stop them.";
+
 fn force_exit() -> ! {
     if let Err(error) = cccc_runtime::force_terminate_owned() {
-        eprintln!("could not terminate every owned process tree: {error}");
+        cccc_runtime::diagnostic(format_args!(
+            "could not terminate every owned process tree: {error}"
+        ));
     }
     std::process::exit(INTERRUPTED_EXIT_CODE);
 }
@@ -77,8 +345,88 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ForceExitReason, force_exit_reason};
+    use super::{Controller, ForceExitReason, force_exit_reason};
     use std::future::{pending, ready};
+
+    #[tokio::test]
+    async fn repeated_regular_requests_never_force_exit() {
+        let controller = Controller::new();
+        controller.request();
+        controller.request();
+        controller.requested().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), controller.forced())
+                .await
+                .is_err()
+        );
+        controller.interrupt();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), controller.forced())
+                .await
+                .is_err()
+        );
+        controller.interrupt();
+        controller.forced().await;
+    }
+
+    #[tokio::test]
+    async fn first_interrupt_requests_shutdown_second_interrupt_forces_it() {
+        let controller = Controller::new();
+        assert!(!controller.is_requested());
+        controller.interrupt();
+        controller.requested().await;
+        assert_eq!(controller.state.borrow().interrupts, 1);
+        controller.interrupt();
+        controller.forced().await;
+    }
+
+    #[test]
+    fn a_lost_interface_stops_the_host_like_quitting() {
+        let controller = Controller::new();
+        controller.lose();
+        assert!(controller.is_requested());
+        assert!(!controller.failed());
+        assert!(controller.web_listening());
+    }
+
+    #[test]
+    fn a_lost_interface_fails_a_keeping_relay_whose_web_has_not_listened() {
+        let controller = Controller::new();
+        controller.fail_on_loss_until_listening();
+        controller.lose();
+        assert!(controller.is_requested());
+        assert!(controller.failed());
+        // A Web that opens afterwards belongs to the failed launch.
+        assert!(!controller.web_listening());
+        // The first reason to stop decides how.
+        controller.request();
+        controller.interrupt();
+        assert!(controller.failed());
+    }
+
+    #[test]
+    fn once_the_web_listens_a_lost_interface_stops_the_host_as_usual() {
+        let controller = Controller::new();
+        controller.fail_on_loss_until_listening();
+        assert!(controller.web_listening());
+        controller.lose();
+        assert!(controller.is_requested());
+        assert!(!controller.failed());
+    }
+
+    #[test]
+    fn a_stop_asked_for_before_the_interface_is_lost_stays_ordinary() {
+        let quit = Controller::new();
+        quit.fail_on_loss_until_listening();
+        quit.request();
+        quit.lose();
+        assert!(!quit.failed());
+        let interrupted = Controller::new();
+        interrupted.fail_on_loss_until_listening();
+        interrupted.interrupt();
+        interrupted.lose();
+        assert!(!interrupted.failed());
+    }
 
     #[tokio::test]
     async fn second_interrupt_forces_exit_before_the_deadline() {

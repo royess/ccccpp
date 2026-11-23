@@ -2,15 +2,16 @@ import {
   MessageSelection,
   MessageSelectionCheckbox,
 } from "../../features/messageRelay/MessageSelection";
-import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { Mail } from "lucide-react";
 import { Actor, LedgerEvent } from "../../types";
 import { formatFullTime, formatTime } from "../../utils/time";
 import { LazyMarkdownRenderer } from "../LazyMarkdownRenderer";
+import { useActorDisplayNameMap } from "../../hooks/useActorDisplayName";
 import { useModalA11y } from "../../hooks/useModalA11y";
+import { useChatObscuringViewOnPhone } from "../../hooks/useChatObscuringView";
 import { ModalFrame } from "./ModalFrame";
 import { getMessageInsight } from "../../utils/messagePerspective";
+import { InboxEmptyIcon } from "../Icons";
 
 function mailText(ev: LedgerEvent): string {
   const data = ev.data && typeof ev.data === "object" ? (ev.data as Record<string, unknown>) : {};
@@ -42,27 +43,24 @@ export function InboxModal({
   onClose,
   onMarkAllRead,
 }: InboxModalProps) {
-  const { t } = useTranslation("modals");
+  const { t, i18n } = useTranslation("modals");
+  useChatObscuringViewOnPhone(isOpen);
   const { modalRef } = useModalA11y(isOpen, onClose);
 
-  // Helper to get display name for actor
-  const getDisplayName = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const actor of actors) {
-      const id = String(actor.id || "");
-      if (id) map.set(id, actor.title || id);
-    }
-    return (id: string) => {
-      if (!id || id === "user") return id;
-      return map.get(id) || id;
-    };
-  }, [actors]);
+  // Display name for an actor id; "user", empty and unknown ids show as given.
+  const displayNameMap = useActorDisplayNameMap(actors);
+  const getDisplayName = (id: string) => {
+    if (!id || id === "user") return id;
+    return displayNameMap.get(id) || id;
+  };
 
   if (!isOpen) return null;
 
   const headerActions = (
     <button
       className="rounded-xl px-4 py-2 text-sm font-medium disabled:opacity-50 transition-colors min-h-[40px] glass-btn text-[var(--color-text-secondary)]"
+      data-lcd-key
+      data-inbox-action
       onClick={onMarkAllRead}
       disabled={readOnly || !messages.length || busy.startsWith("inbox")}
     >
@@ -73,8 +71,8 @@ export function InboxModal({
   const titleContent = (
     <div className="min-w-0 pr-2">
       <div
-        id="inbox-title"
         className="text-lg font-semibold truncate text-[var(--color-text-primary)]"
+        data-inbox-heading
       >
         {t("inbox.title", { actorId })}
       </div>
@@ -92,12 +90,13 @@ export function InboxModal({
       titleId="inbox-title"
       title={titleContent}
       closeAriaLabel={t("common:close")}
+      headerClassName="inbox-modal-header"
       panelClassName="w-full h-full sm:h-auto sm:max-h-[calc(100dvh-8rem)] sm:max-w-2xl sm:mt-16"
       headerActions={headerActions}
       modalRef={modalRef}
     >
       <MessageSelection
-        key={`${groupId}:${actorId}`}
+        key={groupId + ":" + actorId}
         groupId={groupId}
         readOnly={readOnly}
         messages={messages}
@@ -108,16 +107,19 @@ export function InboxModal({
             const insight = getMessageInsight(ev.data);
             return (
               <div key={String(ev.id || idx)} className="rounded-xl px-4 py-3 glass-panel">
-                <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center justify-between gap-3">
                   <MessageSelectionCheckbox event={ev} />
-                  <div className="text-xs font-semibold truncate text-[var(--color-text-primary)]">
+                  <div
+                    className="text-xs font-semibold truncate text-[var(--color-text-primary)]"
+                    data-inbox-sender
+                  >
                     {getDisplayName(ev.by || "") || "—"}
                   </div>
                   <div
                     className="text-xs shrink-0 text-[var(--color-text-muted)]"
                     title={formatFullTime(ev.ts)}
                   >
-                    {formatTime(ev.ts)}
+                    {formatTime(ev.ts, i18n?.language)}
                   </div>
                 </div>
                 <div className="mt-2 text-sm break-words">
@@ -145,7 +147,7 @@ export function InboxModal({
           {!messages.length && (
             <div className="flex flex-col items-center justify-center py-12 text-center">
               <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl border border-[var(--glass-border-subtle)] bg-[var(--glass-tab-bg)] text-[var(--color-text-muted)]">
-                <Mail size={22} aria-hidden="true" />
+                <InboxEmptyIcon size={22} aria-hidden="true" />
               </div>
               <div className="text-sm text-[var(--color-text-muted)]">{t("inbox.noUnread")}</div>
             </div>

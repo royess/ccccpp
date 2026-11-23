@@ -1,3 +1,7 @@
+// The rollback is provoked with Unix permission bits; a Windows directory's
+// read-only attribute does not stop files being created in it.
+#![cfg(unix)]
+
 mod auth_support;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -82,3 +86,5 @@ async fn wait_for_address(home: &HomeLayout) {
     }
     panic!("daemon address was not created");
 }
+
+cccc_daemon::session_owner_test_entry!();

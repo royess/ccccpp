@@ -44,15 +44,15 @@ pub(super) fn apply(root: &Path, patch: &str) -> Result<Vec<String>, String> {
         };
         let mut destination = source.clone();
         let mut names = vec![raw.to_owned()];
-        if kind == "update" {
-            if let Some(path) = lines[index].strip_prefix("*** Move to: ") {
-                destination = resolve(root, path, true)?;
-                if destination == source || destination.exists() {
-                    return Err(format!("move destination already exists: {path}"));
-                }
-                names.push(path.to_owned());
-                index += 1;
+        if kind == "update"
+            && let Some(path) = lines[index].strip_prefix("*** Move to: ")
+        {
+            destination = resolve(root, path, true)?;
+            if destination == source || destination.exists() {
+                return Err(format!("move destination already exists: {path}"));
             }
+            names.push(path.to_owned());
+            index += 1;
         }
         let start = index;
         while index < lines.len() - 1 && !is_file_header(lines[index]) {
@@ -167,7 +167,14 @@ fn resolve(root: &Path, raw: &str, create: bool) -> Result<PathBuf, String> {
     if ancestor != path && !checked.is_dir() {
         return Err("patch parent is not a directory".into());
     }
-    Ok(checked.join(path.strip_prefix(ancestor).map_err(|e| e.to_string())?))
+    let suffix = path.strip_prefix(ancestor).map_err(|e| e.to_string())?;
+    if suffix.as_os_str().is_empty() {
+        // Joining an empty suffix adds a separator, hiding an existing file
+        // from `exists()`.
+        Ok(checked)
+    } else {
+        Ok(checked.join(suffix))
+    }
 }
 
 fn check_current(change: &Change) -> Result<(), String> {

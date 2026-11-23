@@ -4,6 +4,7 @@
 import { useId, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { classNames } from "../../../utils/classNames";
+import { Switch } from "../../ui/switch";
 import { formatDuration } from "./automationUtils";
 import { primaryButtonClass } from "./types";
 
@@ -25,7 +26,12 @@ export function SettingsPage({
       data-settings-page
     >
       <header>
-        <h2 className="text-xl font-semibold text-[var(--color-text-primary)]">{title}</h2>
+        <h2
+          className="text-xl font-semibold text-[var(--color-text-primary)]"
+          data-settings-page-title
+        >
+          {title}
+        </h2>
         {description ? (
           <p className="mt-1.5 text-[13px] leading-6 text-[var(--color-text-secondary)]">
             {description}
@@ -136,7 +142,7 @@ export function SettingsRow({
           ? ""
           : "@min-[600px]/settings:grid-cols-[minmax(0,220px)_minmax(0,1fr)] @min-[600px]/settings:items-start @min-[600px]/settings:gap-6 @min-[900px]/settings:grid-cols-[280px_minmax(0,1fr)]",
       )}
-      data-settings-row
+      data-settings-row={stacked ? "stacked" : "split"}
     >
       <div className="min-w-0 @min-[600px]/settings:pt-1.5">
         {htmlFor ? (
@@ -176,22 +182,13 @@ export function SettingsSwitch({
   disabled?: boolean;
 }) {
   return (
-    <button
-      type="button"
-      role="switch"
+    <Switch
+      checked={checked}
       aria-checked={checked}
       aria-labelledby={labelledBy}
       disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={classNames(
-        "inline-flex h-6 w-10 shrink-0 items-center rounded-full p-0.5 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-text-secondary)] disabled:opacity-50",
-        checked
-          ? "justify-end bg-[var(--color-text-primary)]"
-          : "justify-start bg-[var(--glass-border-subtle)]",
-      )}
-    >
-      <span className="size-5 rounded-full bg-white shadow-sm" />
-    </button>
+      onChange={(event) => onChange(event.currentTarget.checked)}
+    />
   );
 }
 

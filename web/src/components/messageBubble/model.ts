@@ -6,6 +6,7 @@ export function buildToLabel({
   dstTo,
   recipients,
   displayNameMap,
+  userLabel,
 }: {
   hasDestination: boolean;
   dstGroupId: string;
@@ -13,14 +14,21 @@ export function buildToLabel({
   groupLabelById: Record<string, string>;
   recipients: string[] | undefined;
   displayNameMap: Map<string, string>;
+  /** The Group's user, named as the message head names them as an author. */
+  userLabel: string;
 }): string {
   if (hasDestination) {
     if (!dstTo || dstTo.length === 0) return "";
     return dstTo.map((recipient) => getRecipientDisplayName(recipient, displayNameMap)).join(", ");
   }
   if (!recipients || recipients.length === 0) return "@foreman";
+  // `@user` names the user too, as elsewhere in the Web; the daemon itself stores `user`.
   return recipients
-    .map((recipient) => getRecipientDisplayName(recipient, displayNameMap))
+    .map((recipient) =>
+      recipient === "user" || recipient === "@user"
+        ? userLabel
+        : getRecipientDisplayName(recipient, displayNameMap),
+    )
     .join(", ");
 }
 
@@ -75,15 +83,18 @@ export function computeObligationSummary({
 }: {
   hideDirectUserObligationSummary: boolean;
   obligationStatus: LedgerEvent["_obligation_status"];
-}): { done: number; total: number } | null {
+}): { replied: number; cancelled: number; total: number } | null {
   if (hideDirectUserObligationSummary) return null;
   if (!obligationStatus || typeof obligationStatus !== "object") return null;
   const ids = Object.keys(obligationStatus).filter((id) => obligationStatus[id]?.reply_requested);
   if (ids.length === 0) return null;
-  const done = ids.reduce(
-    (count, id) =>
-      count + (obligationStatus[id]?.replied || obligationStatus[id]?.cancelled ? 1 : 0),
-    0,
-  );
-  return { done, total: ids.length };
+  let replied = 0;
+  let cancelled = 0;
+  for (const id of ids) {
+    // The daemon never reports both; if stale data does, count the recipient
+    // once and let cancellation win, as the recipients dialog does.
+    if (obligationStatus[id]?.cancelled) cancelled += 1;
+    else if (obligationStatus[id]?.replied) replied += 1;
+  }
+  return { replied, cancelled, total: ids.length };
 }

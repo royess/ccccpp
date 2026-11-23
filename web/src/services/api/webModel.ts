@@ -22,8 +22,8 @@ export type WebModelConnector = {
   last_wait_status?: string;
   last_turn_id?: string;
   last_error?: string;
-  /** Shared connector diagnostics: event/tool outcomes and fixed reason codes only. */
-  events_log?: DotsEventCall[];
+  /** Bounded outcomes, fixed reasons and optional salted host identity fingerprints. */
+  events_log?: WebModelConnectorCall[];
   /** The Actor this connector's Dot is bound to, if any. */
   dots_actor?: { group_id: string; actor_id: string } | null;
   connector_url?: string;
@@ -33,8 +33,10 @@ export type WebModelConnector = {
 };
 
 export type WebModelConnectorCreateResult = {
+  outcome: "created" | "existing" | "rotated";
   connector: WebModelConnector;
-  secret: string;
+  /** Present only when this call created or rotated the credential. */
+  secret?: string;
   replaced_connector_ids?: string[];
 };
 
@@ -51,12 +53,13 @@ export type DotsPhase =
   | "failed"
   | "stopped";
 
-export type DotsEventCall = {
+export type WebModelConnectorCall = {
   at: string;
   method: string;
   tool_name?: string;
   ok: boolean;
   reason: string | null;
+  host_identity?: { session: string; subject: string | null; organization: string | null };
 };
 
 export type DotsActorState = {
@@ -69,6 +72,7 @@ export type DotsActorState = {
   phase: DotsPhase;
   pending_count: number;
   active_turn_id?: string | null;
+  active_turn_elapsed_seconds?: number | null;
   active_event_ids?: string[];
   last_execution?: {
     turn_id: string;
@@ -147,6 +151,7 @@ export type WebModelBrowserSession = {
   ready?: boolean;
   login_required?: boolean;
   verification_required?: boolean;
+  checked_at?: string | null;
   state?: string;
   pid?: number;
   cdp_port?: number;
@@ -281,6 +286,7 @@ export type GrokActorState = {
   pending_count: number;
   bot_url?: string | null;
   active_turn_id?: string;
+  active_turn_elapsed_seconds?: number | null;
   active_event_ids?: string[];
   error_code?: string | null;
   http_status?: number | null;
@@ -333,9 +339,8 @@ export type WebModelProvider = "chatgpt_web" | "grok_web";
 export type WebModelView = WebModelProvider | "dots";
 
 /**
- * Create (or, by default, rotate) the provider's shared connector. With
- * `createOnly`, an existing connector is refused with `connector_exists` and
- * keeps its credential.
+ * Create only when absent; otherwise return the unchanged connector without
+ * its secret. Creating never rotates a credential.
  */
 export async function createWebModelConnector(
   provider: WebModelProvider = "chatgpt_web",
@@ -344,6 +349,14 @@ export async function createWebModelConnector(
   return apiJson<WebModelConnectorCreateResult>("/api/v1/web-model/connectors", {
     method: "POST",
     body: JSON.stringify(options.createOnly ? { provider, create_only: true } : { provider }),
+  });
+}
+
+/** Explicit credential replacement; the settings view confirms it first. */
+export async function rotateWebModelConnector(provider: WebModelProvider) {
+  return apiJson<WebModelConnectorCreateResult>("/api/v1/web-model/connectors", {
+    method: "POST",
+    body: JSON.stringify({ provider, rotate: true }),
   });
 }
 

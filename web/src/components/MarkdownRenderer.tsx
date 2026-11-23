@@ -3,6 +3,9 @@ import { GraphicViewer } from "./viewer/GraphicViewer";
 import { FloatingPortal } from "@floating-ui/react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import MarkdownIt from "markdown-it";
+import markdownItCjkFriendly from "markdown-it-cjk-friendly";
+import { markdownMentions } from "./markdownMentions";
+import { markdownPaths } from "./markdownPaths";
 import { renderToStaticMarkup } from "react-dom/server";
 import { useTranslation } from "react-i18next";
 import { CheckIcon, CloseIcon, CopyIcon, ExpandIcon } from "./Icons";
@@ -10,6 +13,8 @@ import { classNames } from "../utils/classNames";
 import { copyTextToClipboard } from "../utils/copy";
 import { activateMermaidBlocks, isMermaidFenceLanguage, toggleMermaidView } from "../utils/mermaid";
 import { useModalA11y } from "../hooks/useModalA11y";
+import { useChatObscuringView } from "../hooks/useChatObscuringView";
+import type { MessageMentionToken } from "../utils/mentionHighlight";
 
 const copyIconMarkup = renderToStaticMarkup(
   <CopyIcon className="w-3.5 h-3.5" strokeWidth={2} aria-hidden="true" />,
@@ -56,6 +61,7 @@ function MermaidPreviewDialog({
   const [copied, setCopied] = useState(false);
   const titleId = useId();
   const { modalRef } = useModalA11y(true, onClose);
+  useChatObscuringView(true);
 
   useEffect(() => {
     if (!copied) return;
@@ -110,7 +116,10 @@ function MermaidPreviewDialog({
                 aria-label={copied ? labels.copied : labels.copy}
               >
                 {copied ? (
-                  <CheckIcon className="h-3.5 w-3.5 text-green-600 dark:text-emerald-400" />
+                  <CheckIcon
+                    className="h-3.5 w-3.5 text-green-600 dark:text-emerald-400"
+                    data-status-tone="ok"
+                  />
                 ) : (
                   <CopyIcon className="h-3.5 w-3.5" />
                 )}
@@ -157,6 +166,10 @@ interface MarkdownRendererProps {
   /** Map document-relative image and link URLs; omitted by ordinary message consumers. */
   resolveUrl?: (url: string, kind: "image" | "link") => string;
   onRendered?: () => void;
+  /** References to mark in text, as `getMessageMentionTokens` returns them. */
+  mentionTokens?: readonly MessageMentionToken[];
+  /** Only message text with a validated workspace scope may expose path actions. */
+  pathRoot?: string;
 }
 
 export function MarkdownRenderer({
@@ -167,6 +180,8 @@ export function MarkdownRenderer({
   enableMermaid = false,
   resolveUrl,
   onRendered,
+  mentionTokens,
+  pathRoot,
 }: MarkdownRendererProps) {
   const { t } = useTranslation(["chat", "common"]);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -209,9 +224,11 @@ export function MarkdownRenderer({
     const instance = new MarkdownIt({
       html: false, // Security: Disable raw HTML to prevent XSS
       linkify: true,
-      typographer: true,
       breaks: true,
-    });
+    })
+      .use(markdownItCjkFriendly)
+      .use(markdownMentions)
+      .use(markdownPaths);
     if (resolveUrl) {
       instance.renderer.rules.heading_open = (tokens, index, options, env, renderer) => {
         const title =
@@ -242,6 +259,18 @@ export function MarkdownRenderer({
             : renderer.renderToken(tokens, index, options);
         };
       }
+    } else {
+      // A web address (http:, https: or //) opens in a new tab rather than replacing
+      // CCCC, even one on CCCC's own origin. Relative paths, anchors and other schemes
+      // such as mailto: keep the browser's own handling.
+      instance.renderer.rules.link_open = (tokens, index, options, _env, renderer) => {
+        const token = tokens[index];
+        if (/^(?:https?:)?\/\//i.test(token.attrGet("href") || "")) {
+          token.attrSet("target", "_blank");
+          token.attrSet("rel", "noopener noreferrer");
+        }
+        return renderer.renderToken(tokens, index, options);
+      };
     }
     const escapedTableScrollRegion = instance.utils.escapeHtml(labels.tableScrollRegion);
     instance.renderer.rules.table_open = (tokens, idx, options, _env, self) =>
@@ -370,8 +399,8 @@ export function MarkdownRenderer({
   ]);
 
   const htmlContent = useMemo(() => {
-    return md.render(content || "");
-  }, [md, content]);
+    return md.render(content || "", { mentionTokens, pathRoot });
+  }, [md, content, mentionTokens, pathRoot]);
   // Mermaid renders into this subtree imperatively. Keep the prop object stable so unrelated parent
   // renders do not make React replace the subtree and reset completed diagrams back to "pending".
   const renderedHtml = useMemo(() => ({ __html: htmlContent }), [htmlContent]);

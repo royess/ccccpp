@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { useModalA11y } from "../../hooks/useModalA11y";
+import { useChatObscuringView } from "../../hooks/useChatObscuringView";
 import { ModalFrame } from "./ModalFrame";
 
 export function RuntimeInspectorModal({
@@ -20,6 +21,7 @@ export function RuntimeInspectorModal({
   children: ReactNode;
 }) {
   const { modalRef } = useModalA11y(isOpen && !inline, onClose, { preserveTerminalKeys: true });
+  useChatObscuringView(isOpen && !inline);
   return (
     <ModalFrame
       isOpen={isOpen}
@@ -31,7 +33,7 @@ export function RuntimeInspectorModal({
       closeAriaLabel={closeAriaLabel}
       panelClassName="h-full w-full max-w-none overflow-hidden sm:h-[92vh] sm:w-[min(1480px,98vw)] sm:max-w-[98vw]"
       floatingCloseClassName="sm:!top-3"
-      floatingCloseButtonClassName="!min-h-[40px] !min-w-[40px] !rounded-xl"
+      floatingCloseButtonClassName="!rounded-xl"
       modalRef={modalRef}
     >
       {children}

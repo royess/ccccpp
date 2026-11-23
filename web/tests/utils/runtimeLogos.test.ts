@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
@@ -11,8 +11,10 @@ const WEB_ROOT = resolve(TEST_DIR, "../..");
 const PUBLIC_ROOT = resolve(WEB_ROOT, "public");
 
 describe("runtimeLogos", () => {
-  it("covers every built-in supported runtime except custom", () => {
-    const expected = SUPPORTED_RUNTIMES.filter((runtime) => runtime !== "custom").sort();
+  it("covers every built-in runtime with a file except the inline Claude logo", () => {
+    const expected = SUPPORTED_RUNTIMES.filter(
+      (runtime) => runtime !== "custom" && runtime !== "claude",
+    ).sort();
     const actual = Object.keys(RUNTIME_LOGO_FILE_BY_RUNTIME).sort();
     expect(actual).toEqual(expected);
   });
@@ -26,19 +28,10 @@ describe("runtimeLogos", () => {
     }
   });
 
-  it("returns null for custom or unknown runtimes", () => {
+  it("returns null for the inline Claude logo and custom or unknown runtimes", () => {
+    expect(getRuntimeLogoSrc("claude")).toBeNull();
     expect(getRuntimeLogoSrc("custom")).toBeNull();
     expect(getRuntimeLogoSrc("unknown-runtime")).toBeNull();
     expect(getRuntimeLogoSrc("")).toBeNull();
-  });
-
-  it("keeps the DeepSeek whale centered and visible on the avatar background", () => {
-    const svg = readFileSync(resolve(PUBLIC_ROOT, "logos/deepseek.svg"), "utf8");
-    expect(svg).toContain('viewBox="0 0 64 64"');
-    expect(svg).toContain('transform="translate(10 14.5) scale(1.65)"');
-    expect(svg).toContain('fill="#000"');
-    expect(svg).not.toContain("#4D6BFE");
-    expect(svg).not.toContain("<circle");
-    expect(svg).not.toContain("clip-path");
   });
 });

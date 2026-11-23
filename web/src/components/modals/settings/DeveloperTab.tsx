@@ -1,6 +1,7 @@
 // DeveloperTab configures developer mode and its diagnostics.
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
+import type { LogComponent } from "../../../services/api/diagnostics";
 import { copyTextToClipboard } from "../../../utils/copy";
 import { buildMismatch, type RuntimeBuildInfo } from "../../../utils/runtimeBuildInfo";
 import type { RuntimeVisibilityMode } from "../../../utils/runtimeVisibility";
@@ -24,8 +25,6 @@ interface DeveloperTabProps {
   runtimeInfoErr: string;
   developerMode: boolean;
   setDeveloperMode: (v: boolean) => void;
-  logLevel: "INFO" | "DEBUG";
-  setLogLevel: (v: "INFO" | "DEBUG") => void;
   terminalBacklogMiB: number;
   setTerminalBacklogMiB: (v: number) => void;
   terminalScrollbackLines: number;
@@ -43,8 +42,8 @@ interface DeveloperTabProps {
   onLoadDebugSnapshot: () => void;
   onClearDebugSnapshot: () => void;
   // Log tail
-  logComponent: "daemon" | "web" | "im";
-  setLogComponent: (v: "daemon" | "web" | "im") => void;
+  logComponent: LogComponent;
+  setLogComponent: (v: LogComponent) => void;
   logLines: number;
   setLogLines: (v: number) => void;
   logText: string;
@@ -75,8 +74,6 @@ export function DeveloperTab({
   runtimeInfoErr,
   developerMode,
   setDeveloperMode,
-  logLevel,
-  setLogLevel,
   terminalBacklogMiB,
   setTerminalBacklogMiB,
   terminalScrollbackLines,
@@ -125,7 +122,6 @@ export function DeveloperTab({
 
   const ids = {
     developerMode: useId(),
-    logLevel: useId(),
     peerRuntime: useId(),
     assistantRuntime: useId(),
     ptyBacklog: useId(),
@@ -139,12 +135,14 @@ export function DeveloperTab({
   const output = (text: string, extraClass = "") => (
     <pre
       className={`m-0 min-h-[100px] overflow-auto rounded-[10px] bg-zinc-900 p-3.5 font-mono text-xs leading-6 whitespace-pre text-zinc-200 ${extraClass}`}
+      data-settings-code
     >
       <code>{text || "—"}</code>
     </pre>
   );
   const note = (text: string, tone: "muted" | "error" | "warn" = "muted") => (
     <div
+      data-status-tone={tone === "error" ? "error" : tone === "warn" ? "warning" : "muted"}
       className={
         tone === "error"
           ? "text-xs text-rose-600 dark:text-rose-400"
@@ -163,7 +161,7 @@ export function DeveloperTab({
       description={
         <>
           {t("developer.description")}{" "}
-          <span className="text-amber-700 dark:text-amber-300">
+          <span className="text-amber-700 dark:text-amber-300" data-status-tone="warning">
             <strong className="font-medium">{t("developer.warningTitle")}</strong>{" "}
             {t("developer.warningText")}
           </span>
@@ -184,7 +182,10 @@ export function DeveloperTab({
           versionMismatch || runtimeBuildInfo ? (
             <>
               {versionMismatch ? (
-                <span className="inline-flex items-center rounded-full border border-amber-500/30 bg-amber-500/15 px-2.5 text-xs font-medium text-amber-700 dark:text-amber-300">
+                <span
+                  className="inline-flex items-center rounded-full border border-amber-500/30 bg-amber-500/15 px-2.5 text-xs font-medium text-amber-700 dark:text-amber-300"
+                  data-status-tone="warning"
+                >
                   {t("developer.versionMismatchBadge")}
                 </span>
               ) : null}
@@ -249,18 +250,6 @@ export function DeveloperTab({
             checked={developerMode}
             onChange={setDeveloperMode}
             labelledBy={ids.developerMode}
-          />
-        </SettingsRow>
-        <SettingsRow label={t("developer.logLevel")} labelId={ids.logLevel}>
-          <SegmentedChoice
-            fill={false}
-            labelledBy={ids.logLevel}
-            value={logLevel}
-            options={[
-              { value: "INFO", label: "INFO" },
-              { value: "DEBUG", label: "DEBUG" },
-            ]}
-            onChange={setLogLevel}
           />
         </SettingsRow>
       </SettingsCard>
@@ -381,6 +370,7 @@ export function DeveloperTab({
             value={logComponent}
             options={[
               { value: "daemon", label: "daemon" },
+              { value: "daemon_diagnostics", label: t("developer.daemonDiagnostics") },
               { value: "web", label: "web" },
               { value: "im", label: "im" },
             ]}
@@ -456,7 +446,7 @@ export function DeveloperTab({
                 </div>
                 {missing.length > 0 ? (
                   <div className="break-all">
-                    <span className="text-amber-600 dark:text-amber-400">
+                    <span className="text-amber-600 dark:text-amber-400" data-status-tone="warning">
                       {t("developer.missing")}:
                     </span>{" "}
                     {missing.join(", ")}
@@ -464,7 +454,7 @@ export function DeveloperTab({
                 ) : null}
                 {corrupt.length > 0 ? (
                   <div className="break-all">
-                    <span className="text-rose-600 dark:text-rose-400">
+                    <span className="text-rose-600 dark:text-rose-400" data-status-tone="error">
                       {t("developer.corrupt")}:
                     </span>{" "}
                     {corrupt.join(", ")}
@@ -472,7 +462,7 @@ export function DeveloperTab({
                 ) : null}
                 {removed.length > 0 ? (
                   <div className="break-all">
-                    <span className="text-emerald-600 dark:text-emerald-400">
+                    <span className="text-emerald-600 dark:text-emerald-400" data-status-tone="ok">
                       {t("developer.removed")}:
                     </span>{" "}
                     {removed.join(", ")}

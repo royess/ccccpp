@@ -111,13 +111,23 @@ function unlockBodyScroll(): void {
 export function useModalA11y(
   isOpen: boolean,
   onClose: () => void,
-  options?: { preserveTerminalKeys?: boolean; initialFocusRef?: RefObject<HTMLElement | null> },
+  options?: {
+    preserveTerminalKeys?: boolean;
+    initialFocusRef?: RefObject<HTMLElement | null>;
+    /**
+     * Gives focus back without scrolling to it, for a dialog opened from inside the message list:
+     * scrolling there would move the conversation and stop it following new messages.
+     */
+    preventReturnScroll?: boolean;
+  },
 ) {
   const preserveTerminalKeys = options?.preserveTerminalKeys === true;
   const initialFocusRef = options?.initialFocusRef;
+  const preventReturnScroll = options?.preventReturnScroll === true;
   const instanceId = useId();
   const modalRef = useRef<HTMLDivElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const openedRef = useRef(false);
   const onCloseRef = useRef(onClose);
 
   useEffect(() => {
@@ -200,8 +210,14 @@ export function useModalA11y(
     if (!isOpen || typeof document === "undefined") return;
 
     const id = instanceId;
-    previousFocusRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    // Focus goes back to where it was when the modal opened. Running again for
+    // new options while open, such as another initial field, keeps that place:
+    // what has focus by then may be a control the change removed.
+    if (!openedRef.current) {
+      openedRef.current = true;
+      previousFocusRef.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    }
 
     pushModal(id);
     lockBodyScroll();
@@ -231,14 +247,18 @@ export function useModalA11y(
         unlockBodyScroll();
         const previous = previousFocusRef.current;
         if (previous && document.contains(previous) && typeof previous.focus === "function") {
-          previous.focus();
+          previous.focus({ preventScroll: preventReturnScroll });
         }
       } else {
         const previous = previousFocusRef.current;
         requestAnimationFrame(() => focusTopModal(previous));
       }
     };
-  }, [isOpen, instanceId, handleEscape, handleTab, initialFocusRef]);
+  }, [isOpen, instanceId, handleEscape, handleTab, initialFocusRef, preventReturnScroll]);
+
+  useEffect(() => {
+    if (!isOpen) openedRef.current = false;
+  }, [isOpen]);
 
   return { modalRef };
 }

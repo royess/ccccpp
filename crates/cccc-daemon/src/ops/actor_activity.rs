@@ -24,20 +24,25 @@ impl Publisher {
             .map(|group| group.group_id.clone())
             .collect::<BTreeSet<_>>();
         self.previous.retain(|group_id, _| known.contains(group_id));
-        for meta in groups {
-            let Ok(group) = store.load(&meta.group_id) else {
-                continue;
-            };
-            self.publish_group(&store, &group);
-        }
+        // One session-owner snapshot serves every Group in this round. Each
+        // Group would otherwise ask every owner again, once a second. A failed
+        // owner read is shared by this round only; the next round reads again.
+        crate::session_owner::read_scope(|| {
+            for meta in groups {
+                let Ok(group) = store.load(&meta.group_id) else {
+                    continue;
+                };
+                self.publish_group_snapshot(&store, &group);
+            }
+        });
         Ok(())
     }
 
-    fn publish_group(&mut self, store: &GroupStore, group: &GroupDoc) {
+    fn publish_group_snapshot(&mut self, store: &GroupStore, group: &GroupDoc) {
         let mut payloads = Vec::new();
         let mut snapshot = BTreeMap::new();
         for actor in &group.actors {
-            if let Some(payload) = running_payload(store.home(), group, actor) {
+            if let Some(payload) = activity_payload(store.home(), group, actor) {
                 let runner = text(&payload, "runner_effective", "pty");
                 let state = text(&payload, "effective_working_state", "waiting");
                 snapshot.insert(actor.id.clone(), Fingerprint { state, runner });
@@ -90,19 +95,29 @@ impl Publisher {
     }
 }
 
-pub(super) fn running_payload(
+pub(super) fn activity_payload(
     home: &HomeLayout,
     group: &GroupDoc,
     actor: &Actor,
 ) -> Option<Map<String, Value>> {
-    let running = super::actor_runtime_status::resolve(group, actor).running;
-    if !running {
+    let status = super::actor_runtime_status::resolve(home, group, actor);
+    if !status.available {
+        let mut payload =
+            super::working_state::runtime_actor_fields(home, actor, &group.group_id, false);
+        payload.insert("id".into(), json!(actor.id));
+        return Some(payload);
+    }
+    let running = status.running;
+    // Native callbacks and receiver leases can change outside Actor controls,
+    // before a connected tick has ever been published. Include unavailable
+    // native members too, so clients can replace a hydrated connected snapshot.
+    if !running && actor.external_session_id.is_empty() {
         return None;
     }
     let mut payload =
-        super::working_state::runtime_actor_fields(home, actor, &group.group_id, true);
+        super::working_state::runtime_actor_fields(home, actor, &group.group_id, running);
     payload.insert("id".into(), json!(actor.id));
-    payload.insert("running".into(), Value::Bool(true));
+    payload.insert("running".into(), Value::Bool(running));
     Some(payload)
 }
 

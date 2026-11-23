@@ -1,9 +1,12 @@
+import i18n from "../../i18n";
 import { useGroupStore, useModalStore, useUIStore } from "../../stores";
 import { groupMessagesVisible } from "../../stores/useUIStore";
+import { signalBacklogChanged } from "../../stores/backlogSignals";
 import type { Actor, ChatMessageData, LedgerEvent } from "../../types";
 import {
   extractMailReadData,
   extractCancelledSourceEventId,
+  extractFailedExit,
   extractRuntimeDeliveryData,
   getActorRefreshMode,
   getRecipientActorIdsForEvent,
@@ -34,7 +37,18 @@ type GroupState = ReturnType<typeof useGroupStore.getState>;
 type UiState = ReturnType<typeof useUIStore.getState>;
 type ModalState = ReturnType<typeof useModalStore.getState>;
 
+function earlierObservation(incoming?: string | null, current?: string | null): boolean {
+  if (!incoming || !current || incoming === current) return false;
+  const left = Date.parse(incoming);
+  const right = Date.parse(current);
+  if (left !== right) return left < right;
+  // Date.parse accounts for UTC offsets but truncates the daemon's microseconds.
+  const fraction = (stamp: string) => (stamp.match(/\.(\d+)/)?.[1] || "").replace(/0+$/, "");
+  return fraction(incoming) < fraction(current);
+}
+
 export type LedgerEventProcessorDeps = {
+  alreadyProcessed?: boolean;
   actors: Actor[];
   activeTab: string;
   chatAtBottom: boolean;
@@ -53,6 +67,7 @@ export type LedgerEventProcessorDeps = {
   refreshActors: GroupState["refreshActors"];
   refreshPresentation: GroupState["refreshPresentation"];
   incrementChatUnread: UiState["incrementChatUnread"];
+  showError: UiState["showError"];
   markPresentationSlotAttention: ModalState["markPresentationSlotAttention"];
   clearPresentationSlotAttention: ModalState["clearPresentationSlotAttention"];
 };
@@ -62,20 +77,63 @@ export function processLedgerEvent(
   event: LedgerEvent,
   deps: LedgerEventProcessorDeps,
 ): void {
+  const eventId = String(event.id || "").trim();
+  const bucket = useGroupStore.getState().chatByGroup[groupId];
+  const alreadyApplied = !!eventId && !!deps.alreadyProcessed;
+  // A sparse-view fetch can beat the live event without the reader reaching
+  // it. It does not suppress the chat count; its actor badges need a refresh
+  // because their last server snapshot may already include this event.
+  const seenElsewhere =
+    !!eventId &&
+    [bucket?.events, bucket?.senderHistory?.events, bucket?.chatWindow?.events].some((events) =>
+      events?.some((item) => item.id === eventId),
+    );
   if (isContextSyncEvent(event)) {
-    deps.onContextSync();
+    // A backlog write is a file change, not a Context write: it carries no version, and the
+    // task board has nothing to read again unless the same event also changed tasks.
+    const data = event.data as { backlog?: unknown; changes?: unknown } | undefined;
+    if (data?.backlog) signalBacklogChanged(groupId);
+    const changes = Array.isArray(data?.changes) ? data.changes : [];
+    const backlogOnly =
+      !!data?.backlog &&
+      changes.length > 0 &&
+      changes.every((change) =>
+        String((change as { op?: unknown } | null)?.op || "").startsWith("backlog."),
+      );
+    if (!backlogOnly) deps.onContextSync();
     return;
   }
   if (isActorActivityEvent(event)) {
     const actors = event.data?.actors;
     if (Array.isArray(actors) && actors.length > 0) {
       const store = useGroupStore.getState();
-      deps.updateActorActivity(actors, groupId);
+      const current = new Map<string, Actor>();
+      if (store.selectedGroupId === groupId) {
+        for (const actor of store.internalRuntimeActorsByGroup[groupId] || [])
+          current.set(actor.id, actor);
+        for (const actor of store.actors) current.set(actor.id, actor);
+      }
+      // A stopped or unobservable member must still clear the previous observation.
+      const retained: Actor[] = [];
+      const updates = actors.filter((row) => {
+        const actor = current.get(row.id);
+        if (
+          actor &&
+          row.running &&
+          earlierObservation(row.effective_working_updated_at, actor.effective_working_updated_at)
+        ) {
+          retained.push(actor);
+          return false;
+        }
+        return true;
+      });
+      if (!updates.length) return;
+      deps.updateActorActivity(updates, groupId);
       deps.updateGroupRuntimeState(
         groupId,
         computeGroupRuntimeFromActorActivityUpdates(
-          deps.actors,
-          actors,
+          [...deps.actors.map((actor) => current.get(actor.id) ?? actor), ...retained],
+          updates,
           getRuntimeStatusFallbackForGroup(store, groupId),
         ),
       );
@@ -109,7 +167,13 @@ export function processLedgerEvent(
     if (data) {
       deps.updateObligationStatus(
         data.eventId,
-        { actorId: data.actorId, deliveryState: data.state },
+        {
+          actorId: data.actorId,
+          deliveryState: data.state,
+          deliveryReason: data.reason,
+          deliveryEvidence: data.evidence,
+          waitingReason: data.waitingReason,
+        },
         groupId,
       );
     }
@@ -130,7 +194,22 @@ export function processLedgerEvent(
   const nextEvent = reconciliation.event;
   initializeReadStatus(nextEvent, deps.actors);
   initializeObligationStatus(nextEvent, deps.actors);
-  deps.appendEvent(nextEvent, groupId);
+  // A read can beat the live event. appendEvent deduplicates the live list;
+  // processed events may have been trimmed and must not be appended again.
+  if (!deps.alreadyProcessed) deps.appendEvent(nextEvent, groupId);
+
+  // Nothing else says so: Start Group would just look ignored.
+  const exit = deps.alreadyProcessed ? null : extractFailedExit(nextEvent);
+  if (exit) {
+    const actor = deps.actors.find((item) => item.id === exit.actorId);
+    deps.showError(
+      i18n.t("actors:memberExited", {
+        name: actor?.title || exit.actorId,
+        code: exit.code,
+        defaultValue: "{{name}} stopped (exit code {{code}}). Check its terminal.",
+      }),
+    );
+  }
 
   if (isChatMessageEvent(nextEvent)) {
     const data = nextEvent.data as ChatMessageData;
@@ -163,16 +242,26 @@ export function processLedgerEvent(
         }
       }
     }
-    if (data?.message_mode === "mail") {
+    if (!alreadyApplied && data?.message_mode === "mail") {
       const recipients = getRecipientActorIdsForEvent(nextEvent, deps.actors);
-      if (recipients.length > 0) deps.incrementActorUnread(recipients);
-    } else if (data?.message_mode === "send" || data?.message_mode === "request_reply") {
+      if (recipients.length > 0) {
+        if (seenElsewhere) void deps.refreshActors(groupId, { includeUnread: true });
+        else deps.incrementActorUnread(recipients);
+      }
+    } else if (
+      !alreadyApplied &&
+      (data?.message_mode === "send" || data?.message_mode === "request_reply")
+    ) {
       const recipients = getRecipientActorIdsForEvent(nextEvent, deps.actors);
-      if (recipients.length > 0) deps.incrementWebModelQueued(recipients);
+      if (recipients.length > 0) {
+        if (seenElsewhere) void deps.refreshActors(groupId, { includeUnread: true });
+        else deps.incrementWebModelQueued(recipients);
+      }
     }
   }
 
   if (
+    !alreadyApplied &&
     shouldIncrementUnread(
       nextEvent,
       deps.activeTab === "chat" && groupMessagesVisible(groupId, useUIStore.getState()),

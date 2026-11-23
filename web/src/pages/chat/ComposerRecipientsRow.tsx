@@ -1,9 +1,11 @@
+import { useLayoutEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 
 import { CloseIcon } from "../../components/Icons";
 import { ScrollFade } from "../../components/ScrollFade";
 import type { Actor } from "../../types";
 import { classNames } from "../../utils/classNames";
+import { CHET_SELECTOR } from "../../utils/chetIdentity";
 import { RecipientPopover } from "./RecipientPopover";
 import { useRecipientPopover } from "./useRecipientPopover";
 
@@ -13,8 +15,10 @@ interface ComposerRecipientsRowProps {
   selectedGroupId: string;
   busy: string;
   actors: Actor[];
+  allowChet?: boolean;
   selectedGroupActorsHydrating?: boolean;
   toTokens: string[];
+  unavailableRecipients?: string[];
   onToggleRecipient: (token: string) => void;
   onClearRecipients: () => void;
 }
@@ -25,39 +29,57 @@ export function ComposerRecipientsRow({
   selectedGroupId,
   busy,
   actors,
+  allowChet = false,
   selectedGroupActorsHydrating,
   toTokens,
+  unavailableRecipients = [],
   onToggleRecipient,
   onClearRecipients,
 }: ComposerRecipientsRowProps) {
   const { t } = useTranslation("chat");
   const popover = useRecipientPopover({ isSmallScreen });
+  const lastSelected = useRef<HTMLButtonElement | null>(null);
+  const fadeWidth = 20;
+  useLayoutEffect(() => {
+    const button = lastSelected.current;
+    lastSelected.current = null;
+    if (!button?.isConnected || button.getAttribute("aria-pressed") !== "true") return;
+    const scrollPort = button.closest<HTMLElement>(".composer-recipient-scroll");
+    if (!scrollPort || scrollPort.scrollWidth <= scrollPort.clientWidth) return;
+    const viewport = scrollPort.getBoundingClientRect();
+    const target = button.getBoundingClientRect();
+    // A newly shown clear button can shrink this viewport after the click.
+    // Move only this scroll port, and leave room for its faded edge.
+    if (target.left < viewport.left) {
+      const margin =
+        target.width > viewport.width
+          ? fadeWidth
+          : Math.min(fadeWidth, viewport.width - target.width);
+      scrollPort.scrollLeft -= viewport.left - target.left + margin;
+    } else if (target.width <= viewport.width && target.right > viewport.right) {
+      const margin = Math.min(fadeWidth, viewport.width - target.width);
+      scrollPort.scrollLeft += target.right - viewport.right + margin;
+    }
+  }, [toTokens]);
   const actorChipDisabled = !selectedGroupId || busy === "send" || !!selectedGroupActorsHydrating;
   const chipBaseClass =
     "touch-target-sm flex h-6 flex-shrink-0 items-center justify-center whitespace-nowrap rounded-lg border px-2 text-xs font-medium leading-none transition-all sm:px-2.5 sm:text-xs";
-  const chipActiveClass = isDark
-    ? "border-white bg-white text-[rgb(20,20,22)] shadow-none"
-    : "border-[rgb(35,36,37)] bg-[rgb(35,36,37)] text-white shadow-none";
-  const chipInactiveClass = isDark
-    ? "bg-white/[0.06] text-[var(--color-text-secondary)] border-white/[0.08] hover:bg-white/[0.1] hover:border-white/[0.14] hover:text-[var(--color-text-primary)]"
-    : "bg-[rgb(245,245,245)] text-[rgb(35,36,37)] border-transparent hover:bg-[rgb(237,237,237)] hover:border-black/5 hover:text-[rgb(20,20,22)]";
+  const chipActiveClass =
+    "border-[var(--glass-accent-border)] bg-[var(--glass-accent-bg)] text-[var(--color-text-primary)] shadow-none";
+  const chipInactiveClass =
+    "border-transparent bg-transparent text-[var(--color-text-tertiary)] hover:bg-[var(--glass-tab-bg-hover)] hover:text-[var(--color-text-primary)]";
   return (
     <div
-      className={classNames(
-        "relative flex items-center gap-1.5 border-b px-2.5 py-1",
-        isDark ? "border-white/[0.04]" : "border-black/[0.04]",
-      )}
+      role="group"
+      aria-label={t("to", "To")}
+      data-composer-recipient-row
+      className="relative flex items-center gap-2 px-3 py-1"
     >
-      <span
-        className={classNames(
-          "flex-shrink-0 text-xs font-medium tracking-[0.08em]",
-          isDark ? "text-[var(--color-text-tertiary)]" : "text-gray-400",
-        )}
+      <ScrollFade
+        className="min-w-0 flex-1"
+        innerClassName="w-full max-w-full composer-recipient-scroll"
+        fadeWidth={fadeWidth}
       >
-        {t("to", "To")}
-      </span>
-
-      <ScrollFade className="min-w-0 flex-1" innerClassName="w-full max-w-full" fadeWidth={20}>
         <div className="flex min-w-max items-center gap-1 transition-opacity">
           <div
             className={classNames(
@@ -65,7 +87,28 @@ export function ComposerRecipientsRow({
               selectedGroupActorsHydrating ? "opacity-50 pointer-events-none" : "",
             )}
           >
-            {["@all", "@foreman", "@peers"].map((token) => {
+            {unavailableRecipients.map((token) => (
+              <button
+                key={`unavailable:${token}`}
+                className={`${chipBaseClass} border-[var(--color-danger)] text-[var(--color-danger)]`}
+                onClick={() => onToggleRecipient(token)}
+                disabled={actorChipDisabled}
+                aria-label={t("removeUnavailableRecipient", { name: token })}
+                title={t("removeUnavailableRecipient", { name: token })}
+                data-unavailable-recipient
+              >
+                <span className="max-w-48 truncate">
+                  {t("unavailableRecipient", { name: token })}
+                </span>
+                <CloseIcon size={12} aria-hidden="true" />
+              </button>
+            ))}
+            {[
+              "@all",
+              "@foreman",
+              "@peers",
+              ...(allowChet || toTokens.includes(CHET_SELECTOR) ? [CHET_SELECTOR] : []),
+            ].map((token) => {
               const active = toTokens.includes(token);
               const target = popover.selectorTarget(token);
               return (
@@ -75,7 +118,10 @@ export function ComposerRecipientsRow({
                     chipBaseClass,
                     active ? chipActiveClass : chipInactiveClass,
                   )}
-                  onClick={() => onToggleRecipient(token)}
+                  onClick={(event) => {
+                    lastSelected.current = active ? null : event.currentTarget;
+                    onToggleRecipient(token);
+                  }}
                   onMouseEnter={(event) => popover.show(target, event.currentTarget)}
                   onMouseLeave={popover.scheduleHide}
                   onFocus={(event) => popover.show(target, event.currentTarget)}
@@ -99,7 +145,10 @@ export function ComposerRecipientsRow({
                     chipBaseClass,
                     active ? chipActiveClass : chipInactiveClass,
                   )}
-                  onClick={() => onToggleRecipient(id)}
+                  onClick={(event) => {
+                    lastSelected.current = active ? null : event.currentTarget;
+                    onToggleRecipient(id);
+                  }}
                   onMouseEnter={(event) => popover.show(target, event.currentTarget)}
                   onMouseLeave={popover.scheduleHide}
                   onFocus={(event) => popover.show(target, event.currentTarget)}
@@ -116,6 +165,7 @@ export function ComposerRecipientsRow({
       </ScrollFade>
 
       <RecipientPopover
+        anchorRef={popover.anchorRef}
         isDark={isDark}
         target={popover.visibleTarget}
         style={popover.style}
@@ -125,10 +175,10 @@ export function ComposerRecipientsRow({
         onHide={popover.hide}
       />
 
-      {toTokens.length > 0 && (
+      {(toTokens.length > 0 || unavailableRecipients.length > 0) && (
         <button
           className={classNames(
-            "touch-target-sm flex-shrink-0 h-7 w-7 rounded-full flex items-center justify-center transition-colors opacity-50 hover:opacity-100",
+            "touch-target-sm flex-shrink-0 h-7 w-7 rounded-md flex items-center justify-center transition-colors opacity-50 hover:opacity-100",
             isDark
               ? "text-[var(--color-text-tertiary)] hover:bg-white/10 hover:text-[var(--color-text-primary)]"
               : "text-gray-400 hover:bg-black/5 hover:text-gray-700",

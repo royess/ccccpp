@@ -14,6 +14,23 @@ Open http://127.0.0.1:8848/ in your browser.
 
 `cccc` is the single owner of the default local app session: it starts the daemon and Web together, and pressing `Ctrl+C` stops both together. If another `cccc` session is already running for the same `CCCC_HOME`, a second `cccc` command will refuse to start instead of silently sharing the old daemon.
 
+If the Web server and its daemon report different versions, a dismissible notice
+shows both and says that some features may not work. A difference does not by
+itself establish that they are incompatible. If version information is unavailable,
+the notice is not shown. `cccc daemon start`, `cccc web` and `cccc --headless`
+also report a different running daemon version when they reuse one; they do not
+replace that daemon. Dismissing
+the notice remembers that pair of versions in this browser's site storage; a
+different pair can show a new notice. If storage is unavailable, dismissal lasts
+until the page reloads.
+
+If **Waiting for you** says that the running daemon does not support it, finish
+current work before restarting: on the CCCC host, use the same `CCCC_HOME` to run
+`cccc daemon stop`, then start CCCC from the intended installation. Restarting
+only the Web can leave the old daemon running. If services are managed separately,
+use their service manager to restart them as appropriate; remote users should ask
+the administrator. Stopping the daemon can interrupt work still in progress.
+
 ## Interface Overview
 
 The Web UI has these main areas:
@@ -22,6 +39,77 @@ The Web UI has these main areas:
 - **Sidebar**: Group list, navigation, and the persistent Voice control
 - **Main Area**: Group message history or a paginated terminal view
 - **Input**: Message composer with @mention support
+
+The local Group list scrolls independently from the collapsible **CCCC Connect**
+section and the Voice dock below it. CCCC Connect starts collapsed; click its heading
+to expand or collapse the instance list. The section's information button opens the full
+local instance name and public address. Group rows are more compact, while their
+ordering stays unchanged; connection counts and action menus keep fixed positions,
+with menus visible on touchscreens.
+
+The composer uses one send control with an adjacent mode arrow. The primary action
+shows the selected mode; its tooltip includes the send shortcut. Recipient chips
+need no separate “To” caption. A message within the Group names its recipients in the header,
+and one addressed to you shows **You** (in a read-only exhibit, **User**); a message sent to
+another Group or instance shows its destination route.
+User names remain accessible to screen readers without repeating a visible label
+above right-aligned local user messages. Message spacing is tighter, and the
+composer uses a subdued border that strengthens on focus.
+
+Image attachments in the composer show thumbnails before sending. Hovering or
+focusing a thumbnail opens a larger preview; the filename remains its accessible
+label and tooltip. Unsupported or unreadable images fall back to a filename chip,
+as do ordinary files. The attachment area scrolls when needed and local preview
+URLs are released when a file is replaced or removed.
+
+While a message with attachments is uploading, a stop button appears next to
+**Send**. It ends the wait and keeps your draft: it returns to an empty composer,
+or waits to be restored if you have started a new one. It does not recall the
+message, which may already have arrived, so check the conversation before sending
+it again.
+
+On wider screens, an empty, unfocused composer cycles through four localized typing hints for tasks,
+Skills (`/` and `/install`), agents (`@`), and Groups (`#`). Focusing the composer
+pauses the hint; any draft text hides it, and a suggested reply takes precedence.
+Reduced-motion preferences show a static hint, and hidden tabs pause the animation. **Motion**
+set to **Off** under Appearance also shows a static hint.
+Hints are decorative and never become draft content or screen-reader live announcements.
+
+Each message is as wide as its content, header and attachments included, up to the column; a
+question waiting for your answer keeps room to answer in. Each run of messages from one sender
+opens with a thin line that spans its first message: the first message loaded, a message after a
+change of sender, and a message after a notice or any other entry that is not a message.
+Consecutive messages from the same sender, an agent's or yours, are set apart by space alone. In a
+wide reading column, agents' messages and yours keep the same room from the opposite edge; in a
+narrow one, as on a phone, beside the files panel or at a large text size, agents' messages may
+use the full width. Space inside a message is reduced so that it reads apart from the space
+between messages, and a Markdown rule inside a message is a short mark in the text column.
+Images and files sent with a message follow its text with no rule between them, and the sender's
+insight follows both. Messages have no background, and pointing at one changes only its actions.
+Sender, recipients, Mail mode and time share a compact header; delivery failures and reply/read
+status stay visible. On a phone, the sender, time and actions sit above the route, the message
+uses the available width, and the sender's insight is set apart below it.
+A reply shows up to two lines of the message it answers; clicking or tapping that
+quote, or pressing Enter on it, opens the original message. With a mouse or trackpad
+and enough room in the message column, **Reply**, **Forward** and a copy icon appear
+beside the message header on hover or keyboard focus, after the time or before your name,
+in the free space next to it, so nothing shifts; a long header wraps to leave them room.
+The icon copies the message content as the menu item did before. **Quick reply**, **Pin message**,
+**Copy link** and other actions are in the bar's **More** menu. On touch screens or
+in a narrow message column, **More** ends each message's header and lists every
+action, including copying.
+Read-only views retain status information without exposing these actions. The composer groups recipients, text and tools into one surface.
+
+On phones, the chat keeps as much of the screen as possible for messages. An empty
+composer that is not in use is a single row with the attachment button, the message
+box, voice and Send, plus a short label for a chosen recipient; tapping it or one of
+its controls expands it. Scrolling the messages by touch toward newer ones slides the
+header, the filter row and the runtime dock out of view. They return when you scroll back,
+tap the messages, reach the newest message or touch the composer. A deliberate touch scroll
+of the messages can also take the focus out of the message box, so the keyboard can close;
+a draft stays, and text an input method is still composing is left alone. The **More**
+button sits beside each message. When both are visible, **Back to latest** sits beside the
+members at the bottom of the log. Phones in landscape also use the single-row composer.
 
 The header uses its existing Group status dot for page-connection health: red
 means disconnected, pulsing amber means reconnecting, and a connected page uses
@@ -38,24 +126,56 @@ Reordering or archiving Groups does not move an existing selection.
 
 ### Group message and terminal views
 
+Use **Connect sessions** above the Group list to admit user-owned Codex, Claude Code, Pi and OpenCode V2 CLI sessions. Their native applications retain runtime ownership; the Web shows Group access, receive availability and recovery guidance instead of a mirrored terminal. See [native session setup and lifecycle](./local-sessions).
+
 On desktop, Group editing, search, context and runtime controls stay directly in the header.
 **Group connections** is available under the current Group’s settings and in each Group’s sidebar **⋮** menu, including remote Groups
 in CCCC Connect. The settings entry manages the current Group; the sidebar menu manages the Group
 whose menu you opened. Only incoming invitations ask which local Group should accept
 the connection.
-**Settings and more** collects theme, text size, language, account and the full settings entry.
-Appearance choices use application menus for theme, text size and language. Selecting an
-option keeps the containing menu open and returns focus to its trigger. Arrow keys navigate
-options; Escape closes only the inner choice menu. Narrow headers use the existing overflow
-sheet with the same choices and access rules; choice panels are portalled above its scroll area.
+**Settings and more** opens with your account, where your access includes it, and the full
+settings entry, then Appearance:
+theme and language stay in view, and **More appearance settings** unfolds body font, message
+area width, motion, ‘Waiting for you’ indicators and text size. The menu opens folded each
+time. A choice applies with one click or tap and keeps the menu open; arrow keys move a
+choice's selection. Narrow headers use the overflow sheet with the same choices and access
+rules; message area width is offered only on screens 768px and wider.
 Message identities, recipients, references, timestamps and actions follow the text-size preference.
+**‘Waiting for you’ indicators** under Appearance turns off what marks requests waiting for your
+answer: the sidebar's counts, including the archived Groups' total and the one on the phone's sidebar
+button, and the **Waiting for you** filter inside each Group. Those requests then read as ordinary
+messages: one without a question is answered with the message's **Reply**, and one that asks a
+question still shows it so you can answer in place, without the Waiting for you frame.
+An answer already being sent keeps its form until it is confirmed, so it can be retried.
+A question's options can take a note: after you choose one, **+ Add a note (optional)** beside
+**Send answer** opens a box, and the requester receives your choice and your words in one reply.
+A blank note sends the choice alone; **Other** keeps its own box, and switching between them keeps
+what you wrote in each. Browser
+notifications keep their own switch under Settings → This instance → Notifications. The indicators show by default;
+the choice is saved in this browser.
+**Message area width** under Appearance sets how wide the conversation runs on
+screens 768px and wider: **Medium** keeps a centered reading column, **Wide** gives tables and
+code more room and **Full** uses the whole chat area. With **Medium** or **Wide**, the
+conversation's scrollbar sits beside the column, and the mouse wheel scrolls the conversation
+from the blank space on either side as well. The choice is saved in this browser. It
+does not appear on narrower screens, where the conversation already has no width limit.
+The members' status floats in a compact centered row above the composer. Text scrolled
+behind the member keys fades out, while messages remain visible and interactive on either
+side; the scrollable tail lets the final message move fully above the member controls.
+Activity and feedback move in whole steps: a busy member's ring of pixel dots, three blinks when
+the page sees a member start needing attention, a pixel spinner for waits longer than a quarter of
+a second, and a block cursor that can follow a headless agent's live text, though not after code
+blocks, tables and some other structures. **Motion** under Appearance stills these and the typing
+hint; the system's reduced-motion setting does the same, and Appearance says so. The Voice
+Secretary level meter keeps showing the live level.
 Reading controls share the application theme; embedded PDFs, web pages, images and terminal
-ANSI content retain their own colors. Image and diagram viewers keep zoom buttons separate
-from native wheel scrolling and support dragging the enlarged content.
+ANSI content retain their own colors. Image and diagram viewers zoom with their buttons,
+Ctrl/⌘ + wheel or a pinch, while the plain wheel keeps scrolling; see
+[Inspect images and diagrams](#inspect-images-and-diagrams).
 
 In Group settings, refreshing data or saving a different section preserves edited fields and
-updates fields you have not changed. Delivery, Automation, Messaging and Transcript display
-save results in the current settings view; a failed save leaves your changes available for retry.
+updates fields you have not changed. Delivery, Messaging and Transcript display save results
+in the current settings view; a failed save leaves your changes available for retry.
 Notebook refresh also preserves a pending notebook choice. Changing Groups starts from that
 Group's saved settings. Closing settings still discards unsaved form edits.
 Web Access refresh preserves the selected access goal together with edited connection fields.
@@ -80,19 +200,19 @@ Switching views only replaces the history area; the message composer stays in pl
 Each Group remembers its view and terminal page in this browser, including after a page reload. Message drafts and
 the message reading position survive switching between views.
 
-The terminal view shows up to four Actors per page, in the Group's existing order. Narrow areas
-show one Actor per page. Page arrows appear only when there is more than one page, in the
-Group header or the single Actor title bar on mobile. The arrows have 44-pixel targets, with a
-visible page count and disabled endpoints. On touchscreens, swipe horizontally on the Actor
+The terminal view shows up to four agents per page, in the Group's existing order. Narrow areas
+show one agent per page. Page arrows appear only when there is more than one page, in the
+Group header or the single agent title bar on mobile. The arrows have 44-pixel targets, with a
+visible page count and disabled endpoints. On touchscreens, swipe horizontally on the agent
 title area to page; buttons, vertical gestures and the terminal body keep their own behavior.
-Resizing keeps the focused Actor visible,
-or preserves the first visible Actor when no terminal has focus. Removing Actors displays a
+Resizing keeps the focused agent visible,
+or preserves the first visible agent when no terminal has focus. Removing agents displays a
 valid page without discarding the saved preference during loading.
-Indicators can point to waiting or stuck Actors on other pages without moving the current page.
+Indicators can point to waiting or stuck agents on other pages without moving the current page.
 
 Each visible terminal accepts input directly. Click its content to choose the keyboard target;
 the focused pane is outlined, and new output does not take focus. The bottom composer still
-sends Group messages, independently of terminal input. Maximize opens the existing Actor controls
+sends Group messages, independently of terminal input. Maximize opens the existing agent controls
 using the same terminal instance; close the expanded view to return to the grid. Escape and Tab
 remain terminal keys while the terminal has focus. Existing access and single-writer rules apply:
 a read-only user cannot type. Opening a view leaves any existing writer in control; use
@@ -104,39 +224,39 @@ Switching pages, Groups, or back to Messages keeps recently visited terminals an
 their connections in memory, including scrollback and selection. Each workbench
 retains up to **32 hidden terminals for five minutes** after leaving them; visible
 terminals do not count toward that limit. The oldest hidden views are released
-first, and background output does not extend their lifetime. Unvisited Actors are
+first, and background output does not extend their lifetime. Unvisited agents are
 not loaded in advance. Hidden terminals continue receiving output but cannot
 accept input, resize the remote terminal, or take control automatically. On return, a
 retained writer synchronizes the PTY with its visible dimensions, including when
 control returned while hidden. Another window can still use **Take control**. Expiry, a browser reload, or a replaced
-Actor may require a fresh terminal view; retention does not start or stop Actors.
+agent may require a fresh terminal view; retention does not start or stop agents.
 
-Each Actor title bar keeps its status dot, common terminal actions and maximize control together.
+Each agent title bar keeps its status dot, common terminal actions and maximize control together.
 Ordinary running/working states are available through the dot's label; stopped, waiting, stuck
 and terminal connection notices remain visible as short text, including in narrow panes.
-In narrow panes with pagination, the Actor name and notice occupy their own row above the
-page and terminal controls, so touch targets do not crowd out the Actor's identity.
+In narrow panes with pagination, the agent name and notice occupy their own row above the
+page and terminal controls, so touch targets do not crowd out the agent's identity.
 Use **More** for history, session, configuration, inbox and lifecycle actions. Unavailable
 actions are disabled; stopping and restarting use the same operations as the expanded view.
-Different Actors have independent pending-operation indicators.
+Different agents have independent pending-operation indicators.
 
-Once a retained view expires or is evicted, returning attaches to the Actor's current output;
-this never stops or restarts Actors. Actors without a TUI use their existing
-runtime activity display, and stopped Actors are explicitly identified. Hidden Group messages do
+Once a retained view expires or is evicted, returning attaches to the agent's current output;
+this never stops or restarts agents. Agents without a TUI use their existing
+runtime activity display, and stopped agents are explicitly identified. Hidden Group messages do
 not clear the message unread count or count as viewed for Voice suppression. Following a message
 source link returns to Messages and locates the original event.
 
-The Runtime Dock uses a thin violet-to-rose trailing arc for working Actors, rotating gently
-once every 3.6 seconds. Idle Actors have a quieter green ring, stopped Actors gray, and states
-needing attention rose. All rings keep the same size; reduced-motion preferences leave the working arc static. Hover or focus an Actor
+The Runtime Dock uses a thin violet-to-rose trailing arc for working agents, rotating gently
+once every 3.6 seconds. Idle agents have a quieter green ring, stopped agents gray, and states
+needing attention rose. All rings keep the same size; reduced-motion preferences leave the working arc static. Hover or focus an agent
 for its name and use the button's description for status details. No duration or progress is
 inferred from status timestamps. The upper-right envelope badge shows unread Mail from the
 daemon, including messages outside the loaded chat history. Browser delivery queues have a
 separate badge at the lower right; both badges appear only when their count is nonzero.
 
-The Runtime Dock's progress bubbles show the latest short live update for each Actor, with up to
-two Actors visible at once. Updates from the same Actor replace the previous excerpt. Open the
-Actor to inspect the complete output. Restoring a Group or reconnecting its activity stream
+The Runtime Dock's progress bubbles show the latest short live update for each agent, with up to
+two agents visible at once. Updates from the same agent replace the previous excerpt. Open the
+agent to inspect the complete output. Restoring a Group or reconnecting its activity stream
 restores history without replaying it as new bubbles; ordinary message unread indicators are
 independent of these brief progress previews. The same rules apply to every managed Runtime.
 
@@ -144,57 +264,192 @@ independent of these brief progress previews. The same rules apply to every mana
 
 Files and Presentation share one resizable sidebar with matching header controls. Each Group remembers its expanded width and Presentation density. Files always opens at the expanded width; its file draft survives switching to Presentation and back.
 
-Presentation keeps four fixed slots. New Groups open a compact button rail by default; existing saved layout and window/split preferences are preserved. Open a filled slot to read its content, and use the four slot buttons to switch without returning to the list. Empty slots open the pin flow. The expanded overview uses image thumbnails and compact titled entries for other resources, without starting interactive browser/PDF sessions or clearing update indicators.
+Presentation keeps four fixed slots. New Groups open a compact button rail by default. Open a filled slot to read it in the resource panel; empty slots open the pin flow. The expanded overview uses image thumbnails and compact titled entries for other resources, without starting interactive browser/PDF sessions or clearing update indicators.
 
-Collapse returns to the compact rail; closing the sidebar only hides it and keeps its contents. The expand button restores the remembered width and opens an available slot. Dragging to the minimum width also returns to compact slots. The divider supports arrow keys, and Enter toggles density. The viewer can still open in a larger window, and phones retain full-screen surfaces.
+Collapse returns to the compact rail; closing the sidebar only hides it and keeps its contents. Dragging to the minimum width also returns to compact slots. The divider supports arrow keys, and Enter toggles density.
+
+### Resource panel
+
+Workspace files (from **Files**, a path in a message, or a link inside a document) and
+Presentation slots (from the slot list or a message's reference) open as tabs in one panel.
+[Message attachments](#message-attachments) open as tabs when the desktop panel is visible.
+Opening something that is already open selects its tab. Each Group keeps its own tabs.
+Refreshing the same browser tab restores their order, selection, side-by-side layout, and
+whether the panel was open, collapsed, or maximized, when browser session storage is available.
+This also keeps the layout when you switch Groups and return.
+Renaming or moving a file or folder in **Files** takes its open tabs and unsaved edits along.
+
+Restoration saves resource references, not document contents or unsaved edits. Resources are read
+again with your current permissions. A restored message reference that is no longer available
+stays unavailable; it does not switch to the slot's current card. A request that fails offers a retry
+instead. Attachments not yet confirmed by the ledger are omitted. Reading positions and recently
+closed tabs are not saved across refreshes. This feature does not copy state between browser tabs or
+guarantee recovery after closing a tab.
+
+The panel sits in one of two places. Docked right, the default, it takes the right-hand column.
+Docked left, it covers the message list and keeps the composer. The arrow button in the panel's
+bar moves it, and this browser remembers the choice. Docked left, the panel belongs to the
+message view: the terminal view hides it and the message view brings it back. For an attachment
+tab shown alone, **View full screen** opens its preview over the page. With two resources shown side
+by side, or when viewing a workspace file or Presentation slot, **Maximize** covers the messages
+and the right column together. Press it again or Escape to restore. While the panel covers the
+messages, docked left or maximized, newly arrived messages stay unread, and the collapse key shows
+how many arrived. The resource button in the Group header shows how many tabs are open and opens
+or collapses the panel. An empty panel opens alongside the messages, where you can click an
+attachment to open it there. Escape collapses the panel only from its bar. Editors and PDF viewers
+keep their own Escape.
+
+When the tabs do not fit, the tab strip scrolls sideways, also with the mouse wheel. **All** lists every tab in order with a
+filter by name, path or sender, followed by **Recently closed**. Several tabs closed at once
+come back together, from that list or from the **Undo** notice that follows for eight seconds.
+Closing the last tab leaves the desktop panel open with **Recently closed** available inside it.
+If **Files** or **Presentation** is open in the right column, it takes that space again.
+Focus the tab strip and use the left and right arrow keys to select open tabs. Right-click a tab
+for **Close**, **Close others**, **Close tabs to the right** and **Close all**. **All** also offers
+**Close others** and **Close all**. Delete closes the selected tab.
+
+A file with unsaved edits never closes silently. Closing it asks whether to save, close
+without saving or cancel; closing several stops and offers to close only the saved ones.
+
+Switching between workspace text, Markdown or table tabs in a Group, each shown alone, returns to
+where you were reading, so two long documents can be read in turn; a file opened at a link's anchor
+starts there. A workspace PDF or video starts again from the beginning when you switch to another
+workspace file, and an HTML preview does not keep its scroll position. While a file is loading, or
+if it cannot be read, its tab says so rather than showing the previous file. Attachments you looked
+at most recently stay loaded, eight images and four other attachments; an older one loads again when
+you return to it, so a PDF's page, a video's position or a document's scroll may start over.
+Switching to another Group, or resizing the window between the phone and desktop layouts, loads the
+panel again: tabs stay, but reading positions and loaded attachments start over.
+
+**Side by side** shows two tabs next to each other, for comparing two documents or two pictures; on
+a phone they are stacked. It starts with the tab you are reading and the one you read before it, in
+tab order, or with the same tab on both sides when it is the only one open, and coming back to it
+finds the same pair while both are open. Each side's header names its tab and lists every open tab
+to show there instead; picking the other side's tab shows one document in two places, each side
+keeping its own position. The current side, marked in its header, is the one you last clicked or
+tabbed into (inside a page shown in a frame, such as a PDF in the browser's own viewer, click the
+header instead); a tab picked from the tab strip, **All**, a message or a link opens on it, and one
+the other side already shows makes that side current instead. A side keeps its place while it shows
+the same tab; a workspace file shown there again starts from the top, or at the anchor last followed
+there. Drag the divider to give one side more room, or move it with the arrow keys; a double click
+puts it back in the middle. Each side shows its resource as it reads: workspace files rendered or as
+text, with any unsaved edits, pictures, videos, PDFs and Presentation slots in their own viewers. To
+edit a file, leave **Side by side** with its key or Escape, and the current side's tab is shown
+alone. When both sides hold the same Presentation slot, its viewer stays on the current side and the
+other side says so.
+
+A Presentation slot has one viewer in the panel however many of its tabs are open, and switching
+to another tab and back does not reload it. A slot's own tab takes the title of the slot's current
+card; a tab opened from a message keeps the title it was referenced with. Closing a Presentation tab closes only your view;
+the shared slot stays as it is. **Open in window** in the viewer shows the slot in a larger
+window and collapses the panel. The panel and the window share a slot's interactive page: when
+the slot is published again with another address while that page is open, CCCC asks before
+replacing it, since someone may be working in it.
+
+On a phone the panel is a full-screen surface. **Back** returns to where you opened the
+resource from: the messages, the Files tree or the Presentation slots. **All** is where you
+close several tabs at once. To leave room for the Group title, the phone header has no resource
+button: the menu lists **Resources** with the number open, or, when every tab is closed, offers
+to reopen what was closed last.
+
+Git diffs from **Changes** still open over the messages rather than in the panel. Enlarged
+message diagrams, and previews opened from a link in a message, such as an image or video on
+another site or Markdown from `raw.githubusercontent.com`, still open over the page.
 
 ### Message search and settings
 
-The conversation's **Sender** menu lets you check one or more senders. Each Actor
+The conversation's **Sender** menu lets you check one or more senders. Each agent
 appears once; the current Foreman has a role label. Checked senders are combined
-with OR, and the message-type tabs apply alongside them. **User** matches messages
+with OR, and the tabs above the messages apply alongside them. **User** matches messages
 the user sent; the **User-related** tab also includes messages addressed to the user.
 Selections take effect immediately and the popup stays open for further choices.
 No checked senders means unrestricted. **Show all** and the sender's clear button
-remove only the sender condition; **All** resets only the message type. Each Group
-remembers the selected Actor identities in this browser, so changing the Foreman
+remove only the sender condition; **All** resets only the tab. Each Group
+remembers the selected sender identities in this browser, so changing the Foreman
 role does not retarget a selection. Older matching messages share one history
-cursor and remain available through pagination. A removed Actor's selected identity
+cursor and remain available through pagination. A removed agent's selected identity
 remains available to uncheck. Filtered history follows ledger append order and
 receives the same live read, reply and cancellation updates as the full conversation.
 Reconnect catch-up also covers messages beyond the bounded raw cache. Live arrivals
 are confirmed through a batched cursor read before joining the filtered rows, so
 an older replay cannot appear as the newest message. Failed reads keep a retry
 action; changing the filter or Group discards the departed view's pending reads.
+When a filtered list has earlier pages, **Load older results** above the messages reads another
+page, even if only a few messages are visible or a page has no matches. A short **All** list offers
+the same action when older messages remain.
+
+When **Waiting for you** has loaded no requests and a fresh count confirms that none are waiting,
+the view returns to **All**. Requests answered or withdrawn during the current visit remain listed
+until you leave it. A failed load or an unknown or stale count does not trigger the switch.
+
+**Pinned** keeps the messages you need to come back to. Choose **Pin message** in a message's menu
+and a small pin follows its time. The **Pinned** tab shows how many the Group has and lists them in
+full, in conversation order, each with **Show in chat**. A message unpinned there stays listed, so
+you can pin it again, until you leave the tab or come back to the page, when the list is read again.
+Pins belong to the Group and are kept by the daemon: everyone who uses the Group in this CCCC's Web
+UI shares them, on any browser or device, and each page reads them again when the Group opens or the
+page becomes visible. A read-only exhibit neither shows nor changes them, and agents do not receive
+them in messages or tools. A Group keeps up to 100 pins. When a pinned message can no longer be
+read, the tab says so and offers to remove its pin.
+
+Changing a filter keeps your place. If you were reading earlier messages, the message you were
+reading travels with you: the last one you clicked, tapped or reached with Tab while it remains on
+screen, or the one across the middle of the list once you move on. If the new view contains it, it
+stays at the same height, as far as the view can scroll. If not, the first other message that was on
+screen and that the new view contains stays at its height instead. If none was, the nearest loaded
+message from that part of the conversation takes its place, shown from its top and briefly
+outlined. Otherwise the view opens at its newest messages, and your place is kept for when you
+return. If you were following the latest messages, the new view follows them too, unless you clicked
+or tapped a message that it contains: that message then keeps its height. A list too short to
+scroll always counts as following, so clicking a message there is what carries it over. A view you
+only look at, without scrolling or interacting with its messages, leaves your place unchanged, so
+switching back returns exactly where you were. **Waiting for you** and **Pinned** keep a message
+from your screen only when they list it, and otherwise open at their newest message. Messages that
+are not loaded, such as older ones a filter has not reached yet, cannot be kept. A place is kept for up to
+30 minutes while the page stays open, not across a reload.
 
 Sending keeps the filters. If they hide the sent message, a confirmation offers
 **View message**, including cross-Group sends; the action returns to the originating
-Group even if you have switched Groups. **View context** on a filtered message opens its surrounding
-conversation; returning to the conversation restores the filters.
+Group even if you have switched Groups. In a filtered view, **Show in chat** opens a message with the
+messages around it in the whole conversation. It leads the bar beside the message header
+where the column has room for it, or follows the message's time on touch screens and in a
+narrower column. **Back to filtered conversation** restores the filters and returns to the
+place you were reading.
 
-Message search shows the current Group name and Actor display names. Enter or **Search** submits the keywords; changing a filter reruns the submitted query. Typing new keywords does not change existing highlights or pagination until you submit again. Initial guidance, loading, no matches and failed requests are separate states. **Open** returns to the message context; reply and copying the event ID remain available.
+Opening a message from a notification, a link or search shows it in the live conversation when it
+is already loaded and no filter is on; new messages keep arriving as usual. Otherwise **Viewing a
+message** shows it with the messages around it. Either way it opens just below the header and is
+held there briefly as the view settles, unless you scroll first; on a phone the Group list stays
+closed. Scrolling down past the end, or **Load newer messages**, loads the messages that follow,
+and scrolling on from the newest returns to the live conversation when no filter is on. Earlier
+messages cannot be loaded in that view. **Return to latest** at the top leaves it at any time, and
+the floating **Back to latest** button, when shown, also leaves it. With a filter on, the top
+button reads **Back to filtered conversation**, and both return to the filtered conversation.
 
-Settings keeps **This group** and **This instance** separate. Section forms share a plain work surface, while independent configurations and authorization states retain their own boundaries. Under **Branding**, save the product name explicitly; icon uploads and resets apply immediately. The product name changes the Web sidebar, sign-in screen and browser tab, not the instance name shown in Connect.
+Message search shows the current Group name and sender display names. Enter or **Search** submits the keywords; changing a filter reruns the submitted query. Typing new keywords does not change existing highlights or pagination until you submit again. Initial guidance, loading, no matches and failed requests are separate states. **Open** returns to the message context; reply and copying the event ID remain available.
+
+Settings keeps **This group** and **This instance** separate. The ⓘ beside the switch explains both scopes, including why **This instance** may be locked, and says so when no Group is open. Section forms share a plain work surface, while independent configurations and authorization states retain their own boundaries. Under **Branding**, save the product name explicitly; icon uploads and resets apply immediately. The product name changes the Web sidebar, sign-in screen and browser tab, not the instance name shown in Connect.
 
 Related fields use headings and spacing rather than nested cards. Section actions stay beside their heading when space allows and wrap on narrow screens. Settings help text follows the text-size preference. Switches support keyboard focus and Space, with a larger click/touch target around the compact track. These visual conventions do not change which settings save immediately or require a Save action.
 
 ### Workspace files
 
 Open **Files** in the Group header to browse the active workspace. The file tree and
-Presentation share the right-hand column. Opening a text file on desktop places its
-editor in the message area and keeps the composer available. Closing the editor returns
-to messages; covered messages do not count as viewed for unread tracking.
+Presentation share the right-hand column. A file you open goes into the
+[resource panel](#resource-panel) as a tab.
 
-Save with the toolbar button or `Ctrl+S` / `Cmd+S`. Unsaved edits survive closing and
-reopening files within the current Group, including internal symlinks to the same file.
-Save before leaving the workspace. Switching Groups or instances with unsaved file edits asks whether to stay or discard; refreshing or closing the page uses the browser’s unsaved-changes warning. Closing the file viewer retains its drafts while you stay in the same workspace. A scope change or loss of access initiated elsewhere still retires the old editor; drafts never authorize saving into another scope.
-Changing the active workspace clears the file view and its drafts; stale saves are rejected
-instead of writing into the newly selected workspace. If the file changed on disk since it
-was opened, saving reports a conflict. **Reload file** reads the latest contents from disk,
+Save with the toolbar button or `Ctrl+S` / `Cmd+S`. Unsaved edits remain available when you
+switch files or collapse the resource panel, including internal symlinks to the same file.
+Switching Groups or instances with unsaved file edits asks whether to stay or discard;
+refreshing or closing the page uses the browser's unsaved-changes warning. If the active
+workspace changes, drafts stay with their original directory in this page. A tab from another
+directory shows its unsaved text read-only so you can copy it; switch back to that directory
+to edit or save it. A save never writes the draft into the newly selected directory. If the file
+changed on disk since it was opened, saving reports a conflict. **Reload file** reads the latest contents from disk,
 including updated media at the same path. With unsaved edits, it asks before discarding them;
 canceling or a failed read keeps the draft. Edits made while the reload is waiting are also
 retained. Reload is unavailable during a save. This check does not lock out external editors
-or Actors.
+or agents.
 
 The tree shows workspace files by default, including untracked and Git-ignored files.
 Git's own root metadata directory remains hidden. Use **File browser options → Hide
@@ -250,7 +505,12 @@ replaced with another file's path.
 
 Select **Changes** next to **Files** to inspect the active workspace's Git changes.
 The list separates working-tree modifications, staged changes, conflicts and untracked
-items. Select a tracked change to see its diff in the main area; use **Unified** or
+items. A new folder is listed file by file, as code editors list it; it stays a single
+item when it holds a separate repository. It also stays one item when listing its files
+would exceed the time or size limit, and a note then says the list is incomplete. In
+Files, the contents of a new folder are marked untracked too. This also applies when the
+workspace itself is a new folder of its repository.
+Select a tracked change to see its diff in the main area; use **Unified** or
 **Side by side** when the viewer is wide enough. Untracked files open in Files,
 untracked folders reveal their contents, and conflicts open the current file for
 inspection. The view uses saved content; unsaved drafts remain intact when switching
@@ -258,7 +518,7 @@ views. **Refresh directory** refreshes the current Git view as well. Lists are r
 on entry and after local writes while visible, without periodic background scanning.
 
 Changes is read-only: CCCC does not stage, discard, commit or push on behalf of the
-user. These remain terminal operations because Actors may share the repository's
+user. These remain terminal operations because agents may share the repository's
 index. Large lists/diffs show an explicit limit; Git failures are not shown as a
 clean workspace. Phones retain their existing read-only Files behavior and can view
 Git changes in the same full-screen surface.
@@ -279,26 +539,37 @@ On phones, Files opens a read-only viewer. Binary files and files larger than 1 
 not editable here. Files stay within the active workspace, and exhibit mode does not
 expose this surface.
 
-Images open in the shared graphics viewer, including files larger than the text
-limit. Videos and audio use native browser controls, without autoplay. PDFs open
-in the browser's PDF viewer, with **Open in a new tab** and **Download file** available
-if inline viewing is disabled or unsupported. Native support depends on the browser
-and the file's encoding.
+Images open in the shared graphics viewer, including files larger than the text limit.
+Videos and audio use native browser controls, without autoplay, and pause when their
+view is hidden. PDFs open in the browser's PDF viewer, with **Open in a new tab** and
+**Download file** available if inline viewing is disabled or unsupported. Native support
+depends on the browser and the file's encoding. On a device whose main pointer is touch,
+such as a phone or tablet, and in a browser that reports no built-in PDF viewer, PDFs
+open in CCCC's own reader instead: the pages scroll, and **Fit**, **Zoom out** and
+**Zoom in** work as in the image viewer. The reader shows pages only: it cannot select
+or search text, follow the PDF's own links, fill its forms or open a file that requires
+a password. For those, download the file, or open it in a new tab unless CCCC is
+embedded through Connect.
 
 Markdown renders with tables and Mermaid diagrams. CSV and TSV files open as tables,
 including quoted cells and multiline values; the preview shows up to 200 rows and
 50 columns. Text-sized SVG, Markdown, CSV/TSV and HTML offer **View source** and
 **Preview**. Switching views preserves unsaved edits, and preview uses the current
-draft. The text/source limit remains 1 MiB. Downloads always contain the saved file.
+draft. The editor and the text view hold at most 1 MiB. HTML above that editing
+limit, up to 20 MiB, is read in full for **Preview**, while **View source** shows its
+first 1 MiB; the file stays read-only. Larger HTML shows its first 1 MiB as source
+only. Downloads always contain the saved file.
 
 HTML opens as a static, isolated document: scripts, forms, nested pages and linked
 stylesheets are disabled. Inline styles and workspace image/audio/video resources
-are supported; it is not a running website or application preview. Markdown and HTML
-resolve relative file links within the opened workspace and open them in Files.
+are supported; it is not a running website or application preview. Pages keep their
+own size and margins: wide slides stacked in a centered column start at the left and
+scroll sideways. Markdown and HTML resolve relative file links within the opened workspace and open them in Files.
 Section fragments such as `report.md#details` or `report.html#details` position the
 loaded preview at that section, including repeated same-file links. Positioning
-happens once per navigation; ordinary updates do not pull the reader back. PDF
-page fragments are passed to the browser viewer. HTML audio/video keep native
+happens once per navigation; ordinary updates do not pull the reader back. A PDF
+page fragment such as `paper.pdf#page=5` opens that page, in the browser's viewer or
+CCCC's reader. HTML audio/video keep native
 controls whether the URL is on the media element or a nested `source`.
 HTML does not load external resources. Workspace paths, including percent-encoded
 names, still undergo the same permission and scope checks. Root-relative document
@@ -316,9 +587,12 @@ establish an exemption or add a Cloudflare Stream subscription.
 
 Workspace images, expanded message images, Mermaid diagrams, Presentation images and enlarged
 quoted snapshots share a static graphics viewer. Use **Fit**, **100%**, **+** or
-**−** to change scale; dragging pans enlarged content and the wheel keeps native
-scrolling.
-Touch screens support pinch zoom. Focus the viewport for `+`/`−`, `0` (fit),
+**−** to change scale. **Fit** never enlarges a raster image past actual size; rendered diagrams
+and workspace SVG previews can grow to fill the view. Ctrl/⌘ + wheel and a trackpad or touch pinch zoom at the
+pointer; the plain wheel keeps native scrolling and dragging pans enlarged content. A click
+on the content switches between fit and actual size; on touch screens, double-tap.
+See [Message attachments](#message-attachments) for opening images and videos from a message.
+Focus the viewport for `+`/`−`, `0` (fit),
 `1` (actual size) and native arrow-key scrolling. Closing a modal restores focus
 to its opener. Regular message scrolling, PDF controls and interactive browser
 surfaces retain their own behavior. The workspace text editor is unchanged.
@@ -334,46 +608,169 @@ Switching to another slot or publication clears the previous resource and starts
 Workspace-linked PDF and HTML readers retain their current page, zoom and
 navigation state. Use **Refresh** to load edits from disk; publishing a new card
 also updates the reader. They do not reload on the automatic image/Markdown
-refresh timer.
+refresh timer. On touch devices and in browsers without a built-in PDF viewer, a
+PDF that this CCCC serves, such as a workspace file or an uploaded one, opens in
+CCCC's own reader, as for [workspace files](#workspace-files); a PDF from
+another site keeps the browser's viewer. The slot viewer has no download; for a
+PDF the reader cannot open, **Copy URL/path** copies its URL or workspace path.
 
-### Voice conversation (Experimental)
+### Chet global assistant (Experimental)
 
-The **Voice** control below the Group list is a global assistant entry, not a Group roster item.
-It has two stable actions: the main control always opens the Voice console, and the adjacent
-microphone/square control starts or stops live audio. The same meanings are preserved in the
-collapsed sidebar and active-call mobile bar. Settings, mute, and the Analyst terminal are not
-separate Dock actions.
+The **Chet** control below the Group list opens the global assistant, which is not a Group roster
+item. It shows Chet's pixel head, or an alert mark when something needs a look. The head blinks
+now and then and moves while Chet has work being sent, queued or carried out; with **Motion** off
+under Appearance, or the system's reduced-motion setting, it holds still. You can write a message
+without starting a voice call. Chet uses its configured, signed-in
+Runtime; if a Group is selected when you send, it is included as context, not as a permission boundary.
+The adjacent microphone/square control starts or stops live audio. Minimizing Chet does not stop its
+work or an active call. Sending text does not start a call. If a native Runtime combines that text
+with work already underway for a voice conversation or a background notification, the combined
+answer may also be returned through voice.
 
-The Voice console is one operational workspace. Call state, audio settings, mute, and Stop are in its
-top audio-control area. The conversation keeps up to 40 recent spoken entries from this call,
-updating streaming fragments with the final transcript. The display stays in this browser's memory
-until the next call or page reload. Investigations include a bounded recent excerpt so the Analyst
+Text sent through Chet's main input, observed voice transcripts and voice delegations, and their
+available work receipts and results are retained on the machine running CCCC as Chet's history. Drafts that have not
+been sent stay in this browser and are shared by tabs using the same Web address; editing the draft
+concurrently in two tabs can overwrite a change. A receipt means work was accepted, not that it
+finished; if the outcome cannot be confirmed, Chet says so and does not automatically replay it.
+Voice transcripts record what this browser received and can be incomplete. There is no history-clear
+action in this version.
+
+Spoken entries carry a voice icon instead of a text label, and Chet's spoken lines appear as lighter
+captions without the rule that marks its written results. A written result for a voice request has a
+quote icon, with an arrow, after its time; it expands the **Voice request**, Chet's task wording
+rather than a verbatim quotation of your speech. Adjacent saved Chet voice transcripts from the same call are
+grouped in an expandable row. The most recent loaded group for an active call starts open unless
+you change it; other groups show a preview. A folded group is marked if any transcript is unfinished
+or incomplete. While available, live transcripts and warnings that a transcript was not saved or
+its saving is unconfirmed appear outside these grouped rows. Voice transcripts and written results
+arrive independently, so their display order does not establish a one-to-one relationship.
+
+#### Messages from Groups
+
+A Group member can address Chet with `@chet` as the only recipient, using **Send** or
+**Send + Reply**; Mail is not available for Chet. In the Web UI, a CCCC administrator can choose
+`@chet` in a Group's recipient row. If a member's ID or title is `chet`, `@chet` is ambiguous and
+the send is refused. Chet's messages in a Group are labelled **Chet**, and a reply to an ordinary
+Chet message without other recipients goes back to Chet; replies to Chet's card answers are
+described under Unattended mode. Chet writes to a Group directly; it does not forward
+messages between Groups or send through Connect.
+
+A Group message to Chet appears in Chet's conversation with its sender, Group and time, and
+**Open in Group** opens it there. Its text is read from the Group when the conversation loads: a
+long message is shortened and attachments stay in the Group. If the Group or the message was
+removed, or the Group was re-created, the entry says the message is no longer available. Group
+messages that Chet can take up are queued as turns of their own, and Chet is instructed to answer
+questions and requests in the Group each came from, while an acknowledgement alone needs no reply;
+your typed or spoken requests go ahead of Group messages still
+waiting (on OpenCode, only while Chet is answering a Group message; see below), and a Group turn
+already running is not interrupted. Once Chet has finished, the entry
+links the reply it finds in the Group, which **View reply** opens, or says that no reply is seen
+yet; a reply in the Group does not show that the sender has read it. A Group message whose
+submission cannot be confirmed is not resent automatically. While the CCCC Web service is
+stopped, messages to Chet wait in their Groups and are taken up when it starts again; while
+Chet's Runtime is unavailable, they wait as well. A message whose sender has left the Group or
+been replaced by the time it is taken up can remain only in its Group. A message in Chet's
+conversation is checked again just before it is handed to Chet: if its sender has left the Group
+or been replaced, or the Group was removed or re-created, the entry says it was not handed to
+Chet.
+
+When Chet runs on OpenCode, a Group message cannot be handed over while messages from your own
+conversation with Chet are still waiting for Chet to take them up. A Group message that waits
+only behind work Chet is already doing simply runs after it. If, ten minutes after the Group
+message was sent, it is still held back by your messages that Chet has not taken up, it is not
+sent: the message in the Group says it was not sent to Chet and did not run, and can be sent
+again, and Chet's history says the same; a member who sent it also gets a notice. Your
+conversation with Chet carries on, and neither notice includes its text or status. Once a Group
+message is queued with Chet, messages you send to Chet go after it, unless Chet is answering
+another Group message at the time.
+
+Group messages enter Chet's usual session, which can also hold your own conversation with Chet
+and other Groups' content. Chet is instructed not to carry that into a Group and to pass requests
+for work outside a Group on to you rather than do them. These are instructions to the model, not
+isolation or a permission limit: a model or Runtime can still disregard them.
+
+While Chet's conversation is closed, its entry shows a dot when history holds something new: a
+Group message, an answer, or a request that did not start. Opening the conversation in this
+browser clears it. In a browser where the conversation has never been opened, any such Group
+message, answer or request already in history counts as new.
+
+During a call, a message Chet sends to a Group while the call is recording counts as a call-time
+handoff, so the member's reply can be read aloud. The recording state approximates this; it does not
+show which input started Chet's turn. A request you typed during the call can therefore be
+included, and a handoff Chet sends after the call has ended is not read aloud, although a
+member's reply to it can still be taken up by Chet when the CCCC Web service and Chet's Runtime
+are available.
+
+#### Unattended mode
+
+The **Unattended** switch in Chet's title bar is for times you are away. It applies to every Group on
+this CCCC instance and is off by default; while it is on, Chet's entry below the Group list says
+**Unattended on**. Only a CCCC administrator can turn it on or off.
+
+While it is on, each new message a member of a Group on this instance sends to you with **Send**
+or **Send + Reply** still reaches you, with your usual notifications, and a copy also goes to
+Chet. Messages from other instances and IM are not copied. Chet can reply to the member, answer
+question cards for you, or point out a better approach or a risk; it is instructed to leave to you
+what only you can do, such as signing in or paying, and to say so. Only messages sent after the
+switch was turned on are copied; turning it off and on again starts a new period, and earlier
+cards are not answered.
+
+A card Chet answered reads **Chet chose A for you** (or **Chet answered for you**), and Chet's
+message is labelled as an answer on your behalf. A card counts as answered once Chet answers it,
+everywhere you see your pending replies. To correct Chet, reply to its answer: by default the reply
+goes to the member who asked. By default, a member's reply to Chet's answer comes to you, and to
+Chet while the switch is on.
+
+Each copy also appears in Chet's conversation, marked as a message to you that was copied; when a
+reply from Chet is recorded in the Group, a link to it is shown there. What Chet writes in its
+conversation stays there; only the messages it sends to the Group appear in the Group. While the
+switch is on, Chet's entry below the Group list also asks for attention when CCCC finds that
+Chet's Runtime is not ready, for example not installed or waiting for setup.
+
+Turning the switch off stops new copies. Just before each copy is handed to Chet, CCCC checks
+again: a copy that waits there is not handed over, and its entry in Chet's history says it did not start. A copy
+that has already passed that check, because it is being handed over or Chet's Runtime has taken it,
+can still reach Chet, which may then send an ordinary reply to the member, although it can no
+longer answer the card. Replies and answers already written stay in their threads.
+
+Copies use Chet's usual session, Runtime and account, so they use its quota, queue behind one
+another, and can see your own conversation with Chet; Chet is instructed not to carry that into a
+Group, which is an instruction to the model, not isolation. Chet runs in the CCCC Web service, which
+must be running for copies to be handled; the browser can be closed. Chet can misjudge, and members
+may act on its answers before you correct them.
+
+During a call, investigations include a bounded recent excerpt so Chet
 can understand follow-ups and retain your limits; that excerpt becomes part of its retained conversation.
 Voice is instructed to prepare a self-contained task and clarify essential ambiguity before handing it off.
 Handoffs follow the user's current request language and preserve technical identifiers and explicit
 output-language requirements; an already-clear request can keep its original wording.
-The collapsible right pane embeds the selected Voice Analyst
-runtime's writable TUI; its work status is independent of the live audio status. On desktop, drag
+The collapsible **Activity** pane shows the selected Chet Runtime's writable terminal, or its
+structured output for runtimes without one. Work status is independent of live audio. On desktop, drag
 the divider to adjust the pane widths; focus it and use Left/Right or Home/End for keyboard control.
 Double-click the divider to restore the default ratio. This browser remembers the chosen ratio,
 while both panes retain a readable minimum width. Resizing does not reconnect the terminal. On narrow screens,
-**Conversation** and **Voice Analyst** switch between the two panes.
+**Conversation** and **Activity** switch between the two panes.
 Settings replace the console body inside the same panel; call controls stay available.
 **Back to conversation** or Escape returns to the console without disconnecting its terminal.
-Analyst drafts survive tab changes and panel minimization until explicitly saved or discarded.
+Chet settings drafts survive tab changes and panel minimization until explicitly saved or discarded.
 The minimize control keeps the call running; **Stop voice** ends live audio.
-Its settings tabs are **Call preferences**, **Message notifications**, and **Voice Analyst**.
+Its settings tabs are **Call preferences**, **Message notifications**, and **Runtime**.
 Microphone and supported speaker choices are shared with Voice Secretary in the global audio section.
 Call preferences contain the voice service and speaking voice, alongside response detail
 (concise / standard / detailed) and speaking style (natural / direct / patient). Expression defaults
-save automatically for the instance and apply to the next call, without restarting the Analyst.
-Detail applies to incoming Actor notifications as well as answers. Voice is instructed to identify
+save automatically for the instance and apply to the next call, without restarting Chet.
+Detail applies to incoming agent notifications as well as answers. Voice is instructed to identify
 each notification's Group and sender. Detailed asks it to retain substantive findings, numbers,
-conditions, qualifications and next steps in natural speech; raw tool traces remain in the Analyst terminal.
-Choose **Codex Voice** or **Grok Voice** in the console title or **Call preferences**. The service
+conditions, qualifications and next steps in natural speech; raw tool traces remain in Chet's terminal.
+For completed investigations, concise and standard ask Voice to prefer a brief spoken account over
+reading a long formatted result aloud; detailed keeps the requested detail. Your spoken request can
+override these defaults. These are instructions to the voice provider, so its output may still differ
+from the saved result.
+Choose **Codex Voice** or **Grok Voice** beside the input on desktop, or in **Call preferences**.
+On a phone the choices are in settings. The service
 and its speaking voice are fixed during a call; end it before changing them. This browser remembers
 the selected service and each service's voice independently. Microphone and speaker choices stay
-shared with Voice Secretary. Switching service does not change the independent Analyst runtime or
+shared with Voice Secretary. Switching service does not change the independent Chet runtime or
 its retained conversation. Spoken instructions can override expression defaults.
 
 On the CCCC host, **Codex Voice** uses `codex login`; **Grok Voice** uses a first-party Grok Build
@@ -384,7 +781,7 @@ manager, including its credential lock, and gives the browser only a short-lived
 Grok uses `grok-voice-3.0`, direct browser WebSocket audio and server voice-activity detection. The
 browser resamples its microphone to 24 kHz PCM and plays output through the shared selected speaker.
 An interrupted response stops locally at once. An investigation tool acknowledges reception after
-CCCC accepts it; the actual result returns later through the same global Analyst.
+CCCC accepts it; the actual result returns later through the same global Chet.
 
 The host advertises each service's supported voices and default; Web has no second voice allowlist.
 Codex offers 25 voices, including Himari, Miko, Rindo and Rivage, with Cove as its default. Grok
@@ -400,13 +797,13 @@ Notifications are off for every Group by default. In **Message notifications**, 
 or **All chat messages** for the Groups you want to hear from; enabling a scope starts at the
 current ledger boundary, not old history. Explicit replies to work requested through Voice are
 followed independently of subscriptions. Both acknowledgements and later replies are retained,
-and only the expected Actor's reply to the exact source request counts as its response.
+and only the expected agent's reply to the exact source request counts as its response.
 
 **Do not repeat messages already viewed in Web** is on by default. It uses exact source IDs after
 at least 1.5 seconds of stable, fully visible, expanded display in a focused foreground page.
 Hidden, covered, folded, partially visible and virtual-list overscan rows do not count. This does
-not change Actor Mail unread state or reply obligations. A viewed explicit reply still updates
-the Analyst's context, but does not trigger a duplicate reading. A user's explicit request to
+not change agent Mail unread state or reply obligations. A viewed explicit reply still updates
+Chet's context, but does not trigger a duplicate reading. A user's explicit request to
 read or explain a message still takes priority.
 
 The console's compact **Message sources** section opens the original chat without stopping voice.
@@ -416,44 +813,45 @@ expand the section to see whether it is waiting for the connection or a notifica
 Updates continue reaching Voice during conversation; Voice handles speaking and interruptions.
 An unfinished earlier turn cannot block later delivery. If the connection stops accepting updates,
 the call stops with an explanation; restarting voice can deliver known unsent notifications while
-the Analyst retains its context. Each source also shows the associated result's delivery state. Fully skipped output identifies
+Chet retains its context. Each source also shows the associated result's delivery state. Fully skipped output identifies
 whether it was already viewed, excluded by policy, or unavailable at the submission check. The
 recorded skip reason survives later preference changes. “Submitted” describes delivery to Voice,
 not completed playback or proof of hearing. The experimental provider can omit details or fail to
-resume a report after an interruption even after receiving its context; the Analyst and source links
+resume a report after an interruption even after receiving its context; Chet and source links
 remain available to inspect it. Delivery uncertainty can remain for earlier updates
 while new ones proceed. If notification consumption pauses, a call-wide notice explains that source
-messages are retained and starting a new call retries consumption; voice and Analyst state remain
+messages are retained and starting a new call retries consumption; voice and Chet state remain
 separate.
 If a result combines viewed and unviewed background messages, Voice can point
 to the remaining sources rather than inventing a separable summary. Attachments are identified
 without opening or uploading their contents. Notification text is source data, not authorization
-for an Actor action.
+for an agent action.
 
 Delivery references and cursors survive restarts in protected instance state. Unsent browser
 output can return on a later call only when it is positively known not to have been submitted;
 an uncertain handoff is retained and is not automatically replayed. Available results are returned
 in their recorded completion order, including catch-up on a later call. All new notification routes
 require trusted-local/admin access and are unavailable to scoped users and Exhibit viewers.
-Remote administrator tokens are rechecked during calls, notification handoff and Analyst terminal
+Remote administrator tokens are rechecked during calls, notification handoff and Chet's terminal
 input/output. Revoking or downgrading one closes even an idle terminal connection within the next
 authorization poll (one second) and stops new Voice work on that connection. An unfinished update from a replaced
-Analyst remains unconfirmed rather than being silently executed again by its replacement.
+Chet session remains unconfirmed rather than being silently executed again by its replacement.
 
-The two visible roles are one product flow:
+The text and voice interfaces use the same assistant:
 
 - **Realtime Voice** owns the low-latency spoken conversation, interruption, and clarification.
-- **Voice Analyst** is the backing managed agent session. It handles file inspection, tools, current CCCC facts,
-  and substantial analysis, then returns useful progress and the final result to the same spoken
-  conversation. Under local user authority it can list all Groups and query an explicitly named Group.
-  Codex, Claude Code, Grok Build, OpenCode, Kilo and Antigravity (official ACP) are the currently admitted Analyst runtimes.
+- **Chet** uses a managed Runtime session for file inspection, tools, current CCCC facts,
+  and substantial analysis. Voice delegations can return progress and results to the spoken
+  conversation. Under local user authority the Runtime has tools to list Groups and query an explicitly named Group;
+  this first slice does not yet provide the planned cross-Group summary and hand-off receipts.
+  See [Runtimes](runtimes.md) for supported modes and their validation limits.
 
-CCCC starts the Analyst in one stable neutral directory at
+CCCC starts Chet in one stable neutral directory at
 `CCCC_HOME/state/codex_voice/analyst-workdir/`. It is not a repository, Working Group, implicit MCP
 target, or authorization boundary. Voice therefore starts without a selected Group or attached
-repository and never changes identity when the sidebar selection changes. The Analyst's CCCC MCP
+repository and never changes identity when the sidebar selection changes. Chet's CCCC MCP
 session has global user authority and the full tool catalog, but it receives no default `group_id`;
-every Group, Actor, task, ledger, or repository operation must resolve and pass an explicit target.
+every Group, agent, task, ledger, or repository operation must resolve and pass an explicit target.
 Repository modification remains work for the target Group's Foreman or peer rather than work rooted
 in the neutral Voice directory.
 
@@ -465,11 +863,11 @@ The same byte limit applies to assistant and persona modes. CCCC rejects oversiz
 instead of truncating it. This is a local input size limit, not a provider token limit;
 token counts vary with the text and model, and provider limits still apply.
 CCCC holds this context unchanged for that call. In assistant mode, it includes the context
-in Realtime startup instructions and every Voice Analyst delegation, and uses a context-aware greeting.
+in Realtime startup instructions and every assistant delegation, and uses a context-aware greeting.
 Replaying the same client session and SDP with different context returns busy rather
 than silently reusing the old call. Omitting the field preserves the global Voice behavior.
 Context is not authentication, a selected CCCC Group, a tool permission, or an isolated
-Analyst session. The host application remains responsible for authorization, business
+Chet session. The host application remains responsible for authorization, business
 records and any session reset needed when changing subjects. Do not include credentials.
 
 For host-defined roleplay, set `application_context.mode` to `"persona"`:
@@ -490,20 +888,20 @@ For host-defined roleplay, set `application_context.mode` to `"persona"`:
 The default mode is `"assistant"`; explicitly specifying it behaves like omitting it.
 In persona mode CCCC supplies only the host's instructions, without its assistant role,
 routing instructions or saved expression preferences. It does not resolve, launch, attach
-or reset a Voice Analyst. Incoming delegation events are ignored; Actor/Group notifications
-are neither consumed nor spoken. An existing Analyst and its pending notifications remain
+or reset Chet's Runtime. Incoming delegation events are ignored; agent/Group notifications
+are neither consumed nor spoken. An existing Chet session and its pending notifications remain
 available for later assistant calls. Authorization checks, the single-call microphone lease,
 heartbeats and disconnect cleanup still apply. The host decides the opening behavior in
 its instructions; CCCC sends only a neutral call-start cue.
 
 Check `GET /api/v1/codex_voice/calls/active` first: `readiness.supported_modes` advertises
 `["assistant", "persona"]`. For persona, check `realtime_credentials_available`; do not
-require `analyst_runtime_available` or configure/reset an Analyst. Credential presence is
+require `analyst_runtime_available` or configure/reset Chet. Credential presence is
 not a guarantee of provider availability. Old servers reject the nested `mode` field;
 never retry a rejected persona request by silently dropping it. Start and active responses
 include `call.mode`; persona has `call.analyst_generation: null` and the start response has
 `analyst: null`. The active endpoint's top-level `analyst` still describes the independently
-managed global Analyst, if one exists. A different mode with the same client session ID
+managed global Chet session, if one exists. A different mode with the same client session ID
 returns busy, just like a changed context or SDP. Stop the old call before changing modes.
 
 **Experimental provider boundary:** persona startup omits the quicksilver `delegation`
@@ -515,38 +913,41 @@ The host instructions do not override the provider's own system rules.
 
 CCCC reads the existing Codex credential only in the native process that creates the provider call;
 the browser receives the WebRTC answer and bounded session events, not the credential. Use the
-console header to mute the microphone, resume browser-blocked playback, or stop the call. The
-Analyst uses the same trusted-local YOLO boundary as the corresponding CCCC Actor runtime. Its
+console to mute the microphone, resume browser-blocked playback, or stop the call.
+Chet uses the configured Runtime under the same local user authority as CCCC. Its
 authentication and model provider are independent from the Realtime login: the default launch
 inherits the normal Codex configuration, while Custom or Runtime Profile settings can select Codex,
 Claude Code, Grok, OpenCode, Kilo, or official ACP for Antigravity, Copilot, Devin and Cursor,
 and configure that runtime's provider home, model provider, or API key without
 changing the Realtime credential path. The two sides exchange only
-delegations, progress, and results through the CCCC controller.
+delegations, progress, and results through the CCCC controller. The Runtime's actual permission
+behavior follows its selected command and mode.
 
-For a pure ACP Analyst, the structured console offers **manual investigations** instead
-of a terminal. Submit a task or follow-up; busy work uses the visible FIFO and does not
-steer the current task immediately. Cancel stops the current investigation and queued
-inputs, and remains available while the next investigation awaits provider admission.
-During a call owned by this page, submission binds
-the task to that exact assistant call and its settled result returns to Realtime.
-Outside a call, results stay in the Analyst pane. Ending the original call never moves
-queued or late results into the next one. The pane pairs task text with queued, working,
+For a pure ACP Runtime, **Activity** shows structured output instead of a terminal.
+Chet's main input remains available; busy ACP work uses a visible FIFO. Cancel stops the
+current task and queued inputs, including while provider admission is pending. When the
+current task is your own request, Group messages waiting for Chet stay queued; when it is a
+Group message, Cancel clears everything queued.
+While this page owns an assistant-mode call, Activity also offers a task input whose
+settled result is returned to that exact call. Ending the original call does not retarget
+its queued or late results to a replacement call. If the call ends with text still in
+that input, the draft stays visible. Tasks entered through this separate input appear in
+Activity, not in Chet's persistent conversation history. Activity pairs task text with queued, working,
 completed, failed or cancelled outcomes, retaining the eight most recent settled rows
-and any unsettled/awaiting-output work for the current Analyst generation. Enter adds
+and any unsettled/awaiting-output work for the current Runtime generation. Enter adds
 a newline; Ctrl/Command+Enter submits. Failed submissions preserve the draft and original
-call scope; editing starts a new explicit submission. Realtime context delivery is not
-proof that the result was spoken. Independent native-TUI tasks are not automatically
-shared with Voice; existing voice-delegated tasks retain their current result routing.
-The Analyst **Runtime Setup** uses the same Custom / Runtime Profile model as Actor editing. Custom
+call scope; editing starts a new explicit submission. Returning context to Realtime is
+not proof that the result was spoken. Independent native-terminal tasks do not
+automatically become voice requests.
+Chet's **Runtime** settings use the same Custom / Runtime Profile model as agent editing. Custom
 mode accepts a command for any supported runtime (including Kilo's official Windows npm entrypoint), supported provider/model options, and
 write-only private environment values, and it can save that complete configuration as a reusable
 Runtime Profile without revealing secrets to Web. Runtime Profile mode resolves a compatible
 Profile's command and private environment from the shared profile store;
-the Actor-only submit field does not alter the Voice host. Historical Profiles with a string command are accepted
+the agent-only submit field does not alter the Voice host. Historical Profiles with a string command are accepted
 and normalized to the canonical argument array when next saved.
 
-Antigravity is supported only in official ACP mode and shares the Actor adapter and separate
+Antigravity is supported only in official ACP mode and shares the agent adapter and separate
 CCCC-managed Google login. It shows structured progress, results, queued input and one-time
 permission requests instead of a terminal. An existing Antigravity TUI Profile is not eligible.
 Run `cccc setup --runtime antigravity --runtime-mode acp --login` once before using it.
@@ -555,7 +956,8 @@ native `agy` availability and its login do not satisfy this prerequisite. Readin
 download the component or start authentication. An explicit
 `--model` is reapplied on resume; `--dangerously-skip-permissions` selects unrestricted operation,
 otherwise permissions require Allow once / Deny. ACP serializes additional inputs in a visible
-queue of up to 32; cancellation clears current and queued inputs. Other Runtime input behavior
+queue of up to 32; cancellation clears current and queued inputs, except Group messages
+waiting behind your own request. Other Runtime input behavior
 and Realtime credentials stay unchanged.
 
 For Codex, CCCC removes conflicting host flags and pins app-server,
@@ -564,13 +966,15 @@ For Codex, CCCC removes conflicting host flags and pins app-server,
 Grok, CCCC accepts a direct root command with supported global provider/model options, then owns the
 private leader socket, ACP controller, native TUI attachment, YOLO policy, workspace, and per-session
 MCP binding. Grok subcommands, wrappers, prompt tails, and user-owned topology/session flags are
-rejected rather than routed through a second PTY path. For OpenCode and Kilo, CCCC owns the ACP process,
-generation-scoped authenticated loopback backend, session/load boundary, one-time permission policy,
-per-session MCP injection, and native `opencode attach` or `kilo attach` command. It preserves supported model, agent,
-pure-mode, and logging choices. Kilo's official Windows npm entrypoint uses Node and the installed
-launcher for both ACP and TUI. Custom wrappers, subcommands, prompt tails, and user-owned topology
-or session flags likewise fail explicitly. CCCC validates the live ACP and authenticated backend
-behavior during startup instead of maintaining a separate legacy-version compatibility branch.
+rejected rather than routed through a second PTY path. OpenCode V2 uses a private `serve --stdio` HTTP/SSE backend with its native
+`--server --session` TUI. Kilo uses its own ACP process and `kilo attach`.
+CCCC owns the session, authenticated loopback backend, one-time permissions
+and scoped MCP injection. Supported model, agent and logging choices remain
+configurable; pure mode is Kilo-only. Kilo's official Windows npm entrypoint
+uses Node and the installed launcher. Custom wrappers, subcommands, prompt tails,
+and user-owned topology or session flags fail explicitly. OpenCode requires
+V2 2.1.4 or newer; old V1 receipts and history are retained for explicit migration
+or a deliberate New session.
 These CCCC-owned values cannot be overridden.
 
 For Claude Code, CCCC requires both the launcher and background worker to report version 2.1.259
@@ -585,23 +989,23 @@ values in the job record or Web API. Claude wrappers, renamed binaries, prompt
 tails, print mode, remote-control mode, and user-owned background/session
 arguments fail explicitly; there is no Hook, PTY-paste, or `claude -p` fallback.
 
-For runtimes with a native terminal, the controller and TUI are separate processes but one configured Analyst. Codex's
+For runtimes with a native terminal, the controller and TUI are separate processes in one configured Chet session. Codex's
 app-server and remote TUI receive the same executable, model, Profile, supported `-c` overrides, YOLO
 policy, and private environment. Claude's Agent View controller, transcript follower, and native TUI
 share one background session and one effective launch identity. Grok's leader, ACP client, and TUI share one resolved provider
 configuration, private environment, and exact session; CCCC adds topology arguments only to the
-processes that accept them. OpenCode and Kilo each use a stdio ACP controller and authenticated native TUI attach sharing
-one provider backend and exact session. CCCC injects the scoped MCP binding when it creates the
+processes that accept them. OpenCode V2 uses its HTTP/SSE controller; Kilo uses ACP. Both attach a native TUI to
+one authenticated provider backend and exact session. CCCC injects the scoped MCP binding when it creates the
 managed session,
 so the model reached from either client has the same CCCC tools. Opening the embedded terminal
-therefore observes and controls the existing Analyst session instead of starting another model
+therefore observes and controls the existing Chet session instead of starting another model
 conversation.
 
 If Realtime Voice reports a provider error, its error code is shown separately
-from Analyst failures. Browser and server diagnostics retain only bounded
+from Chet failures. Browser and server diagnostics retain only bounded
 code/type/event/parameter identifiers and the call generation. Provider explanations
 can quote conversation content or credentials and are not logged. A stopped
-audio call does not discard the warm Analyst session. Provider diagnostics do
+audio call does not discard the warm Chet session. Provider diagnostics do
 not retry requests or change the existing disconnect policy.
 
 For startup or later connection failures, keep the CCCC and Runtime versions
@@ -615,13 +1019,13 @@ identify which process or network component caused the closure. A later
 failure. A still-running child PID does not prove that its session is usable.
 These reports omit raw errors, credentials and conversation content.
 
-Ordinary Codex, Claude Code, Grok, OpenCode, and Kilo Actors use the same runtime-specific managed adapter
-as Voice Analyst and always attach the Runtime's native writable TUI. Actor controllers
-are bound to a concrete Group and Actor MCP identity, while Voice Analyst uses the global user
+Ordinary Codex, Claude Code, Grok, OpenCode, and Kilo agents use the same runtime-specific managed adapter
+as Chet and always attach the Runtime's native writable TUI. Agent controllers
+are bound to a concrete Group and agent MCP identity, while Chet uses the global user
 identity and its neutral workspace. These are separate roles over the same adapter, not divergent
-session paths. Actor messages enter the native TUI immediately, leaving queue-versus-steer
-behavior to the receiving Runtime. Realtime Voice decides whether a spoken request needs an Analyst,
-but it does not schedule the Analyst process. CCCC attempts each correlated delegation immediately:
+session paths. Agent messages enter the native TUI immediately, leaving queue-versus-steer
+behavior to the receiving Runtime. Realtime Voice decides whether a spoken request needs Chet,
+but it does not schedule Chet's process. CCCC attempts each correlated delegation immediately:
 Codex can append an explicit in-flight correction through exact-turn steering, while the other
 admitted Runtimes receive the exact input through their verified native terminal and own whether it
 steers or queues. Busy state alone never drops or delays a delegation for these runtimes. Antigravity ACP has no native busy-input surface, so its additional inputs instead enter the visible bounded queue described above.
@@ -631,8 +1035,8 @@ session instead of falling back to a second execution path.
 Custom non-secret settings live in `settings.yaml`; custom private values live in
 `CCCC_HOME/state/secrets/codex_voice_analyst.json`. Profile secrets remain owned by the Runtime
 Profile store, and Web receives key names only. Applying a valid setting while idle restarts the
-managed host and resumes the same materialized Analyst session. Runtime settings cannot change while
-Realtime Voice is connected. If the Analyst still has active or queued work after voice stops, Web
+managed host and resumes the same materialized Chet session. Runtime settings cannot change while
+Realtime Voice is connected. If Chet still has active or queued work after voice stops, Web
 shows that distinct state and asks once before stopping the old managed host, discarding the unfinished
 result, and applying the new settings. An effective Runtime Profile
 command/environment change replaces the warm host at the next voice start while retaining the same
@@ -645,7 +1049,7 @@ work explicitly discarded before the switch cannot be recovered. Browser-local a
 to the next call.
 
 User requests and source-message updates enter the same Runtime admission path immediately; the
-Runtime owns steer/queue behavior. Analyst results are delivered to Realtime in order, including
+Runtime owns steer/queue behavior. Results intended for Realtime are delivered in order, including
 while someone is speaking. Realtime owns speech timing and yielding to interruptions; missing
 speech-turn events cannot block later result delivery. Adjacent fragments of the same result
 are combined without losing text and split to the provider limit before sending. Delivery waits
@@ -659,39 +1063,41 @@ If checking still fails, the call stops with an explanation and positively unsen
 available for a later call. A successfully suppressed result stays suppressed if its check is retried.
 If Realtime does not confirm receipt within 30 seconds, the console shows a notice without
 disconnecting or replaying the update. Results exceeding the 32 KiB Voice limit are reported
-explicitly: use the Analyst terminal for the full output or ask for a shorter summary. Neither
-notice stops the Analyst. Provider receipts confirm receipt, not that every detail was spoken.
+explicitly: use Chet's terminal for the full output or ask for a shorter summary. Neither
+notice stops Chet. Provider receipts confirm receipt, not that every detail was spoken.
 
-Realtime Call and Voice Analyst have separate lifecycles. Stopping voice disconnects browser audio
-and releases the microphone lease, but keeps the Analyst warm. Ongoing Analyst or linked
-Actor work continues. Completed Analyst results are retained without waking audio. Actor replies
-arriving while voice is off stay in the ledger and are consumed on the next explicit call; they do
-not start notification model work in the background. A later call reuses the warm
-Analyst. The console embeds the selected runtime's genuine TUI for that same Analyst session using the existing
-terminal transport; it stays available after the call stops and does not create an Actor or a second
-Analyst. Codex creates its resumable rollout lazily, so its terminal appears when the first real
+Realtime Call and the Chet Runtime have separate lifecycles. Stopping voice disconnects browser audio
+and releases the microphone lease, but keeps Chet warm. Ongoing Chet or linked
+Agent work continues. Completed Chet results are retained without waking audio. Agent replies
+arriving while voice is off stay in the Group's chat and ledger, and do not start notification model
+work in the background. Chet looks for correlated replies only during an assistant call, and handling
+them is not guaranteed. A later call reuses the warm
+Chet session. If the selected Runtime supports a native TUI, Activity embeds it for that same
+session; otherwise Activity shows structured output. It stays available after the call stops and does
+not create an agent or a second session. Codex creates its resumable rollout lazily, so its terminal appears when the first real
 investigation starts; Claude, Grok, OpenCode, and Kilo managed TUIs can attach as soon as their sessions are ready. CCCC does not
-create a token-consuming placeholder task. **New Analyst session** is the explicit reset action and is
+create a token-consuming placeholder task. **New session** is the explicit reset action and is
 available only after the call stops. Raw local paths, provider session IDs, loopback endpoints, and
 external terminal commands are deliberately not part of the product surface.
 
 The embedded native TUI remains writable while managed work is active. The receiving Runtime owns
 whether new terminal input steers the current turn or queues for the next one; CCCC registers exact
 Voice input before writing it and uses the Runtime's authoritative echo to associate the result with
-the correct delegation. OpenCode Analyst results remain available to Realtime Voice when the provider omits a
-live ACP prompt echo: CCCC acknowledges the request from the matching user message on OpenCode's
-authenticated backend stream, then uses the ACP response as the exact completion fence. A completed
-Voice turn with no result is reported as failed instead of silently returning an empty answer.
+the correct delegation. OpenCode V2 Chet results follow consumed inbox IDs, model output and terminal
+execution events on the same ordered backend stream. Prompt admission alone is
+not completion. Exact-turn interruption is unavailable in V2's public API; use
+the native terminal to interrupt, or stop the owning session. A completed Voice
+turn with no result is reported as failed instead of silently returning an empty answer.
 
-The session manager keeps at most one voice call and one warm Voice Analyst per interactive
+The session manager keeps at most one voice call and one warm Chet Runtime per interactive
 Web host. The normal launcher permits one such Web process per `CCCC_HOME`, while the call also uses
 the existing daemon-owned global recording lease shared with Voice Secretary. Hiding the details
 panel, switching Groups, or leaving the tab in the background does not stop or retarget the call.
 Application-level heartbeats keep the otherwise idle event WebSocket alive through ordinary proxies.
-Explicit cross-Group CCCC queries do not retarget the neutral Analyst workspace. Use **Stop voice**
+Explicit cross-Group CCCC queries do not retarget the neutral Chet workspace. Use **Stop voice**
 to disconnect explicitly.
 Closing or reloading the owning page or losing its browser transport ends only the live call and
-releases the recording lease. Stopping Web also stops the warm Analyst process and embedded TUI while
+releases the recording lease. Stopping Web also stops the warm Chet process and embedded TUI while
 retaining only the exact materialized neutral-workspace thread receipt in global runtime state. The
 next call attempts to resume that thread; a legacy repository-bound receipt is deliberately replaced
 with a fresh neutral-workspace thread and a visible migration warning. A resume failure likewise
@@ -730,8 +1136,12 @@ intend to restart the dedicated browser; its saved profile and delivery target a
 - Hidden tabs release their group event streams immediately. Returning to the tab reconnects and
   catches up from the last event cursor, so several open tabs do not exhaust the browser's
   per-origin connection pool.
+- A visible tab keeps its streams. When its window regains focus or the tab comes back into view,
+  the page checks whether the stream has gone quiet or fallen behind the server's latest event. If
+  so, it starts reconnecting, and a reconnect waiting out its delay starts immediately; a
+  successful catch-up can retrieve missed messages.
 - Hover-prefetched group data is reused when that group is selected; group bootstrap does not issue
-  a second actors read for the same transition.
+  a second agents read for the same transition.
 - Production Web responses negotiate Brotli or gzip compression. Voice Secretary code and locale
   resources are loaded on demand instead of being part of every initial page load.
 
@@ -753,7 +1163,7 @@ remain separate from **This instance** settings.
 ## Managing Agents
 
 Use the **+** in the Agent bar near the composer to add an Agent. Choose an
-installed Runtime, set its Actor ID and review the configuration before adding it.
+installed Runtime, set its agent ID and review the configuration before adding it.
 The Runtime selector reports detection on the machine running CCCC, rather than
 the browser device. Use **Check again** after installing a Runtime; a failed check
 is shown separately from a Runtime that was not detected. Detection does not
@@ -765,21 +1175,56 @@ Open an existing Agent to inspect its Runtime and use its available lifecycle
 actions. The Group status button controls the whole Group's enabled Agents and
 message delivery; pausing delivery does not stop work already in progress.
 
+DeepSeek has a **DeepSeek connection** form in its Runtime settings. Enter an
+API base URL, the exact model ID supplied by the service, and its API key, then
+use **Save & Restart**. Without a saved value the Agent uses `DEEPSEEK_BASE_URL`
+and `DEEPSEEK_MODEL` from the environment it starts with (its own environment
+settings first, then the daemon's), and otherwise `https://api.deepseek.com` and
+`deepseek-flash`; the model field also suggests `deepseek-v4-pro`, and
+compatible gateways may use their own model IDs. A URL ending in
+`/chat/completions` is converted to its base URL. The same fields are available
+when creating an Agent, and saving it as a Runtime Profile includes these
+values. All three fields use the existing write-only private environment store:
+saved values are marked **Configured**, blank fields preserve them, and a new
+value replaces the saved one. **Use default** removes the Agent's saved address
+or model; **Remove this key** removes a saved key. The launch command remains
+available under advanced details. Restarting from the Agent inspector does not
+commit an open configuration draft. A missing DeepSeek credential, or an
+authentication failure CCCC recognizes, pauses automatic delivery until an
+explicit launch or restart; pending messages are tried again after a successful
+start. Custom gateways must support DeepSeek streaming Chat Completions and tool
+calls. DeepSeek's URL, model, and key explanations are under **Connection
+help**, collapsed by default.
+
 Switch to **Terminals** for the paged multi-Agent view, or open one Agent's
 inspector from its entry. Runtime restart and session-reset actions have different
 semantics; use the action's explanation before discarding a session.
+Use the Runtime terminal's native scrolling to review earlier output.
 
 ### Claude workspace trust
 
-If managed Claude startup requires workspace trust, the Actor terminal opens
-Claude's own interactive prompt. Only Claude records the approval. Once its
-configuration changes, CCCC can retry the managed launch. Stopping, removing, or
-restarting the Actor cancels the pending recovery; an in-flight launch is cleaned
-up instead of attaching after stop. Group shutdown also includes pending trust
-prompts that do not yet have a managed session.
+On first launch, managed Claude may ask you to trust its workspace or acknowledge
+its bypass-permissions disclaimer. The existing agent terminal stays available,
+and agent details show a persistent **Awaiting your confirmation in the terminal**
+notice. Make the choice yourself in that terminal and keep it open. CCCC does not
+answer the prompt or grant approval for you.
+
+CCCC treats changes to Claude's confirmation files as a reason to retry the managed
+Agent View launch. It reconnects and resumes message delivery only after that
+retry succeeds; the waiting notice clears when the updated runtime state arrives.
+If you decline or exit the prompt, the agent stays stopped for the current daemon
+run. Use **Launch** or **Relaunch** to retry explicitly.
+Stopping the Group and then starting it again also retries its stopped agents;
+scheduled wake-ups do not reopen a declined confirmation during that daemon run.
+Restarting the daemon can attempt to restore agents in a running Group again;
+it does not grant confirmation on your behalf.
+
+Stopping, removing, or restarting the agent cancels the pending recovery; an
+in-flight launch is cleaned up instead of attaching after stop. Group shutdown
+also includes pending confirmation prompts that do not yet have a managed session.
 
 Trust-record monitoring uses the configured Claude directory and the home
-directory, falling back from `HOME` to `USERPROFILE` on Windows in both Actor
+directory, falling back from `HOME` to `USERPROFILE` on Windows in both agent
 environment overrides and the inherited environment.
 
 ## Messaging
@@ -817,10 +1262,15 @@ Reply recipients are temporary: canceling or sending a reply restores the normal
 A temporary cross-group destination does not replace the local Group's remembered recipients;
 after sending, routing returns to the local Group. Reloading the page clears this in-memory state.
 
+If a selected recipient is no longer available, its chip says so and can be removed. Adding another
+ordinary recipient does not silently remove it; resolve the unavailable target before sending the
+message. A reply to a former Group member keeps that member as an unavailable recipient rather than
+silently choosing someone else.
+
 Broadcasts (`@all` and `@peers`, including the Group's default broadcast target) leave
-disabled Actors stopped and deliver to enabled recipients. To wake a disabled Actor,
+disabled agents stopped and deliver to enabled recipients. To wake a disabled agent,
 address it explicitly; `@foreman` also wakes the coordinator. An explicit target still
-wakes when combined with a broadcast. Mail leaves disabled Actors stopped.
+wakes when combined with a broadcast. Mail leaves disabled agents stopped.
 
 Messages larger than 64 KiB after UTF-8 encoding are sent as UTF-8 text attachments for
 same-group and CCCC Connect reply targets. Local cross-group text remains inline because its two
@@ -835,17 +1285,72 @@ attachments, and delivery options remain those currently shown in the composer.
 
 ### Message attachments
 
-Click an image or a video's first frame to open its preview. Video frames load
-when their message comes into view; playback starts when you open the player.
-The player uses native browser controls and pauses other message videos.
-Escape or Close returns to the message. Downloads remain available when the
-browser cannot decode a video. Confirmed uploads play and download from the
-Group's stored blob, so they remain available after the local upload preview expires.
+Click an image, a video's first frame, or a previewable file name. It opens in the desktop
+[resource panel](#resource-panel) while that panel is visible. When the panel is collapsed or
+you are on a phone, the attachment opens in a full-screen preview. **View full screen** on an
+attachment tab opens a new preview, starting a PDF at its first page or a video at the beginning.
+Close the preview to return to the original tab and its reading or playback position.
+
+Use the previous and next buttons to browse the previewable attachments in the same message in
+order. On a wide screen the buttons flank the preview. On a narrow screen they sit beneath it.
+The left and right arrow keys also work when focus is on the preview's controls. Within a PDF
+or HTML frame, use the viewer's own controls. On desktop, **Open in a resource tab** opens
+the attachment shown in the preview in a resource tab.
+
+Video frames load when their message comes into view. Click a video to start playback, or
+press Play after reaching it with the previous and next buttons. The player uses native browser
+controls and pauses other message videos. A video also pauses when its tab is no longer in front.
+**Show in messages** in the panel returns to the message. Downloads remain available when the
+browser cannot decode a video. Confirmed uploads play and download from the Group's stored blob,
+so they remain available after the local upload preview expires.
+
+Markdown, HTML, PDF and common text files have a download button beside their name. Markdown
+renders by default. **View source** and **Preview** switch
+between its unchanged text and rendered view without downloading it again. Text and logs stay
+plain. HTML uses the same controls and opens as a static document: scripts, forms and external
+resources are disabled; inline styles and embedded images are supported. Links can be opened
+explicitly. An attachment has no directory for relative images, stylesheets or sibling files;
+it is not a running website or application preview. Download the original when you need those.
+A long Markdown or text file shows its first 1 MiB, and so does the source view of a long
+HTML file. HTML up to 20 MiB renders in full; larger HTML shows its first 1 MiB as source
+only. As in Files, wide slides stacked in a centered column start at the left and scroll
+sideways.
+PDF uses the browser's own viewer, or CCCC's reader on touch devices and
+in browsers without one, as for [workspace files](#workspace-files). Where neither can show it,
+download it or, unless CCCC is embedded through Connect, open it in a new tab. Other files stay
+downloads.
+
+Audio files keep their download chip and gain a play button. A message has one player,
+which appears below its files; choosing another file switches to it, so you can compare
+several clips. Starting audio pauses other message audio and video, and starting a video
+pauses audio. Playback stops if the message scrolls far out of view or you change Group.
+Which formats play depends on the browser. A file that fails to play shows a note; you can
+try it again, and its download remains available.
+
+### Links and file paths in messages
+
+An address that starts with `http://`, `https://` or `www.` is a link. Links to an image, audio
+or video file open a page-level preview and load only when you click them. Whether they show
+depends on the source and the browser, so the preview offers a way to open the original in a new
+tab. Markdown, static HTML and text from `raw.githubusercontent.com` or `gist.githubusercontent.com` also
+open there, as do full links to this site's Group files, with a download. Other links, including
+a PDF on another site, open in a new tab. Ctrl, ⌘, Shift and the middle button keep their usual
+behavior.
+
+A path with a directory, such as `docs/guide/web-ui.md`, `out/全片.mp4` or `src/main.rs:12`, opens a
+supported file in the resource panel, as it is now rather than when the message was sent, and so does a
+Markdown link to a file in the workspace. Names may use letters and digits of any language. Put a
+path in inline code when a name has spaces or symbols other than `.`, `-` and `_`, or when a relative
+path starts with a folder named in letters other than A to Z; otherwise it may be missed or only
+partly marked.
+Paths outside the Group's active scope stay plain text, and so do paths in a relayed message or a message
+from another scope, where the same path would mean a different file.
 
 ### Message diagrams
 
 In Chat and Inbox messages, a fenced code block labeled `mermaid` is rendered as a diagram after
-the message is complete. Use **View source** to inspect or copy the original definition. Invalid or
+the message is complete. Markdown opened in the Files preview or shown in Presentation renders these
+blocks the same way. Use **View source** to inspect or copy the original definition. Invalid or
 oversized diagrams fall back to the source automatically; other Markdown surfaces continue to show
 Mermaid fences as ordinary code blocks. Flowchart image shapes (`@{ img: ... }`) also remain as
 source because Mermaid waits on browser image decoding before completing the diagram and can
@@ -855,48 +1360,169 @@ small diagrams expand to the available canvas while large diagrams remain scroll
 
 ### @Mentions
 
-Type `@` to trigger autocomplete:
+Type `@` for an Actor or `#` for a Group at the cursor, including in the middle of a message.
+Choosing a suggestion keeps the text after the cursor. Chosen references are highlighted in the
+composer. Displayed messages highlight references to the Group's current agents and selectors and to
+the Groups a message refers to; a removed agent or an old name may no longer be recognized. A
+reference to an agent takes the colour of that agent's name in message headers, a Group the link
+colour, and selectors such as `@all` stay neutral. Links, common email addresses, and code keep their
+normal formatting.
+Message-body references provide context rather than changing the recipient controls. A `#` Group
+reference is a delegation hint, not a direct cross-Group send.
 
-- `@all` - Broadcast to all agents; use for announcements or urgent shared constraints, not default task dispatch
-- `@foreman` - Ask the coordinator to plan, route, or summarize work
-- `@peers` - Send to all peers
-- `@<actor_id>` - Send to a specific agent for targeted work
+Available Actor references include:
+
+- `@all` - Reference all agents; reserve broadcasts for announcements or urgent shared constraints
+- `@foreman` - Reference the coordinator for planning, routing, or a summary
+- `@peers` - Reference all peers
+- `@<actor_id>` - Reference a specific agent for targeted work
 
 For concrete delegated work that needs an owner, done criterion, evidence, handoff, or acceptance trail, use task-backed delegation. In chat it appears as a linked task chip; ordinary messages remain the right path for quick questions and discussion.
 
 ### Replying
 
-Click the reply icon on a message to quote and reply.
+Choose **Reply** on a message to quote it and reply in the composer.
+
+**Quick reply**, in the **More** menu of a message from one of the Group's agents, sends a ready
+reply at once without the composer, under the caption **Quick reply · sends immediately**. It
+goes to that agent alone, quotes the message, and a notice confirms it. Chet's messages,
+messages from or sent to another Group or CCCC instance and questions answered in their own card
+have no quick replies; reply to them in the composer. When CCCC cannot confirm that a quick reply
+was sent, the notice says so and offers **Retry**; check the messages first, because a retry can
+send the reply twice.
+
+The menu lists your quick replies in the order you saved them. A new list starts with four
+default replies, **Agree, go ahead**, **Explain why**, **Try another way** and **Give me
+choices**, each led by an emoji. Manage the list in **Settings › This instance › Quick Replies**:
+add, edit, reorder or delete up to 24 replies, the default ones included, each with a name and a
+text that is sent exactly as written, then **Save**. A default reply's name or text that you
+leave unchanged follows the interface language; one you change stays as written in every
+language, and the reply is shown without its emoji. **Restore default** puts a changed default
+reply back as it was, and a deleted one can be brought back from the same page: it returns at
+the end of the list, as its default, without changing the other replies. If the list was saved
+from another window or device in the meantime, your edits stay on screen and **Reload** replaces
+them with the saved list.
+
+Each time you open the menu or the template list, it reads your replies again and shows a change
+saved on another device once that read succeeds; if the read fails, it keeps what it showed.
+Before the first read succeeds, neither offers a reply; if that read fails, they say so, and
+opening them again tries again.
+
+To start from a reply and edit it first, use **Insert a template** next to **Attach file** in
+the composer. Pick one of your quick replies, filtering by name if you like, and its text is
+inserted at the cursor, replacing any selected text. The list opens above the input, near where
+you are typing, or across the input on a phone, and each row shows the name and the first
+non-empty line of the text. **Manage templates** at the bottom of the list opens the settings
+page.
+
+The daemon keeps your quick replies for each signed-in user: browsers and phones signed in as the
+same user see the same replies, and a browser on this computer that is not signed in has its own.
 
 ## Project Context
 
 Open **Project Context** from the clipboard button in the Group header. The
 header identifies the Group being viewed.
 
-A single navigation row opens **Tasks**, **AGENTS.md**, **Agent State**,
-**Coordination log**, or **Skills**. On narrow screens, scroll the row horizontally;
+A single navigation row opens **Tasks**, **AGENTS.md**, **Agent State**, or
+**Skills**. On narrow screens, scroll the row horizontally;
 keyboard users can move focus with Left/Right or Home/End and activate with
-Enter/Space. Switching sections retains summary/file drafts and task filters.
+Enter/Space. Switching sections retains brief and file drafts as well as task filters.
 
 - **Tasks** is the default section. The goal, current focus and warnings stay
-  visible above the board. Expand **Working summary** for background and
-  constraints, or use Edit directly. The disclosure stays open while editing.
-  The board retains Planned, Active and Done columns, including empty drop targets.
-  Search and attention filters narrow the board. Open a task for requirements,
-  steps, handoffs and completion details. Missing requirements or closeout records
-  describe record completeness; they do not change an existing task's status.
+  visible above the board, except while editing, when the form holds them.
+  Expand **Coordination brief** for the project background and constraints, or
+  use Edit directly. The disclosure stays open while editing.
+  While there are tasks to show, Planned, Active and Done stay as columns, empty
+  ones included, so each remains a drop target; when there are none, or none
+  match the search and attention filters, the board says so instead. Dragging a
+  card to a column moves the task there; **Restore** on an archived card returns
+  it to the status it had before it was archived. A parent card shows how many of
+  its direct, non-archived subtasks are done, even when filters or paging hide
+  some of them. Subtask progress never completes the parent. Each card shows how
+  long ago the task last changed, by this device's clock, and a Planned or Active
+  card without a summary shows its first open checklist item. Done and archived
+  cards no longer show blocking, waiting or handoff marks; reopening the task
+  shows them again. A Done card whose checklist still has open items says how
+  many remain. While a search or filter is active, the board says how many tasks
+  match. The filter buttons count every task, so they leave out their counts
+  while a search or assignee filter narrows the board. While searching, a card
+  whose match is not near the start of its title or summary quotes the matched
+  words from its title, notes, outcome or a handoff the card does not show; the
+  quote can repeat words the card already shows. On phone-width screens, where
+  the columns stack, Active comes first.
+
+  Opening a task shows its editor: title, status, assignee, priority and waiting
+  on first, then the outcome, checklist, notes and subtasks, with **Add subtask**.
+  Parent, handoff, blocking tasks and task type are under **Advanced details**.
+  The outcome, notes and checklist items grow with their text, so a long record
+  scrolls with the editor and long items are not cut off. Text taller than
+  10,000 pixels scrolls inside its own box instead.
+  A checklist item in progress shows as partly ticked, and any other status an
+  agent set is shown beside the item and kept until the item is ticked. Moving a
+  task to Done needs no particular notes; a done task without an outcome only
+  gets a suggestion to add one. Task type requirements describe how complete the
+  record is; they never block a change. Escape closes the editor and keeps
+  Project Context open.
+
+  Saving sends only the fields you changed, and only onto the version you
+  opened. If the task has changed since you opened it, the save is refused and
+  your edits stay in the editor to copy before you reload the latest version; an
+  editor without edits follows such changes by itself. When a save cannot be
+  confirmed, the editor reads the task to tell whether it went through, and
+  saving again never applies it twice. A task that no longer exists keeps your
+  edits in its editor until you close it. If creating a task cannot be
+  confirmed, creating it again unchanged from the same form finishes without
+  making a second one; a closed form or a reloaded page has no such guarantee.
+  **Delete** is offered only for a task that never left Planned,
+  together with its unexecuted subtasks; for other tasks the editor says why,
+  and archiving is the alternative. A deletion is refused, deleting nothing, if
+  any of it changed after you confirmed.
+
+  Above the board, **Tasks | Backlog** switches to the project's backlog, and
+  each Group keeps the view you left it on in this browser. The backlog is a
+  Markdown file in the Group's project folder for long-lived topics and ideas;
+  tasks made from a topic track the work on it. It stays an ordinary file: CCCC
+  reads and edits it in place, never exports or commits it, and any editor can
+  change it too. A Group without a project folder has no backlog. Until a file is
+  chosen, the view offers to create `BACKLOG.md`, which in a Git repository can
+  be listed in the clone's local exclude file so `git add -A` leaves it out
+  (`.gitignore` is not changed), or to use an existing file. Tasks work without
+  one.
+
+  `##` headings are sections, in your own names and order; only a section named
+  exactly `Closed` holds finished topics. `###` headings are topics, and headings
+  inside a topic use `####` or deeper. A topic is a row like a task's, with its
+  linked tasks under the title; open the row to read the topic, or a linked task
+  to open that task. **Create task…** makes a Planned task from it, or opens
+  the topic's unfinished task if it has one. **Edit**, **Move to…** and
+  **Close…** change the topic; closing asks for a one-line outcome, adds it with
+  the date and moves the topic to Closed, where **Reopen…** moves it back. The
+  first change here gives a topic a hidden ID comment in its heading, so it can
+  be renamed or moved and stay linked; task IDs are never written into the file.
+
+  A task made from a topic shows the topic's title in its editor. **Update the
+  entry…** takes the task's outcome to the topic, as a dated paragraph or by
+  closing it. **Put back in the backlog** adds the outcome to the topic, or saves
+  a task from no topic as a new topic and links them, then asks whether to
+  archive the task. Finishing a task never closes its topic.
+
+  Each change applies only to the file as this page read it. If the file changed
+  elsewhere, nothing is written and your text stays; reload and save again. A
+  draft whose topic itself changed is kept to copy, never written over the
+  change. The backlog is read when Project Context opens and again when shown
+  after a change made through CCCC; edits from another editor appear on
+  **Reload**. The read-only exhibit page has no backlog.
 - **AGENTS.md** views and edits the file in the current workspace root, showing
   its actual path. A missing file can be created explicitly; existing documents
   are not renamed, merged, or overwritten as part of setup. Each runtime controls
   instruction discovery and precedence. Saving does not reload running sessions;
-  the optional team notification asks relevant Actors to re-read the file.
-  This editor does not represent all instruction files loaded by every Actor.
-  Web Model and Dots Actors can read files through `cccc_file` when needed.
+  the optional team notification asks relevant agents to re-read the file.
+  This editor does not represent all instruction files loaded by every agent.
+  Web Model and Dots agents can read files through `cccc_file` when needed.
 - **Agent State** shows the latest saved reports, including their timestamps and
   staleness. Focus, next action and blockers remain visible. Expand working context
   or recovery cues when needed. A task named in a report does not prove that its
   Runtime is currently working on it.
-- **Coordination log** has a dedicated page for recent decisions and handoffs.
   Viewing repository instructions or records does not keep a task board beneath them.
 - **Skills** shows self-evolving candidates originating in this Group. Instance
   capability governance has a wider scope; the two views do not replace each other.
@@ -905,25 +1531,118 @@ Enter/Space. Switching sections retains summary/file drafts and task filters.
 
 Open settings from **Settings and more** in the header:
 
+### System notifications
+
+Use **Settings → This instance → Notifications** to enable notifications in
+each browser or installed app where you want them. This is available in the
+private Web UI, not exhibit mode. Keep the CCCC Web service running; closing
+the CCCC page does not stop the service on your server. While requests wait
+for you in a Group, and this browser could show notifications for your account
+but they are not on yet, its messages page also offers them above the message
+box: **Turn on…** opens this settings page, and **Not now** hides the offer in
+that browser. No offer appears when the browser cannot use notifications, when
+they are blocked, when the server cannot send them, or when their state cannot
+be confirmed.
+
+1. Open CCCC over HTTPS, or use localhost on the same computer. On iPhone or
+   iPad, first add CCCC to the Home Screen and open it from there; Web Push
+   requires iOS or iPadOS 16.4 or later. See [WebKit's setup guidance](https://webkit.org/blog/13878/web-push-for-web-apps-on-ios-and-ipados/).
+2. Select **Enable notifications** and allow notifications when the browser
+   asks. If **Finish enabling** appears, select it to complete the subscription.
+3. Check that the page reports notifications enabled. To turn them off for
+   this browser, return to the same page and select **Disable notifications**.
+   This works even when the server cannot be reached: the browser stops
+   receiving them, and the server forgets the subscription once its next
+   notification is refused. Signing out of this browser in **Web Access** also
+   asks the server to stop notifying it for that account.
+
+On desktop, Chrome and Edge need a browser process to remain running. On
+Windows, Edge can keep running after the last window closes if background mode
+is enabled in `edge://settings/system`; see [Microsoft's Edge documentation](https://learn.microsoft.com/en-us/deployedge/microsoft-edge-browser-policies/backgroundmodeenabled).
+Whether Chrome can remain running in the background depends on its version and
+management settings.
+For macOS, Safari supports receiving Web Push while Safari is quit on supported
+systems; see [WebKit's platform requirements](https://webkit.org/blog/12945/meet-web-push/).
+Browser settings and operating-system notification permissions also affect delivery.
+
+Notifications are for new messages explicitly addressed to the user. Requests
+already waiting when notifications are enabled remain in **Waiting for you**;
+they are not sent again. Events written while the Web service is stopped are
+not replayed; a sender restart or handover can also leave a gap. During a
+temporary push-service failure, up to 10 unanswered
+requests per browser are retried while the service runs; older requests may
+be dropped. The push service and device may also delay or discard notifications.
+Check **Waiting for you** if a notification does not open its request. On
+Safari 18.5 or later for Mac, and in iPhone or iPad Home Screen apps on iOS 18.4
+or later, opening a notification tries to load CCCC at its message; in a Home
+Screen app this can reload the open page, and unsent text in it is then lost.
+Message previews may be visible on the lock screen. The server stores a private
+signing key and subscription secrets in `CCCC_HOME`, so keep it accessible only
+to trusted accounts; on Windows file access depends on the directory's
+permissions.
+
+If the sender is starting or unavailable, select **Try again** after the Web
+service starts and check its logs if the status persists. If the browser blocks
+notifications, allow them in browser or device settings. A saved subscription
+that is not connected to the current account can be removed or enabled again
+from this page.
+
 ### Copy Groups
 
 Use **Copy Groups** when you need to duplicate, migrate, or back up a working group.
 
-- **Export group copy** downloads a zip containing durable CCCC group state: ledger history, actors, memory, attachments, automation, and group settings.
-- The copy package does **not** include the workspace repository/project files. Copy or clone the workspace separately, then choose the workspace root during import.
-- System credentials, browser sessions, provider auth, and live runtime state are excluded. The package still contains user content such as ledger history, memory, and attachments; treat it as sensitive. Imported actors are stopped and the imported group starts idle.
+- **Export group copy** downloads a zip containing durable CCCC group state: ledger history, agents, memory, attachments, automation, and group settings.
+- The copy package does **not** include the workspace repository/project files. Copy or clone the workspace separately, then choose the workspace root during import. The folder chooser can also create an empty directory if needed.
+- System credentials, browser sessions, provider auth, and live runtime state are excluded. The package still contains user content such as ledger history, memory, and attachments; treat it as sensitive. Imported agents are stopped and the imported group starts idle.
 - If a group id already exists, import creates a new copy instead of replacing the existing group.
+- Pins are not copied: the copied group starts without any. The pinned messages themselves are in its history.
 
 ### Automation
 
-- **Built-in Automation**: Configure bounded Mail/reply notices and collaboration health loops such as actor idle alerts, keepalive, silence checks, and help nudges.
+Open a Group's menu in the sidebar and choose **Automation**, or open **Settings and
+more**, choose **All settings**, select **This group** and open **Automation**.
+
+Each rule shows its last run and its next planned run in your browser's local time,
+as of when the page opened; saving or reopening the page refreshes them. The last run
+appears once the rule has run and created its notification, marked when the run came
+from **Run now**;
+runs from before this version are not shown. Instead of a next time, a rule shows why
+it will not run: a paused or stopped Group runs no automation, and a Group set to idle
+does not run the built-in stand-up. Resuming a Group restarts the interval and
+recurring clocks, so the next run can move. A recurring rule saved in another time zone
+shows that zone, and editing it keeps the zone. A schedule the daily, weekly and
+monthly patterns cannot express shows as written; it stays as it is until you pick one
+of those patterns.
+
+**Run now** sends a reminder rule's notification once, without waiting for its
+schedule. It runs the saved rule, so save your changes first; it also works on a rule
+that is off. It does not count toward the maximum number of runs and does not change
+the schedule, so a scheduled run may still follow soon after. A paused or stopped Group has
+to be resumed first. The notification may wake its recipients and use model credits.
+If the page cannot tell whether the run went out, it says so and does not try again:
+reopen Automation and check the last run before running the rule again. An unchanged last
+run does not prove that nothing went out.
+
+- **Stand-up**: The built-in example is off by default. Its default schedule reminds the foreman at
+  two-hour intervals to review whether work serves the user's current goals and outstanding
+  requests; where waiting, rework, duplication, unclear handoffs or misunderstandings cause
+  friction and whether the team fits the work; whether repeated user concerns have been addressed
+  and adopted improvements have helped; and whether there is a better way to collaborate. For a
+  question that needs a deeper look, it asks the foreman to mark it `Review:` in a related
+  optimization task, or in a new planned one that authorizes no change, and to suggest a team
+  review rather than run one. It asks for a brief report when the user requests one and otherwise
+  for silence when nothing needs attention. The notification may wake an agent and use model
+  credits; you can edit its schedule, recipients and snippet to fit your team.
 - **Rules**: Create scheduled reminders with interval / recurring schedule / one-time schedule.
+  Repeating reminders can have an optional maximum number of runs; leave it blank for no limit.
+  The list shows progress and completed rules. Editing the limit keeps the count; removing it
+  resets the count, so adding a new limit later starts from zero.
 - **Actions**:
   - `Send Reminder` (normal reminder delivery)
   - `Set Group Status` (operational, one-time only)
-  - `Control Actor Runtimes` (operational, one-time only)
+  - `Control Agent Runtimes` (operational, one-time only)
 - **Snippets**: Reusable message templates managed alongside rules.
-- **One-time behavior**: One-time rules auto-complete after firing, then can be cleaned up from completed list.
+- **One-time behavior**: A one-time rule completes and turns off after it fires, and can then be cleared from the completed list. A one-time rule whose time passed while the Group was paused or stopped does not run late, and it may also show as completed without having sent anything.
 
 ### IM Bridge
 
@@ -931,23 +1650,19 @@ Configure Telegram, Slack, Discord, Feishu, DingTalk, WeCom, or [Mattermost](./i
 
 ### Group Space
 
-Configure provider-backed shared memory per group:
-
-- Provider credential (masked metadata only)
-- Health check
-- Binding (`remote_space_id`, optional auto-create)
-- `Sync Now` two-way reconcile button:
-  - local `repo/space/` resources -> provider,
-  - provider source/artifact projection -> local `repo/space/`
-- Ingest/query/jobs controls
+Connect the provider account and bind the Group's work and memory notebooks.
+The Web page shows a connection summary; source ingestion, queries and jobs use
+agent-facing tools or the CLI. The provider-backed memory notebook is separate from the former
+local Group memory files; CCCC no longer automatically uploads those files. Automatic two-way
+synchronization is retired.
 
 For end-to-end setup details, see: `Group Space + NotebookLM`.
 
 ### Theme
 
-Switch between Light, Dark, or Automatic theme. Automatic uses light mode from 07:00 to 19:00 in the browser's local time zone and dark mode otherwise.
+Switch between Light, Dark, or Auto theme. Auto follows the light or dark setting of your system.
 
-Dark mode uses charcoal surfaces with lighter panels and visible borders. Input outlines and keyboard focus are stronger than ordinary section dividers. Text size also scales side-panel titles, file paths and settings labels; terminal text keeps its own sizing.
+Both themes use the same pixel-screen look: light mode sets dark ink on a pale screen, dark mode light ink on a dark screen. Surfaces are separated by thin rules rather than shadows, and keyboard focus shows a dashed outline. **Body font** under Appearance offers **Sans**, the default, which sets message text in IBM Plex Sans while message headers, controls and code stay monospace; **Mono**, which sets most text in monospace; and **Pixel**, a pixel font. Text size also scales side-panel titles, file paths and settings labels; terminal text keeps its own sizing.
 
 ## Mobile Usage
 
@@ -969,7 +1684,7 @@ CCCC_WEB_HOST=0.0.0.0 cccc
 ```
 
 This keeps localhost access working while also letting other devices on the same network open `http://YOUR_LAN_IP:8848/ui/`.
-The native launcher also honors the binding saved in **Settings > Web Access**, including the 0.4.35 `settings.yaml` during migration. Explicit `--host` / `--port` flags still take precedence.
+The native launcher also honors the binding saved in **Settings > This instance > Web Access**, including the 0.4.35 `settings.yaml` during migration. Explicit `--host` / `--port` flags still take precedence.
 
 If CCCC is running inside WSL2's default NAT networking, this is the exception: `0.0.0.0` only opens the port inside the Linux VM. For true LAN access from other devices, enable WSL mirrored networking or add a Windows `netsh interface portproxy` rule plus matching firewall allow.
 
@@ -993,7 +1708,7 @@ when the reconstructed browser-facing origin is loopback. Unsafe writes and WebS
 carry the exact same loopback Origin; non-local proxy client addresses are rejected. This local
 principal is never persisted and is not valid through LAN, Reach, a public URL, or a reverse proxy.
 
-Before exposing the Web UI beyond localhost, first create an **Admin Access Token** in **Settings > Web Access**. With no administrator token, non-local clients receive only the UI shell and health/session guidance; protected APIs and business WebSockets remain locked, while direct loopback access keeps the passwordless local principal described above. Direct local setup no longer requires copying a bootstrap code. Linking your
+Before exposing the Web UI beyond localhost, first create an **Admin Access Token** in **Settings > This instance > Web Access**. With no administrator token, non-local clients receive only the UI shell and health/session guidance; protected APIs and business WebSockets remain locked, while direct loopback access keeps the passwordless local principal described above. Direct local setup no longer requires copying a bootstrap code. Linking your
 account initializes an administrator Token if needed; completing that flow from
 the verified localhost Web page also signs that browser in. Enabling hosted Remote
 Access from that local page covers installations linked before this automatic
@@ -1004,9 +1719,59 @@ remote address instead, read `web_bootstrap_token` inside the host's effective
 
 The Web Access panel keeps LAN/public `Save`, `Apply now`, and remote-endpoint copying disabled until an Admin Access Token exists. The native daemon and Web boundary enforce the same rule at remote start, apply, and listener boundaries, so direct API calls and stale saved settings cannot bypass the panel. Group-scoped tokens do not satisfy this administrator recovery requirement. Switching back to localhost-only remains available so an incomplete remote setup can be recovered safely.
 
-In **Settings > Web Access**, `127.0.0.1` means local-only and `0.0.0.0` means localhost plus your LAN IP on a normal local host. On WSL2 NAT, it still stays inside the VM until Windows networking forwards it outward.
+In **Settings > This instance > Web Access**, `127.0.0.1` means local-only and `0.0.0.0` means localhost plus your LAN IP on a normal local host. On WSL2 NAT, it still stays inside the VM until Windows networking forwards it outward.
 
-`Save` stores the target binding. If Web was started by `cccc` or `cccc web`, use `Apply now` in **Settings > Web Access** to perform the short supervised restart. If Web is managed by Docker, systemd, or another external supervisor, restart that service instead.
+`Save` stores the target binding. If Web was started by `cccc` or `cccc web`, use `Apply now` in **Settings > This instance > Web Access** to perform the short supervised restart. If Web is managed by Docker, systemd, or another external supervisor, restart that service instead.
+
+Before an address change restarts the supervised Web service, CCCC attempts to
+stop its active Voice work and Chet. If their cleanup cannot be confirmed,
+the current Web remains available and the saved address has not yet taken
+effect. Check the Voice state and retry **Apply now** after cleanup. A Voice
+start can likewise be delayed while resources from a previous Web process are
+being recovered; retry after cleanup, and if the condition persists, review the
+process records as described below. If Chet reset fails after cleanup
+began, refresh the Voice state before deciding whether to try again.
+
+On Unix, CCCC records the processes it starts so that it can clean them up
+after a crash. When it cannot confirm that processes from an earlier Web or
+daemon run have ended, Voice does not start, and the Secretary may hold back new
+tasks and the automatic recovery of unfinished documents. The Voice error then
+offers **Review earlier processes**, and the Secretary panel shows **Review**.
+The review lists each record and why CCCC is still waiting:
+
+- **Check again** retries cleanup for that record only.
+- **Accept** stops waiting for that record. It does not stop the old work: if
+  that work is still running, it may keep changing files or documents or
+  sending requests that cost money, and remote work may continue after local
+  cleanup.
+- **Accept all** appears for two or more records that can be accepted. It
+  accepts them one at a time and stops as soon as anything changes; it is not
+  one transaction.
+
+Some records need offline review. Stop CCCC safely, then run
+`cccc daemon process-recovery --owner daemon list` (or `--owner web`),
+followed by `retry --id <id> --version <version>` or
+`accept --id <id> --version <version> --accept-risk`. While CCCC Web is
+running, these commands refuse to change Web's records. Do not delete files
+under `CCCC_HOME` by hand. On Linux, an agent that CCCC could not confirm after its
+launch is reviewed with `--owner session`; see
+[When CCCC cannot confirm an agent](operations.md#when-cccc-cannot-confirm-an-agent).
+
+Use one `CCCC_HOME` on one host or container at a time. Before moving or
+copying it elsewhere, make sure the work started from it has ended. On that
+basis, CCCC releases records from an earlier boot without signalling anything
+when it can identify that boot; this does not prove that remote requests ended.
+
+On Linux, cleanup prefers the strongest process identity the system offers and
+keeps records it cannot confirm for review; some systems still need approximate
+matching, which can misjudge. On macOS, the crash watchdog still judges
+processes approximately, by process group number and start time to the second: a
+reused number, or the gap between that check and the signal, could stop another
+process by mistake. How often this happens is unknown; earlier versions behave
+the same way. At the next start, CCCC on macOS signals nothing: it releases a
+record from this version once its process and its process group have both ended,
+or a record from an earlier version once its process group has ended, and keeps
+the others for review.
 
 For the default local app flow, prefer restarting from the owning `cccc` session itself: `Ctrl+C` to stop the whole app, then run `cccc` again. That keeps daemon and Web on the same fresh code/runtime.
 
@@ -1029,7 +1794,7 @@ a tab. The temporary header token is removed from browser session storage after
 the cookie is established. Access tokens are not accepted in ordinary API, SSE,
 or WebSocket query strings and should never be placed in shared URLs.
 
-For managed remote access, open **Settings → Web Access** and link this installation
+For managed remote access, open **Settings → This instance → Web Access** and link this installation
 to your CCCC account in the Reach section. Approve the request on the website,
 then return to the same local panel. If an administrator Access Token already
 exists, reuse it; otherwise complete the displayed token prerequisite. Choose

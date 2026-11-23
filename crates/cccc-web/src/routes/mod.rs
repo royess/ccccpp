@@ -4,8 +4,10 @@ mod actor_assets;
 mod actor_profiles;
 mod actors;
 mod assistants;
+mod backlog;
 mod blob_download;
 mod capabilities;
+mod chet;
 mod codex_voice;
 mod connect;
 mod context;
@@ -24,7 +26,10 @@ mod headless;
 mod headless_store;
 mod im;
 mod im_authorization;
+mod local_session_controls;
+mod local_sessions;
 mod membership;
+mod message_pins;
 mod messaging;
 mod messaging_cross_group;
 mod nomcp;
@@ -35,9 +40,15 @@ mod nomcp_resources;
 mod nomcp_send;
 mod presentation;
 mod presentation_browser;
+pub(crate) mod process_recovery;
+mod quick_reply_templates;
 mod realtime;
 mod remote_access;
 mod remote_access_projection;
+#[cfg(test)]
+mod remote_maintenance_test_daemon;
+mod session_node_join;
+mod session_nodes;
 mod settings;
 mod sidebar_preferences;
 mod streams;
@@ -51,6 +62,7 @@ mod terminal_ws;
 mod terminal_ws_bootstrap;
 mod terminal_ws_flow;
 mod terminal_ws_protocol;
+pub(crate) mod update;
 mod voice_secretary;
 mod voice_secretary_terminal;
 mod web_model_browser;
@@ -92,6 +104,8 @@ pub fn router() -> Router<AppState> {
         .merge(filesystem::routes())
         .merge(access_tokens::routes())
         .merge(groups::routes())
+        .merge(local_sessions::routes())
+        .merge(session_nodes::routes())
         .merge(group_copy::routes())
         .merge(actors::routes())
         .merge(assistants::routes())
@@ -102,9 +116,12 @@ pub fn router() -> Router<AppState> {
         .merge(headless::routes())
         .merge(im::routes())
         .merge(messaging::routes())
+        .merge(message_pins::routes())
+        .merge(quick_reply_templates::routes())
         .merge(messaging_cross_group::routes())
         .merge(presentation::routes())
         .merge(presentation_browser::routes())
+        .merge(process_recovery::routes())
         .merge(web_model_connectors::routes())
         .merge(web_model_dots::routes())
         .merge(grok_webhook::routes())
@@ -113,18 +130,23 @@ pub fn router() -> Router<AppState> {
         .merge(web_model_shared_browser::routes())
         .merge(nomcp::routes())
         .merge(context::routes())
+        .merge(backlog::routes())
         .merge(codex_voice::routes())
         .merge(diagnostics::routes())
         .merge(membership::routes())
         .merge(connect::routes())
         .merge(remote_access::routes())
+        .merge(update::routes())
         .merge(settings::routes())
         .merge(capabilities::routes())
+        .merge(chet::routes())
         .merge(streams::routes())
         .merge(realtime::routes())
         .merge(terminal::routes())
 }
 
+pub(crate) use assistants::spawn_voice_model_cleanup;
 pub(crate) use grok_webhook::spawn as spawn_grok_webhooks;
+pub(crate) use web_model_delivery::wait_for_browser_work;
 pub(crate) use web_model_dots::spawn as spawn_dots_events;
 pub(crate) use web_model_supervisor::spawn as spawn_web_model_supervisor;

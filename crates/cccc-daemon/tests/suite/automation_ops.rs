@@ -19,11 +19,22 @@ fn automation_contract_is_versioned_and_frontend_compatible() {
         json!({"group_id":group_id}),
     );
     assert!(initial.result["ruleset"]["rules"].is_array());
-    assert!(
-        initial.result["ruleset"]["snippets"]["standup"]
-            .as_str()
-            .is_some_and(|value| value.contains("{{interval_minutes}}"))
+    assert_eq!(
+        initial.result["ruleset"]["snippets"]["standup"],
+        cccc_core::automation::STANDUP_SNIPPET
     );
+    // The built-in stand-up is off, reaches the foreman alone and is
+    // configured for a two-hour interval.
+    let standup = &initial.result["ruleset"]["rules"][0];
+    assert_eq!(standup["id"], "standup");
+    assert_eq!(standup["enabled"], false);
+    assert_eq!(standup["to"], json!(["@foreman"]));
+    assert_eq!(
+        standup["trigger"],
+        json!({"kind":"interval","every_seconds":7200})
+    );
+    assert_eq!(standup["action"]["title"], "Team stand-up");
+    assert_eq!(standup["action"]["snippet_ref"], "standup");
     assert_eq!(initial.result["version"], 1);
 
     let updated = ok(
@@ -45,6 +56,14 @@ fn automation_contract_is_versioned_and_frontend_compatible() {
     assert_eq!(updated.result["version"], 2);
     assert_eq!(updated.result["ruleset"]["rules"][0]["id"], "reminder");
     assert_eq!(updated.result["event"]["kind"], "group.automation_update");
+    assert_eq!(
+        updated.result["event"]["data"],
+        json!({
+            "previous_version":1,
+            "version":2,
+            "changed":["rules"]
+        })
+    );
     assert_eq!(
         updated.result["supported_vars"],
         json!([
@@ -134,6 +153,15 @@ fn automation_manage_applies_batched_actions_and_reset_honors_version() {
     assert_eq!(reset.result["version"], 3);
     assert_eq!(reset.result["ruleset"]["rules"][0]["id"], "standup");
     assert_eq!(reset.result["event"]["kind"], "group.automation_update");
+    assert_eq!(
+        reset.result["event"]["data"],
+        json!({"previous_version":2,"version":3,"changed":["rules"]})
+    );
+    assert_eq!(managed.result["event"]["data"]["changed"], json!(["rules"]));
+    assert_eq!(
+        managed.result["event"]["data"],
+        json!({"previous_version":1,"version":2,"changed":["rules"]})
+    );
 }
 
 #[test]
@@ -339,7 +367,7 @@ fn automation_state_filters_other_peers_personal_rules_and_snippets() {
         json!({
             "id":id,"enabled":true,"scope":scope,"owner_actor_id":owner,
             "to":[owner.unwrap_or("@all")],
-            "trigger":{"kind":"interval","every_seconds":60},
+            "trigger":{"kind":"interval","every_seconds":60,"max_runs":10},
             "action":{"kind":"notify","snippet_ref":snippet_ref}
         })
     };
@@ -372,9 +400,9 @@ fn automation_state_filters_other_peers_personal_rules_and_snippets() {
         &json!({
             "v":5,
             "rules":{
-                "group-rule":{"last_fired_at":"2026-08-11T00:00:00Z"},
-                "peer1-rule":{"last_error_at":"2026-08-11T00:01:00Z","last_error":"delivery failed"},
-                "peer2-rule":{"last_error_at":"2026-08-11T00:02:00Z","last_error":"private failure"}
+                "group-rule":{"last_fired_at":"2026-08-11T00:00:00Z","fired_count":2},
+                "peer1-rule":{"last_error_at":"2026-08-11T00:01:00Z","last_error":"delivery failed","fired_count":3},
+                "peer2-rule":{"last_error_at":"2026-08-11T00:02:00Z","last_error":"private failure","fired_count":9}
             }
         }),
     )
@@ -405,6 +433,8 @@ fn automation_state_filters_other_peers_personal_rules_and_snippets() {
         state.result["status"]["peer1-rule"]["last_error"],
         "delivery failed"
     );
+    assert_eq!(state.result["status"]["group-rule"]["fired_count"], 2);
+    assert_eq!(state.result["status"]["peer1-rule"]["fired_count"], 3);
     assert!(state.result["status"].get("peer2-rule").is_none());
 
     let unknown = raw(
@@ -641,6 +671,821 @@ fn cron_writes_reject_new_bad_expressions_but_keep_unchanged_legacy_rules_saveab
         }),
     );
     assert_cron_rejected(changed);
+}
+
+/// A Group whose first Actor `lead` is the foreman, with peers `peer1` and
+/// `peer2`, and user-made rules: two scheduled operations, a team reminder and
+/// a personal reminder of `peer2`.
+fn group_with_user_rules(home: &HomeLayout) -> String {
+    let created = ok(home, "group_create", json!({"title":"automation access"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id")
+        .to_owned();
+    for actor_id in ["lead", "peer1", "peer2"] {
+        ok(
+            home,
+            "actor_add",
+            json!({"group_id":group_id,"actor_id":actor_id,"runtime":"custom","by":"user"}),
+        );
+    }
+    ok(
+        home,
+        "group_automation_update",
+        json!({
+            "group_id":group_id,
+            "ruleset":{
+                "rules":[
+                    operation("nightly-pause", json!({"kind":"group_state","state":"paused"})),
+                    operation("morning-restart", json!({"kind":"actor_control","operation":"restart","targets":["@all"]})),
+                    {
+                        "id":"team","enabled":true,"to":["@all"],
+                        "trigger":{"kind":"interval","every_seconds":3600},
+                        "action":{"kind":"notify","snippet_ref":"team-text"}
+                    },
+                    reminder("peer2-own", "peer2")
+                ],
+                "snippets":{"team-text":"sync up"}
+            },
+            "by":"user"
+        }),
+    );
+    group_id
+}
+
+fn operation(id: &str, action: Value) -> Value {
+    json!({
+        "id":id,"enabled":true,
+        "trigger":{"kind":"at","at":"2030-01-01T00:00:00Z"},
+        "action":action
+    })
+}
+
+fn reminder(id: &str, owner: &str) -> Value {
+    json!({
+        "id":id,"enabled":true,"scope":"personal","owner_actor_id":owner,"to":[owner],
+        "trigger":{"kind":"interval","every_seconds":600},
+        "action":{"kind":"notify","message":"check CI"}
+    })
+}
+
+fn stored_automation(home: &HomeLayout, group_id: &str) -> Value {
+    let store = cccc_core::GroupStore::new(home.clone()).expect("store");
+    Value::Object(store.load(group_id).expect("load group").automation)
+}
+
+fn run_now_fixture(home: &HomeLayout) -> String {
+    use cccc_contracts::{Actor, GroupState};
+    use cccc_core::{GroupStore, actors};
+    let store = GroupStore::new(home.clone()).expect("store");
+    let group = store.create("run now", "").expect("group");
+    store
+        .mutate(&group.group_id, |group| {
+            group.state = GroupState::Idle;
+            for id in ["lead", "peer1", "peer2"] {
+                let mut actor = Actor::new(id);
+                // A non-existent native session never launches a provider process.
+                actor.external_session_id = format!("fixture-{id}");
+                actors::add(group, actor)?;
+            }
+            group.automation = json!({"version":7,"rules":[
+                {"id":"standup","enabled":true,"scope":"group","to":["lead"],
+                 "trigger":{"kind":"interval","every_seconds":60,"max_runs":1},
+                 "action":{"kind":"notify","message":"check in"}},
+                reminder("peer1-own", "peer1"),
+                reminder("peer2-own", "peer2"),
+                operation("control", json!({"kind":"group_state","state":"paused"})),
+                {"id":"empty","enabled":false,"to":["lead"],
+                 "trigger":{"kind":"interval","every_seconds":60},
+                 "action":{"kind":"notify","message":""}},
+            {"id":"no-target","enabled":false,"to":["missing"],
+             "trigger":{"kind":"interval","every_seconds":60},
+             "action":{"kind":"notify","message":"nobody"}},
+                {"id":"future","enabled":false,"to":["lead"],
+                 "trigger":{"kind":"at","at":"2099-01-01T00:00:00Z"},
+                 "action":{"kind":"notify","message":"future"}}
+            ]})
+            .as_object()
+            .expect("automation")
+            .clone();
+            Ok(())
+        })
+        .expect("fixture group");
+    group.group_id
+}
+
+#[test]
+fn manual_notification_preserves_schedule_and_records_real_runs() {
+    use cccc_contracts::GroupState;
+    use cccc_core::{GroupStore, automation, ledger};
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path()).expect("home");
+    let group_id = run_now_fixture(&home);
+    let store = GroupStore::new(home.clone()).expect("store");
+    let path = store
+        .state_dir(&group_id)
+        .expect("state dir")
+        .join("automation.json");
+    cccc_core::fs::write_json(
+        &path,
+        &json!({"rules":{
+            "standup":{"last_fired_at":"2020-01-01T00:00:00Z","fired_count":0}
+        }}),
+    )
+    .expect("old baseline");
+    let status = || {
+        ok(
+            &home,
+            "group_automation_state",
+            json!({"group_id":group_id}),
+        )
+    };
+    let before = status();
+    assert_eq!(
+        before.result["status"]["standup"]["last_run_at"],
+        Value::Null
+    );
+    assert_eq!(
+        before.result["status"]["standup"]["last_run_kind"],
+        Value::Null
+    );
+    assert_eq!(
+        before.result["status"]["standup"]["suppressed_reason"],
+        "idle_standup"
+    );
+    assert_eq!(before.result["status"]["standup"]["next_fire_at"], "");
+
+    let sent = ok(
+        &home,
+        "group_automation_run_now",
+        json!({
+            "group_id":group_id,"rule_id":"standup","by":"lead","expected_version":7
+        }),
+    );
+    assert_eq!(sent.result["notified"], json!(["lead"]));
+    assert!(sent.result["run_at"].as_str().is_some());
+    let after = status();
+    assert_eq!(after.result["version"], 7);
+    let baseline = |response: &DaemonResponse| {
+        chrono::DateTime::parse_from_rfc3339(
+            response.result["status"]["standup"]["last_fired_at"]
+                .as_str()
+                .expect("baseline"),
+        )
+        .expect("RFC3339 baseline")
+    };
+    assert_eq!(baseline(&after), baseline(&before));
+    assert_eq!(after.result["status"]["standup"]["fired_count"], 0);
+    assert_eq!(after.result["status"]["standup"]["last_run_kind"], "manual");
+    assert!(
+        after.result["status"]["standup"]["last_run_at"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(after.result["ruleset"]["rules"][0]["enabled"], true);
+    let events = ledger::read_all(&store.ledger_path(&group_id).expect("ledger")).expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.data["context"]["run_kind"] == "manual")
+    );
+
+    // Disabled and future one-time rules can be tried without enabling or completing them.
+    store
+        .mutate(&group_id, |group| {
+            group.automation["rules"][0]["enabled"] = json!(false);
+            Ok(())
+        })
+        .expect("disable");
+    ok(
+        &home,
+        "group_automation_run_now",
+        json!({"group_id":group_id,"rule_id":"standup"}),
+    );
+    ok(
+        &home,
+        "group_automation_run_now",
+        json!({"group_id":group_id,"rule_id":"future"}),
+    );
+    let disabled = status();
+    assert_eq!(disabled.result["ruleset"]["rules"][0]["enabled"], false);
+    assert_eq!(disabled.result["status"]["standup"]["fired_count"], 0);
+    assert_eq!(disabled.result["status"]["future"]["completed"], false);
+
+    // A later scheduled firing is still due and is identified separately.
+    store
+        .mutate(&group_id, |group| {
+            group.state = GroupState::Active;
+            group.automation["rules"][0]["enabled"] = json!(true);
+            Ok(())
+        })
+        .expect("enable");
+    let tick = automation::tick_group(&home, &group_id, false).expect("scheduled tick");
+    assert!(
+        tick.notifications
+            .iter()
+            .any(|event| event.data["context"]["run_kind"] == "scheduled")
+    );
+    let scheduled = status();
+    assert_eq!(
+        scheduled.result["status"]["standup"]["last_run_kind"],
+        "scheduled"
+    );
+    assert_eq!(scheduled.result["status"]["standup"]["fired_count"], 1);
+    store
+        .mutate(&group_id, |group| {
+            group.automation["rules"][0]["enabled"] = json!(false);
+            Ok(())
+        })
+        .expect("disable completed rule");
+    ok(
+        &home,
+        "group_automation_run_now",
+        json!({"group_id":group_id,"rule_id":"standup"}),
+    );
+    let completed = status();
+    assert_eq!(completed.result["status"]["standup"]["completed"], true);
+    assert_eq!(completed.result["status"]["standup"]["fired_count"], 1);
+    assert_eq!(completed.result["ruleset"]["rules"][0]["enabled"], false);
+}
+
+#[test]
+fn run_now_checks_roles_versions_states_and_action_without_writing_on_failure() {
+    use cccc_contracts::GroupState;
+    use cccc_core::{GroupStore, ledger};
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path()).expect("home");
+    let group_id = run_now_fixture(&home);
+    let store = GroupStore::new(home.clone()).expect("store");
+    let ledger_path = store.ledger_path(&group_id).expect("ledger path");
+    let count = || ledger::read_all(&ledger_path).expect("events").len();
+    let before = count();
+    for (by, rule, version, code) in [
+        ("peer1", "standup", 7, "permission_denied"),
+        ("peer1", "peer2-own", 7, "not_found"),
+        ("user", "control", 7, "unsupported_action"),
+        ("user", "standup", 6, "version_conflict"),
+        ("user", "empty", 7, "no_notification"),
+        ("user", "no-target", 7, "no_notification"),
+        ("user", "missing", 7, "not_found"),
+    ] {
+        let response = raw(
+            &home,
+            "group_automation_run_now",
+            json!({
+                "group_id":group_id,"by":by,"rule_id":rule,"expected_version":version
+            }),
+        );
+        assert_eq!(response.error.expect("error").code, code, "{by}/{rule}");
+        assert_eq!(count(), before, "{by}/{rule} wrote an event");
+    }
+    for (state, code) in [
+        (GroupState::Paused, "group_paused"),
+        (GroupState::Stopped, "group_stopped"),
+    ] {
+        store
+            .mutate(&group_id, |group| {
+                group.state = state;
+                Ok(())
+            })
+            .expect("set state");
+        let response = raw(
+            &home,
+            "group_automation_run_now",
+            json!({"group_id":group_id,"rule_id":"standup"}),
+        );
+        assert_eq!(response.error.expect("error").code, code);
+        let status = ok(
+            &home,
+            "group_automation_state",
+            json!({"group_id":group_id}),
+        );
+        assert_eq!(
+            status.result["status"]["standup"]["suppressed_reason"],
+            code
+        );
+        assert_eq!(status.result["status"]["standup"]["next_fire_at"], "");
+        assert_eq!(count(), before);
+    }
+    store
+        .mutate(&group_id, |group| {
+            group.state = GroupState::Idle;
+            Ok(())
+        })
+        .expect("idle");
+    let own = ok(
+        &home,
+        "group_automation_run_now",
+        json!({"group_id":group_id,"rule_id":"peer1-own","by":"peer1"}),
+    );
+    assert_eq!(own.result["notified"], json!(["peer1"]));
+}
+
+fn stored_ids(home: &HomeLayout, group_id: &str) -> Vec<String> {
+    stored_automation(home, group_id)["rules"]
+        .as_array()
+        .expect("saved rules")
+        .iter()
+        .filter_map(|rule| rule["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn manage_as(home: &HomeLayout, group_id: &str, by: &str, actions: Value) -> DaemonResponse {
+    raw(
+        home,
+        "group_automation_manage",
+        json!({"group_id":group_id,"by":by,"actions":actions}),
+    )
+}
+
+fn denied(response: DaemonResponse) -> String {
+    assert!(!response.ok, "an unauthorized automation change was saved");
+    let error = response.error.expect("error");
+    assert_eq!(error.code, "permission_denied", "{}", error.message);
+    error.message
+}
+
+#[test]
+fn a_peer_manages_its_own_reminders_and_nothing_else() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let group_id = group_with_user_rules(&home);
+
+    // Fields a peer leaves out mean a reminder to itself.
+    let created = manage_as(
+        &home,
+        &group_id,
+        "peer1",
+        json!([{"type":"create_rule","rule":{
+            "id":"mine","trigger":{"kind":"interval","every_seconds":300},
+            "action":{"kind":"notify","message":"look at the build"}
+        }}]),
+    );
+    assert!(created.ok, "{:?}", created.error);
+    // Redacted kind/data projection of an observed pre-change ledger event.
+    let captured: Value =
+        serde_json::from_str(include_str!("../fixtures/automation_update_event.json"))
+            .expect("captured event");
+    assert_eq!(captured["kind"], "group.automation_update");
+    assert_eq!(captured["data"], json!({}));
+    let event = &created.result["event"];
+    assert_eq!(event["kind"], captured["kind"]);
+    assert_eq!(
+        event["data"],
+        json!({"previous_version":2,"version":3,"changed":["rules"]})
+    );
+    assert!(!event.to_string().contains("peer2-own"));
+    let mine = stored_automation(&home, &group_id)["rules"]
+        .as_array()
+        .expect("rules")
+        .iter()
+        .find(|rule| rule["id"] == "mine")
+        .cloned()
+        .expect("saved reminder");
+    assert_eq!(mine["scope"], "personal");
+    assert_eq!(mine["owner_actor_id"], "peer1");
+    assert_eq!(mine["to"], json!(["peer1"]));
+    for actions in [
+        json!([{"type":"set_rule_enabled","rule_id":"mine","enabled":false}]),
+        json!([{"type":"update_rule","rule":reminder("mine", "peer1")}]),
+        json!([{"type":"delete_rule","rule_id":"mine"}]),
+    ] {
+        let response = manage_as(&home, &group_id, "peer1", actions);
+        assert!(response.ok, "{:?}", response.error);
+    }
+
+    let saved = stored_automation(&home, &group_id);
+    let mut group_rule = reminder("shared", "peer1");
+    group_rule["scope"] = json!("group");
+    let mut to_everyone = reminder("loud", "peer1");
+    to_everyone["to"] = json!(["@all"]);
+    for rule in [group_rule, to_everyone, reminder("forged", "peer2")] {
+        denied(manage_as(
+            &home,
+            &group_id,
+            "peer1",
+            json!([{"type":"create_rule","rule":rule}]),
+        ));
+    }
+    let message = denied(manage_as(
+        &home,
+        &group_id,
+        "peer1",
+        json!([{"type":"set_rule_enabled","rule_id":"team","enabled":false}]),
+    ));
+    assert!(message.contains("team"), "{message}");
+
+    // Another peer's reminder is neither changed nor named to this peer.
+    let message = denied(manage_as(
+        &home,
+        &group_id,
+        "peer1",
+        json!([{"type":"delete_rule","rule_id":"peer2-own"}]),
+    ));
+    assert!(!message.contains("peer2-own"), "{message}");
+    assert!(message.contains("1 rule not visible to you"), "{message}");
+
+    // Writing back its filtered view would drop the rules it cannot see.
+    let view = ok(
+        &home,
+        "group_automation_state",
+        json!({"group_id":group_id,"by":"peer1"}),
+    );
+    let message = denied(manage_as(
+        &home,
+        &group_id,
+        "peer1",
+        json!([{"type":"replace_all_rules","ruleset":view.result["ruleset"]}]),
+    ));
+    assert!(!message.contains("peer2-own"), "{message}");
+    denied(raw(
+        &home,
+        "group_automation_update",
+        json!({"group_id":group_id,"by":"peer1","ruleset":view.result["ruleset"]}),
+    ));
+    denied(raw(
+        &home,
+        "group_automation_reset_baseline",
+        json!({"group_id":group_id,"by":"peer1"}),
+    ));
+    assert_eq!(stored_automation(&home, &group_id), saved);
+}
+
+#[test]
+fn a_foreman_manages_reminders_but_not_scheduled_operations() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let group_id = group_with_user_rules(&home);
+
+    let team_reminder = json!({
+        "id":"standup-now","to":["@peers"],
+        "trigger":{"kind":"interval","every_seconds":1800},
+        "action":{"kind":"notify","message":"post status"}
+    });
+    for actions in [
+        json!([{"type":"create_rule","rule":team_reminder}]),
+        json!([{"type":"set_rule_enabled","rule_id":"peer2-own","enabled":false}]),
+    ] {
+        let response = manage_as(&home, &group_id, "lead", actions);
+        assert!(response.ok, "{:?}", response.error);
+    }
+
+    let saved = stored_automation(&home, &group_id);
+    let mut converted = operation("nightly-pause", Value::Null);
+    converted["trigger"] = json!({"kind":"interval","every_seconds":60});
+    converted["action"] = json!({"kind":"notify","message":"no longer pauses"});
+    for actions in [
+        json!([{"type":"set_rule_enabled","rule_id":"nightly-pause","enabled":false}]),
+        json!([{"type":"delete_rule","rule_id":"morning-restart"}]),
+        json!([{"type":"update_rule","rule":converted}]),
+        json!([{"type":"create_rule","rule":operation("late-stop", json!({"kind":"group_state","state":"stopped"}))}]),
+        // One refused action refuses the whole batch.
+        json!([
+            {"type":"create_rule","rule":reminder("lead-own", "lead")},
+            {"type":"delete_rule","rule_id":"nightly-pause"}
+        ]),
+    ] {
+        let message = denied(manage_as(&home, &group_id, "lead", actions));
+        assert!(message.contains("only the user"), "{message}");
+    }
+    denied(raw(
+        &home,
+        "group_automation_reset_baseline",
+        json!({"group_id":group_id,"by":"lead"}),
+    ));
+    assert_eq!(stored_automation(&home, &group_id), saved);
+
+    // Bulk writes may keep the user's operations as they are, but not reorder them.
+    let mut rules = saved["rules"].as_array().expect("rules").clone();
+    rules.retain(|rule| rule["id"] != "team");
+    let kept = raw(
+        &home,
+        "group_automation_update",
+        json!({"group_id":group_id,"by":"lead","ruleset":{"rules":rules,"snippets":{"team-text":"sync up"}}}),
+    );
+    assert!(kept.ok, "{:?}", kept.error);
+    let mut swapped = rules.clone();
+    swapped.swap(0, 1);
+    let message = denied(manage_as(
+        &home,
+        &group_id,
+        "lead",
+        json!([{"type":"replace_all_rules","ruleset":{"rules":swapped,"snippets":{}}}]),
+    ));
+    assert!(message.contains("reorders"), "{message}");
+    let operations_only = rules[..2].to_vec();
+    let replaced = manage_as(
+        &home,
+        &group_id,
+        "lead",
+        json!([{"type":"replace_all_rules","ruleset":{"rules":operations_only,"snippets":{}}}]),
+    );
+    assert!(replaced.ok, "{:?}", replaced.error);
+    assert_eq!(
+        stored_ids(&home, &group_id),
+        ["nightly-pause", "morning-restart"]
+    );
+}
+
+#[test]
+fn the_baseline_survives_a_first_change_and_a_saved_empty_list_stays_empty() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let created = ok(&home, "group_create", json!({"title":"baseline"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id");
+    ok(
+        &home,
+        "actor_add",
+        json!({"group_id":group_id,"actor_id":"lead","runtime":"custom","by":"user"}),
+    );
+    ok(
+        &home,
+        "actor_add",
+        json!({"group_id":group_id,"actor_id":"peer1","runtime":"custom","by":"user"}),
+    );
+    let created = manage_as(
+        &home,
+        group_id,
+        "peer1",
+        json!([{"type":"create_rule","rule":reminder("mine", "peer1")}]),
+    );
+    assert!(created.ok, "{:?}", created.error);
+    assert_eq!(stored_ids(&home, group_id), ["standup", "mine"]);
+
+    ok(
+        &home,
+        "group_automation_update",
+        json!({"group_id":group_id,"ruleset":{"rules":[],"snippets":{}},"by":"user"}),
+    );
+    let state = ok(
+        &home,
+        "group_automation_state",
+        json!({"group_id":group_id}),
+    );
+    assert_eq!(state.result["ruleset"]["rules"], json!([]));
+    let created = manage_as(
+        &home,
+        group_id,
+        "lead",
+        json!([{"type":"create_rule","rule":reminder("lead-own", "lead")}]),
+    );
+    assert!(created.ok, "{:?}", created.error);
+    assert_eq!(stored_ids(&home, group_id), ["lead-own"]);
+
+    denied(manage_as(
+        &home,
+        group_id,
+        "stranger",
+        json!([{"type":"delete_rule","rule_id":"lead-own"}]),
+    ));
+}
+
+#[test]
+fn replacing_the_list_saves_snippets_the_way_they_take_effect() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let created = ok(&home, "group_create", json!({"title":"snippets"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id");
+    for actor_id in ["lead", "peer1"] {
+        ok(
+            &home,
+            "actor_add",
+            json!({"group_id":group_id,"actor_id":actor_id,"runtime":"custom","by":"user"}),
+        );
+    }
+    let created = manage_as(
+        &home,
+        group_id,
+        "peer1",
+        json!([{"type":"create_rule","rule":reminder("mine", "peer1")}]),
+    );
+    assert!(created.ok, "{:?}", created.error);
+
+    // A peer writing its view back unchanged, built-in stand-up text included,
+    // changes nothing and is not refused for it.
+    let view = ok(
+        &home,
+        "group_automation_state",
+        json!({"group_id":group_id,"by":"peer1"}),
+    );
+    assert!(view.result["ruleset"]["snippets"]["standup"].is_string());
+    let unchanged = manage_as(
+        &home,
+        group_id,
+        "peer1",
+        json!([{"type":"replace_all_rules","ruleset":view.result["ruleset"]}]),
+    );
+    assert!(unchanged.ok, "{:?}", unchanged.error);
+    assert_eq!(unchanged.result["changed"], false);
+
+    // A changed stand-up text replaces the saved override, so the text that
+    // fires is the one the foreman saved.
+    ok(
+        &home,
+        "group_automation_update",
+        json!({"group_id":group_id,"by":"user","ruleset":{
+            "rules":view.result["ruleset"]["rules"],"snippets":{"standup":"old text"}
+        }}),
+    );
+    let replaced = manage_as(
+        &home,
+        group_id,
+        "lead",
+        json!([{"type":"replace_all_rules","ruleset":{
+            "rules":view.result["ruleset"]["rules"],"snippets":{"standup":"new text"}
+        }}]),
+    );
+    assert!(replaced.ok, "{:?}", replaced.error);
+    let saved = stored_automation(&home, group_id);
+    assert_eq!(saved["snippet_overrides"], json!({"standup":"new text"}));
+    assert_eq!(saved["snippets"], json!({}));
+    let state = ok(
+        &home,
+        "group_automation_state",
+        json!({"group_id":group_id}),
+    );
+    assert_eq!(state.result["ruleset"]["snippets"]["standup"], "new text");
+}
+
+#[test]
+fn agent_writes_report_a_malformed_saved_list_instead_of_replacing_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let created = ok(&home, "group_create", json!({"title":"malformed"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id");
+    ok(
+        &home,
+        "actor_add",
+        json!({"group_id":group_id,"actor_id":"lead","runtime":"custom","by":"user"}),
+    );
+    let store = cccc_core::GroupStore::new(home.clone()).expect("store");
+    let mut group = store.load(group_id).expect("load group");
+    group.automation.insert("rules".into(), Value::Null);
+    store.save(&group).expect("seed malformed rules");
+
+    let response = manage_as(
+        &home,
+        group_id,
+        "lead",
+        json!([{"type":"create_rule","rule":reminder("lead-own", "lead")}]),
+    );
+    assert_eq!(
+        response.error.expect("refused").code,
+        "group_automation_state_invalid"
+    );
+    assert_eq!(stored_automation(&home, group_id)["rules"], Value::Null);
+    ok(
+        &home,
+        "group_automation_update",
+        json!({"group_id":group_id,"by":"user","ruleset":{"rules":[],"snippets":{}}}),
+    );
+    assert_eq!(stored_automation(&home, group_id)["rules"], json!([]));
+}
+
+#[test]
+fn enabling_or_disabling_a_rule_takes_an_explicit_boolean() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let group_id = group_with_user_rules(&home);
+    let before = stored_automation(&home, &group_id);
+    for enabled in [None, Some(Value::Null), Some(json!("true")), Some(json!(1))] {
+        let mut action = json!({"type":"set_rule_enabled","rule_id":"team"});
+        if let Some(enabled) = enabled {
+            action["enabled"] = enabled;
+        }
+        let response = manage_as(&home, &group_id, "user", json!([action]));
+        assert_eq!(response.error.expect("refused").code, "invalid_request");
+    }
+    assert_eq!(stored_automation(&home, &group_id), before);
+}
+
+#[test]
+fn an_actor_caller_is_the_actor_named_exactly() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let group_id = group_with_user_rules(&home);
+    // A padded name would be authorized as peer2 but own its rules as another.
+    let padded = manage_as(
+        &home,
+        &group_id,
+        " peer2",
+        json!([{"type":"create_rule","rule":reminder("padded", " peer2")}]),
+    );
+    assert!(denied(padded).contains("unknown actor"));
+}
+
+#[test]
+fn a_change_keeps_every_saved_rule_or_saves_nothing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let created = ok(&home, "group_create", json!({"title":"rule ids"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id");
+    let rule = |id: &str| {
+        json!({
+            "id":id,"trigger":{"kind":"interval","every_seconds":600},
+            "action":{"kind":"notify","message":"check CI"}
+        })
+    };
+    // Ids are compared as written, as the scheduler keys their state, so
+    // these are two rules and a change to one keeps the other.
+    ok(
+        &home,
+        "group_automation_update",
+        json!({"group_id":group_id,"ruleset":{"rules":[rule("same"), rule(" same ")]}}),
+    );
+    let create = json!([{"type":"create_rule","rule":rule("other")}]);
+    assert!(manage_as(&home, group_id, "user", create).ok);
+    assert_eq!(stored_ids(&home, group_id), ["same", " same ", "other"]);
+    let disable = json!([{"type":"set_rule_enabled","rule_id":" same ","enabled":false}]);
+    assert!(manage_as(&home, group_id, "user", disable).ok);
+    let rules = stored_automation(&home, group_id)["rules"].clone();
+    assert_eq!(
+        (&rules[0]["enabled"], &rules[1]["enabled"]),
+        (&json!(true), &json!(false))
+    );
+    let delete = json!([{"type":"delete_rule","rule_id":"same"}]);
+    assert!(manage_as(&home, group_id, "user", delete).ok);
+    assert_eq!(stored_ids(&home, group_id), [" same ", "other"]);
+
+    // A saved rule that a change could not carry over is reported, not dropped.
+    let store = cccc_core::GroupStore::new(home.clone()).expect("store");
+    for rules in [
+        json!([rule("kept"), {"trigger":{"kind":"interval","every_seconds":600}}]),
+        json!([rule("kept"), "not a rule"]),
+        json!([rule("kept"), rule("  ")]),
+        json!([rule("twin"), rule("twin")]),
+    ] {
+        let mut group = store.load(group_id).expect("load group");
+        group.automation.insert("rules".into(), rules.clone());
+        store.save(&group).expect("seed saved rules");
+        let create = json!([{"type":"create_rule","rule":rule("new")}]);
+        let response = manage_as(&home, group_id, "user", create);
+        assert_eq!(
+            response.error.expect("refused").code,
+            "group_automation_state_invalid"
+        );
+        assert_eq!(stored_automation(&home, group_id)["rules"], rules);
+    }
+    ok(
+        &home,
+        "group_automation_update",
+        json!({"group_id":group_id,"ruleset":{"rules":[rule("twin")]}}),
+    );
+    assert_eq!(stored_ids(&home, group_id), ["twin"]);
+}
+
+#[test]
+fn repeating_rule_limits_must_be_positive_integers() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let created = ok(&home, "group_create", json!({"title":"automation limits"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id");
+    let triggers = [
+        json!({"kind":"interval","every_seconds":60,"max_runs":0}),
+        json!({"kind":"interval","every_seconds":60,"max_runs":-1}),
+        json!({"kind":"interval","every_seconds":60,"max_runs":1.5}),
+        json!({"kind":"cron","cron":"0 * * * *","max_runs":"2"}),
+        json!({"kind":"cron","cron":"0 * * * *","max_runs":null}),
+        json!({"kind":"at","at":"2030-01-01T00:00:00Z","max_runs":1}),
+    ];
+    for trigger in triggers {
+        let response = raw(
+            &home,
+            "group_automation_update",
+            json!({
+                "group_id":group_id,
+                "expected_version":1,
+                "ruleset":{"rules":[{
+                    "id":"repeat","trigger":trigger,"to":["@foreman"],
+                    "action":{"kind":"notify","message":"hello"}
+                }],"snippets":{}}
+            }),
+        );
+        assert!(!response.ok, "invalid limit was saved: {trigger}");
+        assert_eq!(
+            response.error.expect("validation error").code,
+            "group_automation_manage_failed"
+        );
+        assert_eq!(
+            ok(
+                &home,
+                "group_automation_state",
+                json!({"group_id":group_id})
+            )
+            .result["version"],
+            1
+        );
+    }
 }
 
 fn assert_cron_rejected(response: DaemonResponse) {

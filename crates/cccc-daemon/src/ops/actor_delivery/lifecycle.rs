@@ -1,17 +1,50 @@
 use super::*;
 
+/// Why an Actor's delivery worker stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownReason {
+    /// Unfinished work keeps its ordinary retry semantics.
+    Stop,
+    /// The Actor's runtime owner is being replaced. Work whose submission may
+    /// have started is recorded as ambiguous and never offered again; work
+    /// that was never submitted stays retryable for the new owner.
+    Replace,
+}
+
 pub fn shutdown_actor(group_id: &str, actor_id: &str) {
+    shutdown_actor_for(group_id, actor_id, ShutdownReason::Stop);
+}
+
+/// Stop and join the Actor's worker. Its outcomes are recorded before this
+/// returns, except a record that failed to persist: that claim stays claimed
+/// and the caller settles it.
+pub fn shutdown_actor_for(group_id: &str, actor_id: &str, reason: ShutdownReason) {
+    gaps::clear(|(group, actor)| group == group_id && actor == actor_id);
+    clear_refills(|(group, actor)| group == group_id && actor == actor_id);
     let worker = workers()
         .lock()
         .ok()
         .and_then(|mut workers| workers.remove(&(group_id.to_owned(), actor_id.to_owned())));
     if let Some(worker) = worker {
-        worker.shutdown();
+        worker.shutdown_for(reason);
     }
     clear_in_flight(|item| item.0 == group_id && item.1 == actor_id);
 }
 
 pub fn shutdown_group(group_id: &str) {
+    gaps::clear(|(group, _)| group == group_id);
+    clear_refills(|(group, _)| group == group_id);
+    clear_group_catchup(group_id);
+    shutdown_group_workers(group_id);
+}
+
+/// A user's next send can resume a paused group without a lifecycle restart.
+pub fn pause_group(group_id: &str) {
+    set_group_paused(group_id, true);
+    shutdown_group_workers(group_id);
+}
+
+fn shutdown_group_workers(group_id: &str) {
     let removed = workers()
         .lock()
         .map(|mut workers| {
@@ -32,6 +65,9 @@ pub fn shutdown_group(group_id: &str) {
 }
 
 pub fn shutdown_all() {
+    gaps::clear(|_| true);
+    clear_refills(|_| true);
+    clear_all_group_catchups();
     let removed = workers()
         .lock()
         .map(|mut workers| {
@@ -45,6 +81,9 @@ pub fn shutdown_all() {
     }
     if let Ok(mut completions) = completions().lock() {
         completions.clear();
+    }
+    if let Ok(mut notices) = sender_notices().lock() {
+        notices.clear();
     }
     if let Ok(mut pending) = in_flight().lock() {
         pending.clear();

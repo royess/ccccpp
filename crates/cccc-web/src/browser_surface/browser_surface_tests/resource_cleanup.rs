@@ -165,9 +165,11 @@ async fn closed_actor_windows_retire_with_their_generation() {
                 height: 600,
                 storage_state: None,
                 reuse_existing: true,
+                track_initial_url: false,
                 mode: BrowserMode::Headless,
                 shared_browser: true,
                 actor_identity: Some(&generation),
+                actor: None,
             })
             .await
             .expect("open actor");
@@ -182,18 +184,52 @@ async fn closed_actor_windows_retire_with_their_generation() {
             .read()
             .await
             .browser
-            .execute(CloseTargetParams::new(target_id))
+            .execute(CloseTargetParams::new(target_id.clone()))
             .await
             .expect("user closes window");
         // CDP acknowledges CloseTarget before the target necessarily disappears
         // from GetTargets. Wait for that lifecycle fact, not an arbitrary delay.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while manager.info(&key).await["state"] != "closed" {
+        let mut last = Value::Null;
+        let retired = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                last = manager.info(&key).await;
+                if last["state"] == "closed" {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
-        .await
-        .expect("closed target retired");
+        .await;
+        if retired.is_err() {
+            // `info` treats a failed GetTargets as "not closed yet"; ask directly so a
+            // timeout tells a slow close, a CDP error and a wrong state apart. The
+            // question has its own bound so a stuck CDP connection cannot stretch the
+            // failure to the handler's request timeout.
+            let targets = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                owner
+                    .read()
+                    .await
+                    .browser
+                    .execute(GetTargetsParams::default())
+                    .await
+            })
+            .await;
+            let targets = match targets {
+                Ok(Ok(targets)) => format!(
+                    "target still listed: {}",
+                    targets
+                        .result
+                        .target_infos
+                        .iter()
+                        .any(|target| target.target_id == target_id)
+                ),
+                Ok(Err(error)) => format!("GetTargets failed: {error}"),
+                Err(_) => "GetTargets did not answer within 2 s".to_owned(),
+            };
+            panic!(
+                "closed target not retired within 5 s (cleanup {cleanup}); last info: {last}; {targets}"
+            );
+        }
         manager
             .close_missing_actors(&store)
             .await
@@ -232,7 +268,7 @@ async fn closed_actor_windows_retire_with_their_generation() {
             }
             "prefix" => {
                 manager
-                    .close_prefixes(&[key.clone()])
+                    .close_prefixes(std::slice::from_ref(&key))
                     .await
                     .expect("Web deletion cleanup");
             }
@@ -292,6 +328,7 @@ async fn legacy_actor_pairing_does_not_replace_or_reap_its_window() {
                 &url,
                 (800, 600),
                 &crate::browser_surface::actor_identity(actor),
+                "",
             )
             .await
             .expect("open Actor window");
@@ -329,6 +366,7 @@ async fn legacy_actor_pairing_does_not_replace_or_reap_its_window() {
             &url,
             (800, 600),
             &crate::browser_surface::actor_identity(&loaded.actors[0]),
+            "",
         )
         .await
         .expect("open viewer");

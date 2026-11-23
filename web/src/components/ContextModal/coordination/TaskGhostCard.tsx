@@ -1,9 +1,9 @@
 import type { Task } from "../../../types";
 import { classNames } from "../../../utils/classNames";
 import {
-  statusTone,
   taskDisplaySummary,
   taskStatus,
+  taskStatusLabel,
   taskTitle,
   type ContextTranslator,
 } from "../model";
@@ -23,21 +23,22 @@ export function TaskGhostCard({
   const status = taskStatus(task);
 
   return (
-    <div className={classNames("w-[320px] rounded-2xl border p-3 shadow-2xl", "glass-panel")}>
+    <div
+      data-task-ghost
+      className={classNames(
+        "w-[320px] max-w-[calc(100vw-2rem)] rounded-2xl border p-3 shadow-2xl",
+        "glass-panel",
+      )}
+    >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <div className="truncate text-sm font-semibold text-[var(--color-text-primary)]">
+          <div className="line-clamp-2 text-sm font-semibold text-[var(--color-text-primary)] [overflow-wrap:anywhere]">
             {taskTitle(task)}
           </div>
           <div className={classNames("mt-1 text-xs", mutedTextClass)}>{task.id}</div>
         </div>
-        <span
-          className={classNames(
-            "rounded-full border px-2 py-0.5 text-[11px] font-medium",
-            statusTone(status),
-          )}
-        >
-          {status}
+        <span data-task-ghost-status className="border px-2 py-0.5 text-[11px] font-medium">
+          {taskStatusLabel(status, tr)}
         </span>
       </div>
       {taskDisplaySummary(task) ? (
@@ -45,7 +46,9 @@ export function TaskGhostCard({
           {taskDisplaySummary(task)}
         </div>
       ) : null}
-      <TaskCardBadges task={task} tr={tr} compact />
+      <div data-task-meta className="mt-3">
+        <TaskCardBadges task={task} tr={tr} compact />
+      </div>
     </div>
   );
 }

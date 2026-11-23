@@ -6,24 +6,111 @@ Complete command reference for the CCCC CLI.
 
 ### `cccc`
 
-Start the Web UI, reusing an existing daemon or starting one if needed.
+Start the daemon and the Web UI, reusing an existing daemon or starting one if
+needed.
 
 ```bash
-cccc                    # Start daemon + Web UI
+cccc                    # In a terminal: daemon + Web UI, with the terminal interface
+cccc --headless         # Daemon + Web UI with plain log output (same as `cccc web`)
 cccc --help             # Show help
 ```
+
+In an interactive terminal, `cccc` opens a terminal interface for this launch.
+Its main screen is a status panel: the version, the actual Web address, the
+`CCCC_HOME` in use, whether this launch started the daemon, the Groups, and the
+native sessions this CCCC knows. Terminals that recognize URLs open the Web
+address directly, for example with Ctrl+click in Windows Terminal. Lists refresh
+every few seconds while they are on screen; a failed refresh keeps the last list
+and says how old it is.
+
+The Groups table has NAME, STATUS and RUNNING columns. STATUS uses the Web UI's
+words: Running, Idle, Paused, Offline and Stopped. Stopped means the Group was
+stopped. Offline means it was not stopped or paused, but no agent is running:
+for example a new Group, or one whose agents exited or whose native sessions are
+closed. RUNNING counts the managed agents that are running and the native
+members ready to receive from that Group; it is neither the number of members
+nor the number of busy models. The native sessions table has APP, DIRECTORY,
+STATUS and ID columns; ID is the end of the session's source id, which
+`/sessions` shows in full.
+
+On the regular screens, browsing and every action use the arrow keys, Enter, Tab
+and Esc, without letter shortcuts. Up/Down moves the highlight, Enter opens or runs the highlighted
+row, and Esc goes back one level or cancels a confirmation. On the main screen, Up/Down selects a Group, PgUp/PgDn pages through a list
+longer than the screen, and Enter opens its page. Tab on an empty command line, or typing `/`, opens the command menu:
+Up/Down moves through it, Tab completes the selected command without running
+it, Enter runs it, and Esc closes it. Left/Right, Home/End, Delete and
+Ctrl+A/E/U edit a typed command. Pasting only inserts text: in terminals with
+bracketed paste, pasted newlines do not run a command.
+
+A Group's page shows its recorded state, how many tasks it has in each state,
+its agents and a link that opens it in the Web UI. Its rows are Tasks and the
+actions the Group's state allows: Start for a stopped Group (and Stop while it
+still reports running agents), Resume and Stop for a paused one, and Start and
+Stop otherwise. Each action asks for a confirmation
+that names the Group and what will happen. The confirmation starts on Cancel:
+choose the action with Up/Down and press Enter to run it, so pressing Enter
+twice changes nothing. Starting runs the enabled agents that
+are not running and lets enabled native members receive again, so Start also
+helps a running Group whose other agents have exited; stopping stops the managed
+agents and stops delivery to native members, whose apps stay open. Tasks lists the Group's tasks: Left/Right switches between the unfinished
+ones (Active, then Planned) and the Done ones, and PgUp/PgDn pages through a
+long list. Enter shows one task read-only, with its status, assignee,
+checklist, notes and outcome; tasks are edited in the Web UI.
+
+When agents wait for your answer in a Group, the main screen shows the number
+after its name (`[~3]` is from an earlier read, `[?]` cannot be confirmed), and
+its page adds a Waiting for you row. That row lists the open requests and
+PgUp/PgDn pages through them; Enter opens one. In a request, Up/Down moves
+between its options, Other and Send answer, and Enter selects the highlighted
+row: nothing is chosen until you press Enter on it. Other opens an editor where
+Ctrl+J starts a new line and Enter or Esc returns. Send answer records the
+answer; when the result is uncertain, only the same answer can be retried. A
+note added to a chosen option is written in the Web UI; here an answer is an
+option or Other.
+Requests that cannot be answered here, such as ones from another Group, say so
+and are answered in the Web conversation.
+
+Commands:
+
+- `/groups` opens the page of the Group selected on the main screen.
+- `/sessions` lists every native session this CCCC knows. Enter shows the
+  selected session's details.
+- `/setup` connects Codex, Claude Code, Pi or OpenCode sessions; see
+  [Native sessions](../guide/local-sessions).
+- `/help` lists the commands and keys. It scrolls with Up/Down when the terminal
+  is short.
+- `/quit` (or `/exit`, or Ctrl+C on any page) stops what this launch started:
+  the Web server, and the daemon when this launch started it. A daemon that was
+  already running keeps running. If stopping takes too long, a second Ctrl+C
+  forces an exit (after `/quit`, press Ctrl+C twice). After the interface
+  closes, the terminal shows what actually stopped.
+
+The interface is English only and needs at least 60x16 characters; on a wider
+terminal it stays within 100 columns. In a smaller terminal it shows only a
+notice and accepts only Ctrl+C, so nothing can be confirmed unseen. It does not use the mouse; Ctrl+Z does not
+suspend it (use `/quit`), and Ctrl+L redraws the screen. `NO_COLOR` turns its
+colors off.
+
+`cccc` runs headless, with plain log output and no terminal interface, when
+given `--headless`, when its input or output is not a terminal, or when
+`CCCC_WEB_MODE` / `CCCC_WEB_READONLY` select read-only Exhibit mode. Use
+`--headless` on servers, in containers, under a service manager and in scripts.
+It applies only to this launch, so `cccc --headless` with a subcommand is an
+error. Other options keep the interface: `cccc --port 9000` in a terminal opens
+it on port 9000.
 
 ### `cccc doctor`
 
 Check your environment and diagnose issues.
 
 ```bash
-cccc doctor             # Full environment check
+cccc doctor             # In a terminal: command, daemon, builds, agent CLIs, Web Model browser
+cccc doctor --json      # The full JSON report, which is also what a pipe or redirect gets
 ```
 
 Browser readiness uses the same Chrome/Edge discovery as the projected Web runtime on
 Linux, macOS, and Windows, and may additionally recognize system Chromium.
-On Linux, the report includes projected-browser readiness: system Chrome/Edge, required `Xvfb`
+On Linux, the JSON report includes projected-browser readiness: system Chrome/Edge, required `Xvfb`
 isolation, and the optional `x11vnc` VNC viewer. A missing `x11vnc` does not prevent browser
 isolation; CCCC falls back to its CDP screencast viewer.
 
@@ -37,9 +124,15 @@ current launcher's directory to the front of PATH and open a new terminal.
 List available agent runtimes.
 
 ```bash
-cccc runtime list       # List detected runtimes
-cccc runtime list --all # List all supported runtimes
+cccc runtime list       # List supported runtimes and whether each is available
+cccc runtime list --all # Also include the custom runtime
 ```
+
+## Local native sessions
+
+`cccc sessions enable|disable --runtime codex|claude|pi|opencode` installs or removes the same-user native integration; `/setup` in the terminal interface runs the same enable step for the apps you pick. Use `cccc sessions list [--include-offline]`, `send --to <source_id> --text <text>`, and `create --sources <ids...>` to collaborate without pairwise invitations.
+
+Use `cccc sessions join --group <group_id> --sources <ids...>` to add sources to an existing Group, or `leave --group <group_id> --from <source_id>` to pause one source's access without stopping its native process. `recovery --group <group_id> --actor <actor_id>` reads local recovery instructions; adding `--refresh` explicitly rechecks Codex's existing receive channel. Neither form starts or resumes the native application or replays messages. See [Native sessions](../guide/local-sessions) for requirements, reload steps and lifecycle semantics.
 
 ## Daemon Commands
 
@@ -48,15 +141,17 @@ cccc runtime list --all # List all supported runtimes
 Manage the CCCC daemon.
 
 ```bash
-cccc daemon status      # Check daemon status
-cccc daemon start       # Start daemon
-cccc daemon stop        # Stop daemon
+cccc daemon status              # Check daemon status
+cccc daemon start               # Start daemon
+cccc daemon stop                # Stop the daemon and every agent it manages
+cccc daemon stop --keep-agents  # Linux and native arm64 macOS: stop only the daemon and keep agents running
 ```
 
 Notes:
 
 - `cccc daemon start` refuses to spawn a duplicate daemon if the pid-file process is still alive but IPC is not responding.
-- Check `cccc daemon status` and `cccc doctor` before restarting an unresponsive daemon. `cccc daemon stop` stops its managed processes across Groups; after it completes, `cccc daemon start` starts the daemon again.
+- Check `cccc daemon status` and `cccc doctor` before restarting an unresponsive daemon. `cccc daemon stop` stops its managed processes across Groups and reports which agents it stopped; after it completes, `cccc daemon start` starts the daemon again.
+- On Linux and Apple Silicon Macs running the native arm64 build, `cccc daemon stop --keep-agents` stops only the daemon for maintenance such as an update. The agents CCCC started keep running, and the next `cccc daemon start` reattaches them and names them. A daemon that cannot do this (an older version, an Intel macOS build, or a Windows build) refuses the option and stops nothing. See [Keeping agents across a restart](../guide/operations.md#keeping-agents-across-a-restart).
 
 ## Membership and Reach Commands
 
@@ -74,7 +169,7 @@ cccc reach off         # Stop publication without removing local identity
 ```
 
 The token-bearing Web URL is shown here; keep it private. ChatGPT/Web Model
-connector credentials are actor-specific and are managed from that actor's Web
+connector credentials are agent-specific and are managed from that agent's Web
 Model settings. Windows helper installation is not included in this release
 candidate, so Reach is unavailable there.
 
@@ -121,18 +216,21 @@ cccc group create --title "my-group"         # Create group
 cccc group show <group_id>                   # Show group metadata
 cccc group update --group <id> --title "..." # Update title/topic
 cccc group use <group_id> .                  # Set active scope
-cccc group start --group <id>                # Start group actors
-cccc group stop --group <id>                 # Stop group actors
+cccc group start --group <id>                # Start the Group's agents
+cccc group stop --group <id>                 # Stop the Group's agents
 cccc group set-state idle --group <id>       # Set state: active/idle/paused/stopped
 cccc group detach-scope <scope_key> --group <id>
 cccc group delete --group <id> --confirm <id>
 ```
 
-## Actor Commands
+`set-state stopped` is the same as `group stop`: it stops the Group's agents and
+delivery to its native members, never only its recorded state.
+
+## Agent Commands {#actor-commands}
 
 ### `cccc actor add`
 
-Add a new actor to the group.
+Add a new agent to the Group.
 
 ```bash
 cccc actor add <actor_id> --runtime claude
@@ -145,12 +243,13 @@ Options:
 - `--runtime`: Agent runtime (claude, codex, web_model, droid, etc.)
 - `--command`: Custom command (for custom runtime)
 - `--title`: Display title
+- `--model-label`: Optional model name the operator declares for people and external tools; CCCC does not check it or use it to launch the runtime
 
-For the ChatGPT Web Model actor, create and start the actor from the target CCCC Web group, then finish ChatGPT sign-in, MCP URL, and chat binding in `Settings > Global > ChatGPT Web Model`.
+For a ChatGPT Web Model agent, create and start the agent from the target Group in the CCCC Web UI, then finish ChatGPT sign-in, MCP URL and chat binding in **Settings → This instance → Web Models → ChatGPT**.
 
 ### `cccc actor`
 
-Manage actors.
+Manage agents.
 
 ```bash
 cccc actor list                    # List actors
@@ -158,12 +257,14 @@ cccc actor add <actor_id> --scope /path/to/project
 cccc actor start <actor_id>        # Start actor
 cccc actor stop <actor_id>         # Stop actor
 cccc actor restart <actor_id>      # Restart actor
+cccc actor new-session <actor_id>  # Restart actor on a new session
 cccc actor remove <actor_id>       # Remove actor
 cccc actor update <actor_id> --scope /path/to/project
+cccc actor update <actor_id> --model-label "gpt-5-codex"   # An empty value clears it
 cccc actor secrets <actor_id> ...  # Manage runtime-only secrets
 ```
 
-Actor scope arguments are project paths at the CLI boundary. CCCC resolves them
+Agent scope arguments are project paths at the CLI boundary. CCCC resolves them
 to the attached scope key before persistence.
 
 ## Message Commands
@@ -175,7 +276,7 @@ Send a message.
 ```bash
 cccc send "Hello"                  # No --to: default recipient policy applies (default: foreman)
 cccc send "Hello" --to @foreman    # Send to foreman
-cccc send "Hello" --to peer-1      # Send to specific actor
+cccc send "Hello" --to peer-1      # Send to a specific agent
 cccc send "Announcement" --to @all # Explicit broadcast
 cccc send "Please answer" --to peer-1 --mode request-reply
 cccc send "For later" --to peer-1 --mode mail
@@ -238,14 +339,26 @@ cccc cancel-reply <event_id>
 
 ### `cccc inbox`
 
-Read and consume an actor's unread Mail, advancing its read cursor. This changes
-the actor's unread state; it is not a read-only view of the actor's responses.
+Read and consume an agent's unread Mail, advancing its read cursor. This changes
+the agent's unread state; it is not a read-only view of the agent's responses.
 Use `cccc tail` or Web chat to view recorded messages without consuming Mail.
 
 ```bash
 cccc inbox --actor-id <id>         # Read and consume the next unread Mail batch
 cccc inbox --actor-id <id> --limit 10
 ```
+
+### `cccc inbox-summary`
+
+Summarize the Mail still waiting for every agent in a Group, without consuming it.
+
+```bash
+cccc inbox-summary --cutoff 2026-10-30T00:00:00Z   # Per agent: waiting Mail, how much was sent at or before the cutoff, the oldest's age when known
+```
+
+It does not move read cursors, start agents or send notices, and returns no
+message text. The user, the system and the Group's Foreman may use it (`--by`,
+default `user`); peers may not.
 
 ### `cccc tail`
 
@@ -256,6 +369,25 @@ cccc tail                          # Show recent events
 cccc tail -n 50                    # Show last 50 events
 cccc tail -f                       # Follow new events
 ```
+
+### `cccc ledger search`
+
+Search the ledger through the daemon's `ledger_search` operation. Like
+`cccc tail`, it does not consume Mail.
+
+```bash
+cccc ledger search --by assistant                    # Events from one sender
+cccc ledger search --by-any peer-1 --by-any peer-2   # From any of several senders
+cccc ledger search --to user --kind chat             # Chat messages to one recipient
+cccc ledger search -q release --since 2026-11-01T00:00:00Z
+cccc ledger search --before <event_id> -n 20         # The page before an event
+```
+
+`--kind` accepts `all` (default), `chat` or `notify`. `--since` and `--until`
+are inclusive RFC 3339 times; `--before` and `--after` take event IDs and are
+exclusive. `-q` matches text anywhere in the event, ignoring case. The daemon
+clamps `--limit` (default 50) to 1–200. Without `--group`, the current Group
+is searched.
 
 ## IM Bridge Commands
 
@@ -343,7 +475,7 @@ a runtime choice. Use ordinary commands directly:
 
 ```bash
 cccc                 # launch daemon + Web
-cccc status          # show product, daemon, groups, actors, and agent runtimes
+cccc status          # show product, daemon, groups, agents and agent runtimes
 cccc doctor          # inspect the native installation and environment
 cccc daemon start    # explicit daemon lifecycle
 ```
@@ -363,23 +495,28 @@ cccc setup                         # Configure every supported runtime; unavaila
 cccc setup --runtime claude        # Report CCCC-owned per-session MCP for Claude Code
 cccc setup --runtime codex         # Auto-configure for Codex
 cccc setup --runtime copilot       # Auto-configure for GitHub Copilot CLI
-cccc setup --runtime cursor        # Show prompt-assisted setup contract for Cursor CLI
+cccc setup --runtime cursor        # Configure native Cursor CLI MCP
 cccc setup --runtime devin         # Auto-configure for Devin CLI
 cccc setup --runtime kiro          # Auto-configure for Kiro CLI
 cccc setup --runtime kimi          # Configure native Kimi Code MCP
 cccc setup --runtime kimi --runtime-mode acp  # Report session-owned MCP
 cccc setup --runtime auggie --runtime-mode acp # Report session-owned MCP
 cccc setup --runtime kiro --runtime-mode acp   # Official V3; session-owned MCP
-cccc setup --runtime hermes --runtime-mode acp # Official ACP; session-owned MCP
+cccc setup --runtime hermes        # Report session-owned MCP (both modes)
 cccc setup --runtime droid --runtime-mode acp  # Official ACP; session-owned MCP
 cccc setup --runtime pi            # Report CCCC-owned RPC session MCP
-cccc setup --runtime kilo          # Show prompt-assisted setup contract for Kilo Code CLI
-cccc setup --runtime antigravity   # Show prompt-assisted setup contract for Antigravity CLI
+cccc setup --runtime kilo          # Report CCCC-owned per-session MCP for Kilo Code CLI
+cccc setup --runtime deepseek      # Install or repair the pinned DeepSeek Harness
+cccc setup --runtime antigravity   # Auto-configure for Antigravity CLI
 ```
 
-Without `--runtime`, setup performs one batch pass: installed CLI runtimes are configured,
-prompt-assisted/manual runtimes return their configuration contract, and missing runtimes are
-reported without aborting the remaining setup work.
+Without `--runtime`, setup makes one pass over every supported runtime and reports each result
+without stopping at a failure. A runtime whose `cccc` MCP entry lives in its own configuration gets
+that entry written or confirmed when its CLI is installed; a missing CLI or a failed setup is
+reported as `unavailable`. Claude Code, OpenCode, Kilo, Pi, Hermes and DeepSeek report that CCCC
+injects their MCP into each managed session; DeepSeek reports `setup_required` until it is
+installed. `custom` returns the configuration to add by hand. The batch `configured` count includes
+only the runtimes whose entry setup wrote or confirmed.
 
 ### `cccc update`
 
@@ -436,7 +573,14 @@ Notes:
   and close foreground CCCC processes before asking pip to replace it.
 - A standalone update restarts the daemon when it was running, while the old
   combined Web process remains stopped; the next bare `cccc` starts the updated
-  Web process.
+  Web process. Restarting the daemon this way also stops its agents. If CCCC
+  cannot confirm that every agent stopped, the update is not installed, the
+  previous version is kept and CCCC stays stopped; finish stopping CCCC with
+  `cccc daemon stop`, following what it reports, then run the update again. On Linux and native arm64 macOS,
+  to update while agents keep running, run `cccc daemon stop --keep-agents`,
+  then `cccc update`, then `cccc daemon start`. When the daemon is not running,
+  the update goes ahead only if no agent is left running, or if CCCC kept them
+  this way and the new version can reach each of them; otherwise it says why.
 - On Windows, standalone self-update continues in a separate PowerShell process
   after the original executable exits so the binary can be replaced safely.
 
@@ -445,7 +589,9 @@ Notes:
 ### `cccc web`
 
 Start the Web UI, reusing an existing daemon or starting one if needed, just
-like `cccc` with no subcommand.
+like `cccc --headless`: never with the terminal interface, always with plain log
+output. Unlike `cccc --headless`, it accepts `--exhibit` (or `--mode exhibit`)
+for a read-only Web UI.
 
 ```bash
 cccc web                           # Start Web UI
@@ -478,6 +624,10 @@ cccc mcp                           # Start MCP server (stdio mode)
 | `CCCC_WEB_PORT` | saved setting, then `8848` | Web UI port; `--port` overrides both |
 | `CCCC_WEB_MODE` | `normal` | Set to `exhibit` for a read-only Web UI |
 | `CCCC_WEB_READONLY` | unset | Truthy value also enables read-only exhibit mode |
+
+`CCCC_HOME`, `CCCC_GROUP_ID` and `CCCC_ACTOR_ID` reserve two exact values each
+as an MCP placeholder that a runtime could not fill, such as `${env:CCCC_HOME}`
+and `$CCCC_HOME`; either one counts as unset.
 
 For `cccc` and `cccc web`, an existing live Web binding is reused when neither
 `--host` nor `--port` is supplied. Otherwise, each value resolves from its command

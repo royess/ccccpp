@@ -8,10 +8,14 @@ use cccc_contracts::{
     Actor, DaemonRequest, Event,
     connect::{ConnectActor, ConnectGroup},
     connect_message::*,
+    message_args::MessageWrite,
 };
 use cccc_core::{GroupDoc, GroupStore, HomeLayout, connect_catalog, connect_delivery, ledger};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+pub(crate) const DELIVERY_WINDOW_ENDED: &str = "delivery window ended";
+pub(crate) const EXTERNAL_GROUP_DISCONNECTED: &str = "external Group connection was disconnected";
 
 pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
     matches!(request.op.as_str(), "connect_send" | "connect_send_files")
@@ -19,6 +23,7 @@ pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
 }
 
 fn send(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
+    super::messaging::accept_arguments(request, MessageWrite::ConnectSend)?;
     send_with_reply(home, request, None, false)
 }
 
@@ -34,6 +39,9 @@ fn send_with_reply(
     reply: Option<ReplyContext>,
     preflight: bool,
 ) -> OpResult {
+    super::messaging::reject_chet_provenance(&request.args)?;
+    reject_chet_connect(home, request)?;
+    super::messaging::reply_questions::reject_fields(&request.args, "a Connect message")?;
     let group_id = connect_peer::authorize_local_source(home, request)?;
     if request
         .args
@@ -205,7 +213,7 @@ fn send_with_reply(
                     "paths must contain 1–16 source-scope files",
                 )
             })?;
-        super::messaging::files::read(&source, paths, connect_delivery::MAX_ATTACHMENT_BYTES)?
+        super::messaging::files::read(&source, by, paths, connect_delivery::MAX_ATTACHMENT_BYTES)?
             .apply(home, &source, &mut data)?;
     }
     let attachments = if preflight {
@@ -323,6 +331,31 @@ fn send_with_reply(
     object(
         json!({"accepted":true,"queued":true,"delivery_state":"queued","delivery_id":id,"source_event":entry.source_event,"source_projected":projected}),
     )
+}
+
+/// Connect does not yet carry Chet as a distinct service identity. Refuse the
+/// request before source acceptance or file reads instead of sending as user.
+fn reject_chet_connect(home: &HomeLayout, request: &DaemonRequest) -> Result<(), OpError> {
+    if !request
+        .args
+        .contains_key(cccc_core::voice_notifications::ORIGIN_ARG)
+    {
+        return Ok(());
+    }
+    let by = request
+        .args
+        .get("by")
+        .and_then(Value::as_str)
+        .unwrap_or("user");
+    if super::messaging::effective_message_author(home, request, by)?
+        == cccc_core::actors::CHET_SERVICE_PRINCIPAL
+    {
+        return Err(OpError::new(
+            "chet_cross_group_unsupported",
+            "Chet cannot send through Connect yet; ask the user or a Group member to relay the message",
+        ));
+    }
+    Ok(())
 }
 
 fn check_retry(event: &Event, digest: &str) -> Result<(), OpError> {
@@ -494,6 +527,7 @@ pub(super) fn reply(
     mode: &str,
     preflight: bool,
 ) -> OpResult {
+    reject_chet_connect(home, request)?;
     let original = connect_messages::stored_message(target)?;
     let incoming = target
         .data
@@ -578,6 +612,23 @@ pub(super) fn reply(
     Ok(result)
 }
 
+/// What the sender should do next. A delivery that ran out of time or lost
+/// its connection before any receipt was pending never reached the target, so
+/// it was not refused and a plain resend is the action.
+fn failure_next_step(cancellation: bool, state: &str, reason: &str) -> &'static str {
+    if cancellation {
+        "The reply request may still be active on the target. This does not stop an Actor or retract delivered work."
+    } else if state != "failed" {
+        "The target may have received this message. Check with the target before sending again."
+    } else if reason == DELIVERY_WINDOW_ENDED {
+        "The delivery window ended before the target received this message. Send it again if it is still needed."
+    } else if reason == EXTERNAL_GROUP_DISCONNECTED {
+        "The connection closed before the target received this message. Reconnect, then send it again if it is still needed."
+    } else {
+        "The target did not accept this message. Resolve the failure before sending a new message."
+    }
+}
+
 /// Called under the source Group permit, before the active record is removed.
 /// A final receipt and its optional notification are independently recoverable.
 pub(crate) fn notify_delivery_failure(
@@ -618,13 +669,6 @@ pub(crate) fn notify_delivery_failure(
         (false, "failed") => "Connect delivery failed",
         (false, _) => "Connect delivery unconfirmed",
     };
-    let next = if cancellation {
-        "The reply request may still be active on the target. This does not stop an Actor or retract delivered work."
-    } else if state == "failed" {
-        "The target did not accept this message. Resolve the failure before sending a new message."
-    } else {
-        "The target may have received this message. Check with the target before sending again."
-    };
     let reason = receipt
         .data
         .get("error")
@@ -633,6 +677,7 @@ pub(crate) fn notify_delivery_failure(
         .chars()
         .take(1024)
         .collect::<String>();
+    let next = failure_next_step(cancellation, state, &reason);
     let text = format!(
         "{title}: {} / {}. {next} Reason: {reason}. Source event: {}.",
         work.target().instance_id,
@@ -646,4 +691,29 @@ pub(crate) fn notify_delivery_failure(
         "context":{"transport":"connect","delivery_id":work.delivery_id(),"state":state,"dst_instance_id":work.target().instance_id,"dst_group_id":work.target().group_id}
     }).as_object().expect("notification").clone() },"system.notify")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod failure_next_step_tests {
+    use super::{DELIVERY_WINDOW_ENDED, EXTERNAL_GROUP_DISCONNECTED, failure_next_step};
+
+    #[test]
+    fn an_expired_or_disconnected_delivery_is_not_reported_as_refused() {
+        for reason in [DELIVERY_WINDOW_ENDED, EXTERNAL_GROUP_DISCONNECTED] {
+            let next = failure_next_step(false, "failed", reason);
+            assert!(!next.contains("did not accept"), "{reason}: {next}");
+            assert!(
+                next.to_lowercase().contains("send it again"),
+                "{reason}: {next}"
+            );
+        }
+        assert!(
+            failure_next_step(false, "failed", "rejected by target").contains("did not accept")
+        );
+        assert!(
+            failure_next_step(false, "unconfirmed", DELIVERY_WINDOW_ENDED)
+                .contains("may have received")
+        );
+        assert!(failure_next_step(true, "failed", DELIVERY_WINDOW_ENDED).contains("reply request"));
+    }
 }

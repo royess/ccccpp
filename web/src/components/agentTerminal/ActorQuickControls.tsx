@@ -1,7 +1,8 @@
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Maximize2, MoreHorizontal, Play, RefreshCw, MousePointer2 } from "lucide-react";
+import { RefreshCw, MousePointer2 } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
+import { ExpandIcon, LcdIcon, PlayIcon, VoiceMoreIcon } from "../Icons";
 
 export function ActorQuickControls({
   actorTitle,
@@ -20,7 +21,6 @@ export function ActorQuickControls({
   onLaunch,
   onReconnect,
   onTakeover,
-  onHistory,
   onNewSession,
   onRestart,
   onStop,
@@ -45,7 +45,6 @@ export function ActorQuickControls({
   onLaunch: () => void;
   onReconnect: () => void;
   onTakeover: () => void;
-  onHistory: () => void;
   onNewSession: () => void;
   onRestart: () => void;
   onStop: () => void;
@@ -82,37 +81,41 @@ export function ActorQuickControls({
       {!readOnly && !running ? (
         <button
           className={button}
+          data-lcd-key
           disabled={busy}
           onClick={onLaunch}
           title={t(startLabel)}
           aria-label={t(startLabel)}
         >
-          <Play size={14} />
+          <PlayIcon size={14} strokeWidth={2} absoluteStrokeWidth={false} />
         </button>
       ) : null}
       {!readOnly && running && hasTerminal ? (
         connectionFailed ? (
           <button
             className={button}
+            data-lcd-key
             onClick={onReconnect}
             title={t("reconnect")}
             aria-label={t("reconnect")}
           >
-            <RefreshCw size={14} />
+            <LcdIcon icon={RefreshCw} glyph="reload" size={14} />
           </button>
         ) : connected && !writable ? (
           <button
             className={`${button} @min-[480px]/actor-view:w-auto @min-[480px]/actor-view:px-1 text-xs`}
+            data-lcd-key
             onClick={onTakeover}
             title={t("takeControl")}
             aria-label={t("takeControl")}
           >
-            <MousePointer2 size={14} />
+            <LcdIcon icon={MousePointer2} glyph="pointer" size={14} />
             <span className="hidden @min-[480px]/actor-view:inline">{t("takeControl")}</span>
           </button>
         ) : (
           <button
             className={`${button} hidden @min-[480px]/actor-view:inline-flex`}
+            data-lcd-key
             disabled={!connected || !writable || busy}
             onClick={onInterrupt}
             title={t("sendInterruptTitle")}
@@ -122,7 +125,7 @@ export function ActorQuickControls({
           </button>
         )
       ) : null}
-      {!readOnly || hasTerminal ? (
+      {!readOnly ? (
         <Popover
           open={open}
           onOpenChange={(value) => {
@@ -134,13 +137,15 @@ export function ActorQuickControls({
             <button
               ref={triggerRef}
               className={`${button} relative`}
+              data-lcd-key
               title={t("actorControls", { actor: actorTitle })}
               aria-label={t("actorControls", { actor: actorTitle })}
             >
-              <MoreHorizontal size={15} />
+              <VoiceMoreIcon size={15} />
               {unreadCount > 0 ? (
                 <span
                   className="absolute right-0 top-0 h-1.5 w-1.5 rounded-full bg-amber-500"
+                  data-terminal-unread
                   aria-label={t("unreadMessages", { count: unreadCount })}
                 />
               ) : null}
@@ -149,7 +154,8 @@ export function ActorQuickControls({
           <PopoverContent
             align="end"
             sideOffset={4}
-            className="w-48 max-h-[min(440px,70vh)] overflow-y-auto rounded-xl p-1.5"
+            className="w-48 max-h-[min(440px,70vh,var(--radix-popover-content-available-height))] rounded-xl p-1.5"
+            data-lcd-menu
             aria-label={t("actorControls", { actor: actorTitle })}
             onEscapeKeyDown={(event) => event.stopPropagation()}
             onKeyDown={(event) => {
@@ -162,74 +168,66 @@ export function ActorQuickControls({
             <div className="truncate border-b border-[var(--glass-border-subtle)] px-2 py-1.5 text-xs font-semibold">
               {actorTitle}
             </div>
-            {hasTerminal ? (
-              <button className={item} onClick={() => run(onHistory, true)}>
-                {t("terminalHistory")}
+            {running && hasTerminal ? (
+              <button
+                className={item}
+                disabled={!connected || !writable || busy}
+                onClick={() => run(onInterrupt)}
+              >
+                {t("sendInterruptLabel")}
               </button>
             ) : null}
-            {!readOnly ? (
-              <>
-                {running && hasTerminal ? (
-                  <button
-                    className={item}
-                    disabled={!connected || !writable || busy}
-                    onClick={() => run(onInterrupt)}
-                  >
-                    {t("sendInterruptLabel")}
-                  </button>
-                ) : null}
-                {!running ? (
-                  <button className={item} disabled={busy} onClick={() => run(onLaunch)}>
-                    {t(startLabel)}
-                  </button>
-                ) : null}
-                {canStartNewSession ? (
-                  <button className={item} disabled={busy} onClick={() => run(onNewSession)}>
-                    {t("newSession")}
-                  </button>
-                ) : null}
-                {running && !pauseCcccAccess ? (
-                  <button className={item} disabled={busy} onClick={() => run(onRestart)}>
-                    {t("relaunch")}
-                  </button>
-                ) : null}
-                <button className={item} disabled={busy} onClick={() => run(onEdit, true)}>
-                  {t("editAgentConfig")}
-                </button>
-                <button className={item} onClick={() => run(onInbox, true)}>
-                  {t("inbox")}
-                  {unreadCount > 0 ? ` · ${unreadCount > 99 ? "99+" : unreadCount}` : ""}
-                </button>
-                <div className="my-1 border-t border-[var(--glass-border-subtle)]" />
-                {running ? (
-                  <button
-                    className={item}
-                    disabled={busy}
-                    title={pauseCcccAccess ? t("dotsPauseHint") : undefined}
-                    onClick={() => run(onStop)}
-                  >
-                    {t(pauseCcccAccess ? "dotsPause" : "quitAgent")}
-                  </button>
-                ) : null}
-                <button
-                  className={`${item} text-rose-600 dark:text-rose-400`}
-                  disabled={busy}
-                  onClick={() => run(onRemove)}
-                >
-                  {t("removeAgent")}
-                </button>
-              </>
+            {!running ? (
+              <button className={item} disabled={busy} onClick={() => run(onLaunch)}>
+                {t(startLabel)}
+              </button>
             ) : null}
+            {canStartNewSession ? (
+              <button className={item} disabled={busy} onClick={() => run(onNewSession)}>
+                {t("newSession")}
+              </button>
+            ) : null}
+            {running && !pauseCcccAccess ? (
+              <button className={item} disabled={busy} onClick={() => run(onRestart)}>
+                {t("relaunch")}
+              </button>
+            ) : null}
+            <button className={item} disabled={busy} onClick={() => run(onEdit, true)}>
+              {t("editAgentConfig")}
+            </button>
+            <button className={item} onClick={() => run(onInbox, true)}>
+              {t("inbox")}
+              {unreadCount > 0 ? ` · ${unreadCount > 99 ? "99+" : unreadCount}` : ""}
+            </button>
+            <div className="my-1 border-t border-[var(--glass-border-subtle)]" />
+            {running ? (
+              <button
+                className={item}
+                disabled={busy}
+                title={pauseCcccAccess ? t("dotsPauseHint") : undefined}
+                onClick={() => run(onStop)}
+              >
+                {t(pauseCcccAccess ? "dotsPause" : "quitAgent")}
+              </button>
+            ) : null}
+            <button
+              className={`${item} destructive-key text-rose-600 dark:text-rose-400`}
+              disabled={busy}
+              onClick={() => run(onRemove)}
+            >
+              {t("removeAgent")}
+            </button>
           </PopoverContent>
         </Popover>
       ) : null}
       <button
         className={button}
+        data-lcd-key
         onClick={onExpand}
         title={t("chat:workView.maximize", { actor: actorTitle })}
         aria-label={t("chat:workView.maximize", { actor: actorTitle })}
       >
-        <Maximize2 size={14} />
+        <ExpandIcon size={14} strokeWidth={2} absoluteStrokeWidth={false} />
       </button>
     </div>
   );

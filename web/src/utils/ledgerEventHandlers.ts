@@ -26,7 +26,14 @@ export function isRuntimeDeliveryEvent(
   ev: unknown,
 ): ev is BaseLedgerEvent & {
   kind: "runtime.delivery";
-  data: { actor_id?: string; source_event_id?: string; state?: string };
+  data: {
+    actor_id?: string;
+    source_event_id?: string;
+    state?: string;
+    reason?: string | null;
+    delivery_evidence?: string | null;
+    retryable?: boolean | null;
+  };
 } {
   return (
     ev !== null && typeof ev === "object" && (ev as BaseLedgerEvent).kind === "runtime.delivery"
@@ -69,15 +76,14 @@ export function hasRenderableChatMessageContent(event: {
   return refs.length > 0;
 }
 
-export function isActorActivityEvent(
-  ev: unknown,
-): ev is BaseLedgerEvent & {
+export function isActorActivityEvent(ev: unknown): ev is BaseLedgerEvent & {
   kind: "actor.activity";
   data: {
     actors: Array<{
       id: string;
       idle_seconds?: number | null;
-      running: boolean;
+      /** Absent when the session owner cannot be observed. */
+      running?: boolean;
       effective_working_state?: string;
       effective_working_reason?: string;
       effective_working_updated_at?: string | null;
@@ -221,6 +227,9 @@ export interface RuntimeDeliveryData {
   actorId: string;
   eventId: string;
   state: string;
+  reason: string;
+  evidence?: string;
+  waitingReason?: string;
 }
 
 /**
@@ -240,7 +249,28 @@ export function extractRuntimeDeliveryData(ev: unknown): RuntimeDeliveryData | n
   const eventId = String(ev.data?.source_event_id || "").trim();
   const state = String(ev.data?.state || "").trim();
   if (!actorId || !eventId || !state) return null;
-  return { actorId, eventId, state };
+  const rawEvidence = String(ev.data?.delivery_evidence || "").trim();
+  const evidence = state === "accepted" && rawEvidence ? rawEvidence : undefined;
+  const waitingReason =
+    state === "failed" && ev.data?.retryable === true ? "not_submitted" : undefined;
+  return {
+    actorId,
+    eventId,
+    state,
+    reason: String(ev.data?.reason || "").trim(),
+    evidence,
+    waitingReason,
+  };
+}
+
+/** A member that ended on its own with an error, not one that was stopped or quit. */
+export function extractFailedExit(ev: LedgerEvent): { actorId: string; code: number } | null {
+  if (ev.kind !== "actor.stop") return null;
+  const data = ev.data as { actor_id?: unknown; exit_code?: unknown; reason?: unknown } | undefined;
+  const actorId = String(data?.actor_id || "").trim();
+  const code = data?.exit_code;
+  if (data?.reason !== "process_exit" || !actorId) return null;
+  return typeof code === "number" && code !== 0 ? { actorId, code } : null;
 }
 
 export function extractCancelledSourceEventId(ev: unknown): string {

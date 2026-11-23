@@ -99,7 +99,7 @@ async fn fake_analyst_server_inner(
                     send_result(
                         &mut socket,
                         id,
-                        json!({"thread":{"id":"thread-controller","turns":[]}}),
+                        json!({"thread":{"id":"thread-controller","path":"fixture-rollout.jsonl","turns":[]}}),
                     )
                     .await
                 }
@@ -180,7 +180,7 @@ pub(super) async fn fake_disconnecting_analyst_server() -> (String, JoinHandle<(
                     send_result(
                         &mut socket,
                         id,
-                        json!({"thread":{"id":"thread-disconnect","turns":[]}}),
+                        json!({"thread":{"id":"thread-disconnect","path":"fixture-rollout.jsonl","turns":[]}}),
                     )
                     .await
                 }

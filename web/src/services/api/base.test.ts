@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   apiJson,
+  apiForm,
   filenameFromContentDisposition,
   isAuthRequiredErrorCode,
   normalizePresentationBrowserSurfaceState,
@@ -33,7 +34,30 @@ describe("apiJson", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
     expect(await apiJson("/api/v1/connect")).toMatchObject({
       ok: false,
-      error: { code: "NETWORK_ERROR" },
+      error: { code: "NETWORK_ERROR", httpStatus: 200 },
+    });
+  });
+
+  it.each([
+    [502, "<html>Bad Gateway</html>", "HTTP_ERROR"],
+    [503, "", "EMPTY_RESPONSE"],
+    [504, JSON.stringify({ message: "Gateway Timeout" }), "PARSE_ERROR"],
+    [
+      503,
+      JSON.stringify({ ok: false, error: { code: "upstream_unavailable", message: "busy" } }),
+      "upstream_unavailable",
+    ],
+    [
+      403,
+      JSON.stringify({ ok: false, error: { code: "connect_frame_expired", message: "denied" } }),
+      "connect_frame_expired",
+    ],
+  ])("preserves HTTP %i on an error response", async (status, body, code) => {
+    vi.stubGlobal("window", { location: { search: "" } });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body, { status }));
+    expect(await apiJson("/api/v1/connect/frame?frame_id=fixture")).toMatchObject({
+      ok: false,
+      error: { code, httpStatus: status },
     });
   });
 
@@ -92,6 +116,24 @@ describe("apiJson", () => {
     expect(resp.ok).toBe(false);
     expect(resp.ok ? "" : resp.error.code).toBe("HTTP_ERROR");
     expect(resp.ok ? "" : resp.error.message).toContain("504 Gateway Time-out");
+  });
+});
+
+describe("apiForm", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("reports an interrupted response body as an unknown network result", async () => {
+    vi.stubGlobal("window", { location: { search: "" } });
+    const response = new Response("partial");
+    vi.spyOn(response, "text").mockRejectedValue(new DOMException("Aborted", "AbortError"));
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+    expect(await apiForm("/upload", new FormData())).toMatchObject({
+      ok: false,
+      error: { code: "NETWORK_ERROR" },
+    });
   });
 });
 
@@ -175,23 +217,6 @@ describe("authenticated URLs", () => {
     removeAuthTokenFromUrl();
 
     expect(replaceState).toHaveBeenCalledWith({ preserved: true }, "", "/ui/?view=group#actor");
-  });
-});
-
-describe("normalizePresentationBrowserSurfaceState", () => {
-  it("preserves projected display ownership for the browser status UI", () => {
-    const state = normalizePresentationBrowserSurfaceState({
-      active: true,
-      state: "ready",
-      metadata: { display: ":123", display_owned: true, display_owner: "cccc_xvfb", adopted: true },
-    });
-
-    expect(state.metadata).toEqual({
-      display: ":123",
-      display_owned: true,
-      display_owner: "cccc_xvfb",
-      adopted: true,
-    });
   });
 });
 

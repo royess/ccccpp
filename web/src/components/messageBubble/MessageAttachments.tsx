@@ -1,49 +1,97 @@
-import type { MessageAttachment } from "../../types";
+import { useEffect } from "react";
+import {
+  useAttachmentPreviewStore,
+  useAttachmentSetShown,
+} from "../../stores/useAttachmentPreviewStore";
 import { classNames } from "../../utils/classNames";
 import { buildMessageAttachmentLinks } from "../../utils/messageAttachmentLinks";
 import {
+  attachmentDocumentKind,
+  isAudioAttachment,
   isImageAttachment,
   isSvgAttachment,
   isVideoAttachment,
 } from "../../utils/messageAttachments";
 import { FileIcon } from "../Icons";
+import { AudioAttachments } from "./AudioAttachments";
+import { DocumentAttachment } from "./DocumentAttachment";
 import { ImagePreview } from "./ImagePreview";
 import { VideoPreview } from "./VideoPreview";
 import { AuthenticatedDownloadLink } from "../AuthenticatedDownloadLink";
+import type { MessageAttachmentSource } from "../resourcePanel/openAttachmentResource";
+import { type PlacedAttachment, previewItems } from "./attachmentPreviewItems";
 
 export function MessageAttachments({
   attachments,
   blobGroupId,
+  panelGroupId,
+  sender,
+  sentAt,
   isUserMessage,
   isDark,
   attachmentKeyPrefix,
+  sourceEventId = "",
   downloadTitle,
-  sectionClassName,
 }: {
-  attachments: MessageAttachment[];
+  attachments: PlacedAttachment[];
   blobGroupId: string;
+  panelGroupId: string;
+  sender?: string;
+  sentAt?: string;
   isUserMessage: boolean;
   isDark: boolean;
   attachmentKeyPrefix: string;
+  sourceEventId?: string;
   downloadTitle: (name: string) => string;
-  sectionClassName?: string;
 }) {
   const imageAttachments = attachments.filter((attachment) => isImageAttachment(attachment));
   const videoAttachments = attachments.filter((attachment) => isVideoAttachment(attachment));
+  const audioAttachments = attachments.filter((attachment) => isAudioAttachment(attachment));
   const fileAttachments = attachments.filter(
-    (attachment) => !isImageAttachment(attachment) && !isVideoAttachment(attachment),
+    (attachment) =>
+      !isImageAttachment(attachment) &&
+      !isVideoAttachment(attachment) &&
+      !isAudioAttachment(attachment),
   );
   const useImageGrid = imageAttachments.length > 1;
+  const where = (attachment: PlacedAttachment) => ({
+    blobGroupId,
+    messageKey: attachmentKeyPrefix,
+    sender,
+    sentAt,
+    eventId: sourceEventId,
+    index: attachment.sourceIndex ?? attachments.indexOf(attachment),
+    blobPath: attachment.path || "",
+    localPreviewUrl: attachment.path ? undefined : attachment.local_preview_url || undefined,
+  });
+  // The attachments the page can show, in the message's own order rather than the order of the
+  // sections below; audio plays in place and other files download.
+  const siblings = previewItems(attachments, blobGroupId, where);
+  const sourceFor = (attachment: PlacedAttachment): MessageAttachmentSource => ({
+    panelGroupId,
+    ...where(attachment),
+    siblings,
+  });
+  // A preview or tab showing one of these attachments steps through the current list, such as
+  // the stored copies once an upload is confirmed.
+  const shown = useAttachmentSetShown(panelGroupId, attachmentKeyPrefix);
+  useEffect(() => {
+    if (shown && blobGroupId)
+      useAttachmentPreviewStore.getState().remember(panelGroupId, attachmentKeyPrefix, siblings);
+  }, [attachmentKeyPrefix, blobGroupId, panelGroupId, shown, siblings]);
 
   if (attachments.length <= 0 || !blobGroupId) return null;
 
   return (
-    <div className={sectionClassName || "mt-3"}>
+    <div className="mt-3" data-message-attachments>
       {imageAttachments.length > 0 && (
         <div
           className={classNames(
-            "max-w-full items-start gap-2",
-            useImageGrid ? "grid w-fit grid-cols-2" : "flex max-w-[min(30rem,82vw)] flex-col gap-3",
+            "items-start gap-2",
+            useImageGrid
+              ? "grid w-full max-w-[20.5rem] grid-cols-2 sm:max-w-[22.5rem]"
+              : "flex max-w-[min(100%,30rem,82vw)] flex-col gap-3",
+            !useImageGrid && !isUserMessage && "w-[min(30rem,82vw)]",
           )}
         >
           {imageAttachments.map((attachment, index) => {
@@ -59,10 +107,11 @@ export function MessageAttachments({
                 key={`img:${attachmentKeyPrefix}:${index}`}
                 className={classNames(
                   "flex flex-col",
-                  useImageGrid ? "w-[10rem] sm:w-[11rem]" : "w-full max-w-[min(30rem,82vw)]",
+                  useImageGrid ? "min-w-0 w-full" : "w-full max-w-[min(30rem,82vw)]",
                 )}
               >
                 <ImagePreview
+                  resource={sourceFor(attachment)}
                   href={links.previewHref}
                   downloadHref={links.downloadHref}
                   downloadName={links.downloadName}
@@ -81,6 +130,7 @@ export function MessageAttachments({
         <div
           className={classNames(
             "flex max-w-full flex-col items-start gap-3",
+            !isUserMessage && "w-[min(30rem,82vw)]",
             imageAttachments.length > 0 && "mt-3",
           )}
         >
@@ -91,11 +141,11 @@ export function MessageAttachments({
               title: attachment.title,
               localPreviewUrl: attachment.local_preview_url,
               fallbackLabel: "video",
-              preferStoredPreview: true,
             });
             return (
               <VideoPreview
                 key={`video:${attachmentKeyPrefix}:${index}`}
+                resource={sourceFor(attachment)}
                 href={links.previewHref}
                 downloadHref={links.downloadHref}
                 downloadName={links.downloadName}
@@ -106,11 +156,28 @@ export function MessageAttachments({
           })}
         </div>
       )}
+      {audioAttachments.length > 0 && (
+        <div
+          className={classNames(
+            (imageAttachments.length > 0 || videoAttachments.length > 0) && "mt-3",
+          )}
+        >
+          <AudioAttachments
+            attachments={audioAttachments}
+            blobGroupId={blobGroupId}
+            attachmentKeyPrefix={attachmentKeyPrefix}
+            downloadTitle={downloadTitle}
+          />
+        </div>
+      )}
       {fileAttachments.length > 0 && (
         <div
           className={classNames(
             "flex max-w-full flex-wrap items-start gap-2",
-            (imageAttachments.length > 0 || videoAttachments.length > 0) && "mt-3",
+            (imageAttachments.length > 0 ||
+              videoAttachments.length > 0 ||
+              audioAttachments.length > 0) &&
+              "mt-3",
           )}
         >
           {fileAttachments.map((attachment, index) => {
@@ -121,6 +188,20 @@ export function MessageAttachments({
               localPreviewUrl: attachment.local_preview_url,
               fallbackLabel: "file",
             });
+            const documentKind = attachmentDocumentKind(attachment);
+            if (documentKind) {
+              return (
+                <DocumentAttachment
+                  key={`file:${attachmentKeyPrefix}:${index}`}
+                  resource={sourceFor(attachment)}
+                  kind={documentKind}
+                  downloadHref={links.downloadHref}
+                  downloadName={links.downloadName}
+                  label={links.label}
+                  downloadTitle={downloadTitle(links.label)}
+                />
+              );
+            }
             return (
               <AuthenticatedDownloadLink
                 key={`file:${attachmentKeyPrefix}:${index}`}

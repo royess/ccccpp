@@ -302,6 +302,27 @@ fn copy_actor(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         .iter()
         .find(|actor| actor.id == actor_id)
         .ok_or_else(|| OpError::new("actor_not_found", "actor not found"))?;
+    // Saving a configuration as a Profile copies the environment in a second
+    // request; the caller can pin the member it read the configuration from.
+    if string_arg(request, "expected_actor_generation")
+        .is_some_and(|expected| expected != cccc_core::actors::generation_identity(actor))
+        || string_arg(request, "expected_actor_updated_at")
+            .is_some_and(|expected| expected != actor.updated_at)
+    {
+        return Err(OpError::new(
+            "actor_changed",
+            "This member changed after its configuration was read. Reload it and save the Profile again.",
+        ));
+    }
+    // Its credentials belong to the native application, and a private file
+    // left from an earlier configuration is not one to save. Copying would
+    // replace the Profile's values with nothing it can use.
+    if !actor.external_session_id.is_empty() {
+        return Err(OpError::new(
+            "external_session_owned",
+            "Configure native session credentials in the original runtime",
+        ));
+    }
     if !actor.profile_id.is_empty() {
         let source = profiles
             .get_ref(
@@ -382,7 +403,7 @@ fn copy_profile(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
 }
 
 fn copy_voice_secrets(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
-    if !bool_arg(request, "is_admin", false) {
+    if !super::profile_access::explicit_admin(request) {
         return Err(OpError::new(
             "permission_denied",
             "administrator access is required to copy voice runtime secrets",

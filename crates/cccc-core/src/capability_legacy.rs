@@ -143,6 +143,9 @@ fn parse_capability(value: &Value) -> Option<Capability> {
         source_uri: nonempty(value.get("source_uri"))
             .unwrap_or_default()
             .to_owned(),
+        sync_state: nonempty(value.get("sync_state"))
+            .unwrap_or_default()
+            .to_owned(),
         qualification_status: nonempty(value.get("qualification_status"))
             .unwrap_or("qualified")
             .to_owned(),
@@ -150,6 +153,8 @@ fn parse_capability(value: &Value) -> Option<Capability> {
             .get("enable_supported")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        metadata: crate::capabilities::record_metadata(value),
+        release_owned: false,
     })
 }
 

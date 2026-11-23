@@ -2,7 +2,7 @@
 import { act, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { useModalStore } from "../../stores";
+import { useModalStore, useUIStore } from "../../stores";
 import type { ActorSecretChanges } from "./actorSecretManagerModel";
 const mocks = vi.hoisted(() => ({ env: vi.fn(), status: vi.fn(), native: vi.fn() }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
@@ -126,6 +126,65 @@ describe("Web Model effective Actor configuration", () => {
   });
   const button = (label: string) =>
     [...host.querySelectorAll("button")].find((b) => b.textContent === label)!;
+  it.each([
+    { revision: 2, switches: false },
+    { revision: 3, switches: true },
+  ])(
+    "uses the applied Profile revision to distinguish a restart from a switch ($revision)",
+    async ({ revision, switches }) => {
+      const previous = useUIStore.getState();
+      useUIStore.setState({ isWebAdmin: true, webReadOnly: false });
+      const p = props();
+      p.linkedProfileId = "profile-1";
+      p.linkedProfileScope = "global";
+      p.savedActor = {
+        id: "alpha",
+        title: p.title,
+        runtime: "codex",
+        runtime_mode: "default",
+        command: ["codex"],
+        capability_autoload: ["skill:fixture"],
+        profile_id: "profile-1",
+        profile_scope: "global",
+        profile_revision_applied: 2,
+      };
+      p.actorProfiles = [
+        {
+          id: "profile-1",
+          name: "Profile",
+          scope: "global",
+          runtime: "codex",
+          runner: "pty",
+          command: ["codex"],
+          submit: "enter",
+          env: {},
+          created_at: "",
+          updated_at: "",
+          revision,
+        },
+      ];
+      try {
+        await act(async () => root.render(<ActorConfigModal {...p} />));
+        await act(async () => button("saveAndRestart").click());
+        if (switches) {
+          expect(p.onSaveAndRestart).not.toHaveBeenCalled();
+          const confirm = [...document.querySelectorAll("button")].find(
+            (item) => item.textContent === "runtimeSwitch.confirm",
+          )!;
+          await act(async () => confirm.click());
+          expect(p.onSaveAndRestart).toHaveBeenCalledWith(
+            expect.objectContaining({ runtimeSwitch: expect.objectContaining({ start: true }) }),
+          );
+        } else {
+          expect(p.onSaveAndRestart).toHaveBeenCalledWith(
+            expect.not.objectContaining({ runtimeSwitch: expect.anything() }),
+          );
+        }
+      } finally {
+        useUIStore.setState(previous, true);
+      }
+    },
+  );
   it("shows ACP settings on runtime selection and preserves the saved mode baseline", async () => {
     const p = props();
     p.runtime = "antigravity";
@@ -274,9 +333,8 @@ describe("Web Model effective Actor configuration", () => {
     await act(async () => root.render(<ActorConfigModal {...p} runtime="web_model" command="" />));
     expect(host.textContent).not.toContain("conversation-setup");
     await act(async () => button("common:save").click());
-    expect(p.onSave).toHaveBeenLastCalledWith(
-      expect.objectContaining({ setVars: {}, unsetKeys: [], clear: false }),
-    );
+    expect(p.onSave).not.toHaveBeenCalled();
+    expect(host.textContent).toContain("secretDraftNotApplied");
     await act(async () => root.render(<ActorConfigModal {...p} />));
     await act(async () => button("common:save").click());
     expect(p.onSave).toHaveBeenLastCalledWith(
@@ -302,7 +360,8 @@ describe("Web Model effective Actor configuration", () => {
     expect(useModalStore.getState().settingsTarget).toMatchObject({
       scope: "global",
       tab: "webModels",
-      webModelProvider: "dots",
+      webModelProvider: "chatgpt_web",
+      webModelSection: "connector",
     });
     expect(p.onCancel).not.toHaveBeenCalled();
   });
@@ -457,6 +516,7 @@ describe("Web Model effective Actor configuration", () => {
   });
 
   it("compares a failed multi-step save against the persisted Actor while keeping the draft", async () => {
+    vi.stubGlobal("confirm", vi.fn().mockReturnValue(true));
     const p = props();
     p.savedActor = {
       id: p.actorId,
@@ -493,6 +553,7 @@ describe("Web Model effective Actor configuration", () => {
   });
 
   it("accepts a Bot URL immediately when switching to Grok and submits it with the runtime draft", async () => {
+    vi.stubGlobal("confirm", vi.fn().mockReturnValue(true));
     const p = props();
     await act(async () => root.render(<ActorConfigModal {...p} />));
     await act(async () => root.render(<ActorConfigModal {...p} runtime="grok_web_model" />));
@@ -524,8 +585,6 @@ describe("Web Model effective Actor configuration", () => {
     expect(p.onSave).toHaveBeenCalledWith(expect.objectContaining({ grokBotUrl: url }));
     expect(input!.value).toBe(url);
     expect(host.textContent).toContain("fixture bind failed");
-    await act(async () => button("saveAndRestart").click());
-    expect(p.onSaveAndRestart).toHaveBeenCalledWith(expect.objectContaining({ grokBotUrl: url }));
     await act(async () => root.render(<ActorConfigModal {...p} />));
     expect(host.querySelector('input[type="url"]')).toBeNull();
     const calls = vi.mocked(p.onSave).mock.calls.length;
@@ -537,5 +596,73 @@ describe("Web Model effective Actor configuration", () => {
       root.render(<ActorConfigModal {...p} actorId="beta" runtime="grok_web_model" />),
     );
     expect(host.querySelector<HTMLInputElement>('input[type="url"]')!.value).toBe("");
+  });
+
+  it("offers separate save and safe restart actions when changing a running member to Grok", async () => {
+    const confirmSave = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    vi.stubGlobal("confirm", confirmSave);
+    const before = useUIStore.getState();
+    useUIStore.setState({ isWebAdmin: true, webReadOnly: false });
+    const p = props();
+    p.isRunning = true;
+    p.savedActor = {
+      id: p.actorId,
+      generation: "generation-1",
+      updated_at: "2026-01-01T00:00:00Z",
+      runtime: "codex",
+      command: ["codex"],
+      title: p.title,
+      capability_autoload: ["skill:fixture"],
+    };
+    try {
+      await act(async () => root.render(<ActorConfigModal {...p} />));
+      await act(async () => root.render(<ActorConfigModal {...p} runtime="grok_web_model" />));
+      const input = host.querySelector<HTMLInputElement>('input[type="url"]')!;
+      const url = "https://grok.com/bot/1373170d-9cf2-408c-b597-e243e5884f4a";
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, url);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(button("common:save")).toBeDefined();
+      expect(button("saveAndRestart")).toBeDefined();
+      await act(async () => button("common:save").click());
+      expect(confirmSave).toHaveBeenCalledWith("runtimeSwitch.managedToWebSaveConfirm");
+      expect(p.onSave).not.toHaveBeenCalled();
+      await act(async () => button("common:save").click());
+      expect(p.onSave).toHaveBeenCalledWith(expect.objectContaining({ grokBotUrl: url }));
+      expect(p.onSaveAndRestart).not.toHaveBeenCalled();
+
+      await act(async () => button("saveAndRestart").click());
+      expect(document.body.textContent).toContain("runtimeSwitch.managedToWeb");
+      const confirm = [...document.querySelectorAll("button")].find(
+        (item) => item.textContent === "runtimeSwitch.confirm",
+      )!;
+      await act(async () => confirm.click());
+      expect(p.onSaveAndRestart).toHaveBeenCalledWith(
+        expect.objectContaining({
+          grokBotUrl: url,
+          runtimeSwitch: expect.objectContaining({ start: true }),
+        }),
+      );
+    } finally {
+      useUIStore.setState(before, true);
+    }
+  });
+
+  it("warns before saving away from a Web conversation that may still be processing", async () => {
+    const confirmSave = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    vi.stubGlobal("confirm", confirmSave);
+    const p = props();
+    p.savedRuntime = "web_model";
+    p.runtime = "web_model";
+    p.savedActor = { id: p.actorId, runtime: "web_model", title: p.title };
+    await act(async () => root.render(<ActorConfigModal {...p} />));
+    await act(async () => button("runtimeSwitch.managed").click());
+    await act(async () => root.render(<ActorConfigModal {...p} runtime="codex" />));
+    await act(async () => button("common:save").click());
+    expect(confirmSave).toHaveBeenCalledWith("runtimeSwitch.oldWebSaveConfirm");
+    expect(p.onSave).not.toHaveBeenCalled();
+    await act(async () => button("common:save").click());
+    expect(p.onSave).toHaveBeenCalledOnce();
   });
 });

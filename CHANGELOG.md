@@ -6,6 +6,1707 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and versions
 
 ## [Unreleased]
 
+## [0.4.60]
+
+### Added
+
+- **Unattended** mode (experimental, off by default): an instance-wide switch in Chet's title
+  bar. While it is on, each new message a member of a Group on this instance sends to the user
+  with Send or Send + Reply also goes to Chet,
+  which can reply, answer the user's question cards (recorded as Chet's answer on the user's
+  behalf and closing the card everywhere), or point out a risk. Chet's history shows each copy;
+  Chet's entry asks for attention when its Runtime is not ready. New daemon operations
+  `unattended_get` and `unattended_update`; `cccc_message_reply` takes a structured `answer`
+  for Chet in this mode.
+- Each browser can choose **All messages to me** or **Only when a reply is requested** in
+  **Settings > Notifications**. Both options include messages requesting a reply or
+  decision, including choice cards.
+- When CCCC has the evidence, the recipient list says whether a message was **Written to
+  terminal (execution unconfirmed)** or **Accepted by the runtime**, and can show why an
+  undelivered message is waiting. **Show recipient status** in a plain message's action menu
+  opens it; the list refreshes each time it opens and offers **Send now** for eligible deliveries.
+  `cccc ledger search --with-obligation-status`, and an agent reading one visible
+  message with `with_obligation_status`, see the same delivery facts, projected by direction.
+- In developer mode, `debug_snapshot` reports ledger-index cache counters and, on Linux, the
+  daemon's process memory.
+
+### Changed
+
+- Switches have a smaller knob with a margin and keep the track's color, so on and off are told
+  apart by the knob's side and fill.
+- A delivery that can still be retried, including one hitting a full delivery queue, shows
+  its waiting reason instead of failing; **Delivery failed** is kept for final failures. Mail
+  the member has already read is not shown as waiting.
+- For a member kept running by its session process, Start, Stop, Restart, New session,
+  Remove and enabling or disabling it first check that CCCC can reach that process; if the
+  check fails, the request is refused before any state changes.
+- OpenCode members keep an `OPENCODE_CONFIG_CONTENT` configuration inherited from CCCC's
+  environment; a member's own setting still wins.
+
+### Fixed
+
+- While CCCC is running, if one of two session owners stops responding, new messages can
+  still reach running members whose healthy owner CCCC can verify, and those members can be
+  stopped individually. Managed and DeepSeek members kept running from v0.4.59 need a
+  restart of that member. Resending an older message and views that read the whole Group
+  can still wait for the unresponsive owner. An owner already unresponsive at startup can
+  still fail startup.
+- Messages not yet handed to the runtime, or known not to have been submitted, during a short
+  disconnection are delivered when the member is back. A partial terminal write stays
+  unconfirmed and is not replayed automatically.
+- Stopping one member no longer marks the whole Group stopped when another member's process
+  is briefly unreachable; input for a just-replaced terminal is not typed into the new one.
+- Uploaded SVG attachments up to 4 MiB preview; on a phone, closing the last resource tab
+  closes the panel; DeepSeek setup reports the managed-session mode.
+
+## [0.4.59]
+
+### Added
+
+- On Linux and native Apple Silicon Macs, CCCC can restart or install a compatible update
+  while managed agents keep running. Choose **Keep agents running** in **Settings > This
+  instance > Update** (**Update now** or **Restart CCCC**), **Keep agents; update** or **Keep
+  agents and restart CCCC** in the terminal interface, or run
+  `cccc daemon stop --keep-agents` and `cccc daemon start`. CCCC reconnects to the same
+  processes with their terminal and output, and reports which members it found, restarted
+  or could not confirm. The first upgrade from v0.4.58 still stops managed agents.
+- Web and the terminal interface check for a release only when asked, and can update a
+  website installation in place, or restart CCCC into a locally rebuilt executable.
+- A full-screen viewer steps through the attachments of one message; task details open
+  beside the board on larger screens.
+- DeepSeek members run on the official Harness developer preview `0.2.2-rc.5`; generic ACP
+  members show tool activity.
+
+### Changed
+
+- `cccc daemon stop` says which agents it stopped and names any it could not confirm, with
+  a next step that works: run it again after a plain stop, or the review command after a
+  stop that kept agents.
+- OpenCode decides from its own settings whether a message joins a running turn; a Group
+  request to Chet that waits more than ten minutes is reported as not sent.
+- A start that begins a new conversation instead of resuming says so.
+
+### Fixed
+
+- A message sent while CCCC briefly could not reach a member's session owner is delivered
+  once the owner answers, in order, without another message.
+- A confirmed local command such as `/model` in a managed Claude Code terminal no longer
+  shows the member as working.
+- Environment values that are not valid Unicode no longer crash CCCC; a `CCCC_HOME` too
+  long for the daemon socket is reported with a workaround.
+- Managed-member failure reasons are no longer masked when they only resemble an inherited
+  environment value; delayed activity snapshots no longer replace a newer turn; a member
+  reading another member's agent state gets that member's state.
+- Fewer idle writes and lookups: browser members skip unchanged Group writes, member status
+  shares one owner snapshot per round, and two mid-sized ledger indexes stay cached when
+  switching Groups.
+- The Windows CLI reserves enough stack to start in debug builds.
+
+### Known limitation
+
+- With two session owners after a keep restart, one owner that stops responding blocks new
+  messages and individual stops for members of the other until it responds again.
+
+## [0.4.58]
+
+### Added
+
+- Markdown attachments, and Markdown links opened in the page, switch between the rendered
+  view and the unchanged source without downloading again, with the **View source** /
+  **Preview** control that workspace files already have. The control sits in the title bar
+  of the resource panel, of each side of a split view and of the preview dialog, so a
+  document gets no extra toolbar row.
+- HTML attachments, Group HTML files and HTML from `raw.githubusercontent.com` or
+  `gist.githubusercontent.com` open as a static document preview. Scripts do not run, form
+  controls are disabled and external resources are not loaded; inline styles and embedded
+  images are supported, and the page follows only web, mail and in-page links. An
+  attachment has no directory, so its relative images, stylesheets and sibling files are
+  not resolved. HTML up to 20 MiB previews in full, embedded images included, and
+  **Files** previews HTML over its 1 MiB editing limit the same way, read-only.
+  **View source** shows the first 1 MiB. Larger HTML shows only that source, with a
+  notice, instead of a broken page. Wide slides stacked in a centered column start at the
+  left and scroll sideways; pages keep their own size and are not scaled to fit. Panel tabs restored
+  after a reload keep the HTML kind.
+
+### Fixed
+
+- The keys in an attachment's title bar share one size with the **Files** toolbar, and the
+  download key no longer sticks out of the bar.
+- On a phone, the empty composer at rest keeps attach, the template button, the input and
+  voice on one row; the template button no longer drops to a second line. **Send** returns
+  with the full layout when the input is focused. A send in flight keeps the full layout,
+  so its progress and **Stop waiting for upload** stay visible if focus leaves the
+  composer during an upload.
+
+## [0.4.57]
+
+### Added
+
+- Quick replies of your own, in one list. Settings › Quick Replies keeps up to 24 replies in
+  your order, the four default ones included, each with a name and a text sent exactly as
+  written; add, reword, reorder or delete any of them. A default reply's unchanged name or
+  text follows the interface language, a changed one stays as written, **Restore default**
+  puts it back, and a deleted default can be brought back at the end of the list. A
+  message's quick reply menu sends one at once; the composer's template button opens the
+  list above the input, near where you are typing, and inserts one at the cursor to edit
+  before sending. The daemon keeps one list per signed-in user, so other browsers and phones
+  signed in as that user see the same replies; a browser on this computer that is not
+  signed in has its own.
+- The operations guide lists what a daemon restart keeps and what it does not, with a
+  FAQ entry pointing to it.
+- `cccc_bootstrap` recovery includes the Group brief's last update time
+  (`coordination_brief.updated_at`), so an agent resuming work can see that a brief is
+  old. It is omitted when the brief has no recorded update time.
+
+### Changed
+
+- Reading a parent task through MCP keeps the parent's full details and returns its
+  subtasks as summary rows. Read a subtask by its own ID for its notes and checklist.
+
+### Fixed
+
+- Enabling a capability or calling an external tool no longer holds up other operations
+  while it waits for the external service. Superseded preparation cannot reverse a later
+  disable, and an old call cannot restore a changed binding or installation. Already
+  admitted external calls are never automatically replayed.
+- A cron automation rule that already owes a run, for example one enabled again after
+  missing its time, reports that run as its next fire time instead of the following
+  occurrence, as interval and one-time rules already did. The Web labels that time as
+  pending. The missed run still fires once.
+- The capability page's Enabled count covers all matches of the current search, like the
+  Skills, MCP and Packs counts, instead of only the page on screen. `capability_overview`
+  returns `enabled_count`; the standard now also documents `kind_counts`.
+- MCP recipes that declare `command` as a string or argv array, or a fallback command
+  without a package identifier, install as the published contract describes. A string
+  names one executable and is never split by a shell; arguments need an argv array.
+  Malformed command fields are rejected before the catalog changes.
+- ChatGPT Web members treat `local-chatgpt:` conversation URLs as provisional, like
+  `WEB:` ones, and a conversation moved into a Project keeps its binding and delivery
+  receipts (#226, #227).
+- On Windows, background process constructors now share a no-console-window
+  default, covering the Codex app-server and delivery helper reported in #228,
+  managed Claude launchers, Reach helpers and process checks, Git scope detection,
+  and runtime preparation. Standard streams, timeouts and ownership are unchanged;
+  interactive terminals, foreground maintenance and detached daemon startup retain
+  their policies. Production Clippy and entry-point checks catch bypasses, with
+  explicit reasons for exceptions. The runtime library and its Windows tests
+  were checked for a Windows target on Linux; Windows-only daemon and CLI
+  branches will first be compiled in Windows CI. This release has not been run
+  locally on Windows; the reporter's Codex/Windows Terminal check remains needed.
+- Chet on OpenCode: a message or member result sent while Chet is busy waits for the
+  current turn and goes to Chet's own session as its own turn, instead of being typed
+  into Chet's terminal, where after `/new` it reached another session and held up later
+  Group messages to Chet (#229). Voice delegations during a call are unchanged.
+- The documentation home page's getting-started button links to the page's own address,
+  so opening the link directly no longer returns 404.
+- Web slash commands for capability tools pass their arguments to the tool. They were sent
+  under a field the daemon does not read, so the tool ran without them.
+- The chat composer keeps the highlight of a later @mention when Undo restores a
+  replaced or deleted selection. Who receives the message was not affected.
+
+## [0.4.56]
+
+### Added
+
+- CCCC ships a short recommendation list: 10 skills and MCP servers in four work
+  groups, each listed only where we produced a representative result with it. Each
+  has its reason (what that result showed and its limits), notes on when not to use
+  it, verification records (level, outcome, date, build and path, failed checks
+  included) and, for MCP servers, where it runs, how it signs in and what it needs.
+  Release-owned entries are read-only, change with CCCC versions and are never
+  installed or enabled automatically. An entry is a primary only where a trial
+  showed a gain; this release has one, Exa.
+- The capability page has a Recommended view by work group. Each entry shows a status
+  for the Group's members, and its details show the reason, each member's status and
+  why, verification, where it runs, sign-in and requirements. Enable for Group is
+  offered when some member can use the entry, or might; the MCP and Skills lists show
+  the same status and action for recommended entries.
+- `capability_overview` and `capability_state` project each member's availability
+  (`compatible`, `needs_setup`, `unsupported`, `unknown`), enabled scopes, blocks and
+  pending preparation, with localized names and reasons; `capability_search` adds a
+  `for_you` summary for the calling member.
+- Managed members can use remote MCP servers that need a Bearer token from their own
+  private settings or linked Profile. Recipes reference the environment key, never
+  the value; enabling for a Group records intent only and uses no member's token.
+  Native sessions and Web model members have no member-token route.
+- An administrator can update an installed MCP server's recipe for all Groups from
+  CCCC Web, after previewing it and confirming the scope. A failed update keeps the
+  previous installation; agents cannot update recipes.
+- Recommended entries carry CCCC's notes (`avoid_when`, `gotchas`,
+  `requirements_summary`) alongside skill text, MCP preparation results and
+  structured external tool results, including results with `isError: true`; a
+  transport error carries none.
+- `cccc_bootstrap` lists the recommended entries an agent might use, one line each
+  with its role, exact ID and first use case, marked when applicable `enabled`,
+  `discovery pending`, `check requirements` or `setup required` (with the
+  requirements summary); blocked and `unsupported` entries are left out. The section
+  stays within 24 entries and 3,072 bytes of compact JSON and counts the entries it
+  leaves out.
+- When a client connects, CCCC's MCP server returns a short fixed note: CCCC offers optional skills
+  and MCP servers for named kinds of work, and an agent can browse the recommended ones or search
+  with `cccc_capability_search` and should read an entry's limits before enabling it. The MCP
+  `initialize` result and the Web model connector's `server/discover` result carry it; Voice
+  secretary task sessions, which cannot see those tools, do not. Clients decide whether to show it
+  to the model.
+- `cccc_capability_search(recommended=true)` lists the recommended entries for the calling agent, at
+  most ten, without guessing a word: blocked entries and entries it cannot use are left out, entries
+  that need setup stay with their requirements, and a query narrows them. Without the argument,
+  search is unchanged.
+
+### Changed
+
+- `capability_search` returns summaries without skill text or full tool schemas;
+  `cccc_capability_use` returns a skill's full text. `capability_overview` returns
+  skill text only for the self-proposed skill editor.
+- Help points agents to browsing the recommended entries with
+  `cccc_capability_search(recommended=true)`, or to `recommended` in bootstrap, when a capability
+  could fill a gap or improve quality or efficiency, and to keep their own tools when the added
+  option does not help. Help and the `cccc_capability_search` description say to search by a name or
+  one short word, since every space-separated term must appear in an entry; the description also
+  names the kinds of work the recommended entries serve. The `cccc_capability_use` description says
+  what a capability is and that it takes an exact ID or an unambiguous tool name.
+- Remote and local MCP servers use the official Rust MCP SDK 3.9.0. HTTP servers may
+  answer with JSON or SSE; an expired session is not reinitialized and a call is not
+  replayed. A local server's handshake and call share one deadline, and errors keep
+  up to the last 8 KiB of its stderr with known credentials and declared
+  environment values redacted.
+- A tool result with `isError: true` no longer marks a binding verified.
+- HTTP(S) source links are projected without user information, query or fragment.
+- Claude Code sessions that CCCC starts turn off CCCC's own Claude Code plugin in
+  their session settings; user and project plugin settings are unchanged.
+- **Open Capability Center**, in Settings → **Capability Governance** and on a Group's
+  **Skills** tab in **Project Context**, opens the Capability Center over the current page
+  instead of in a new browser tab. Closing it, with its close button or Esc, returns to that
+  page, which then reloads its list. The `/ui/capabilities` address opens the main page.
+
+### Fixed
+
+- CCCC closed a local MCP server's input right after sending its requests, so a call
+  could end before the server answered; input now stays open until the answer or the
+  time limit. Errors also left out the server's error output.
+- Remote MCP servers that answer with SSE, or require clients to accept it, could not
+  be used.
+- Importing a skill kept only the first 2,400 characters of its text; imported skills
+  now keep their full text up to 2 MiB.
+- The capability page filtered the daemon's search results again with a narrower
+  rule, treating the whole query as one string over fewer fields, so some matched
+  entries disappeared, such as those matching several words in different fields; it
+  now keeps the daemon's matches for the same query.
+
+## [0.4.55]
+
+### Added
+
+- A workspace can use a Markdown file in its project as its Backlog. Tasks now has
+  a Tasks | Backlog switch for reading, adding, editing, moving and closing entries,
+  and for starting work from an entry. The file remains the source of truth;
+  existing-entry writes check its file hash and reject stale edits. Linked tasks
+  retain their source without writing CCCC task numbers into the Markdown file.
+  A task's result can be written back to its entry, and finishing a task asks for
+  a source update without automatically closing the topic. Creating BACKLOG.md
+  in a Git project excludes it locally by default, without changing .gitignore.
+  Tasks still works without a Backlog file. The read-only exhibit does not expose
+  the Backlog.
+- The `cccc_backlog` MCP tool and daemon Backlog operations expose the same
+  workspace-file workflow. Task create and update accept an optional Backlog
+  `source`; the daemon owns permissions, file-hash checks and partial-write
+  reporting.
+- `cccc ledger search` exposes the daemon's existing sender, recipient, time,
+  kind, text and cursor filters. `cccc actor new-session` exposes the existing
+  action that restarts a member with a new session instead of resuming its saved
+  conversation. Both commands return the daemon's result and report its errors.
+
+### Changed
+
+- A native member's own exact message-history read no longer repeats the full
+  Group rules immediately after they have been given. They are included on first
+  use in a conversation, after a reported context compaction, when the rules
+  change or after a UTC hour boundary, unless an accepted delivery already
+  carried them. Further self exact reads use the receiving-context header.
+  Reading on a member's behalf still returns the full rules without marking
+  them as given. The record is kept in daemon memory, so restarting the daemon
+  can repeat the rules. Claude's pointer notices now mention instructions only
+  when due.
+  This changes neither message delivery nor read acknowledgments.
+- The member protocol, task tool descriptions and help now explain when to track
+  requests and commitments as tasks, and when to keep deferred issues or ideas
+  in the configured Backlog. A task's completion follow-up distinguishes its
+  outcome from whether its source topic is finished. Tool descriptions also
+  clarify caller identity and the retry keys accepted for local sends.
+- In the Web Tasks section, the former Working summary block is now Coordination
+  brief, and its text field is Project background. The English, Chinese and
+  Japanese labels, refresh hints and save controls follow those names. Editing
+  hides the repeated saved goal, focus and refresh note above the form while
+  preserving the draft. On narrow screens, the time and save controls wrap as
+  groups instead of breaking within a word.
+- Markdown pinned to Presentation renders Mermaid diagrams, as the Files preview
+  of the same file already does. The existing enlargement and Escape behavior
+  applies; the Voice Secretary's live draft is unchanged.
+
+### Fixed
+
+- A change to launch PATH alone no longer necessarily discards a saved managed
+  conversation. Claude, Pi and the Copilot, Devin, Cursor, Kimi Code, Auggie,
+  Kiro, Hermes and Droid ACP adapters can recognize that case when both receipts
+  contain the complete launch-fingerprint split introduced in 0.4.54. Other
+  identity changes and older receipts retain the existing rules. Pi and ACP
+  start with the new PATH. Claude resumes the saved session only when its lookup
+  finds no live job; a live job keeps its old PATH, so CCCC leaves it alone and
+  starts a new conversation. A failed resume still reports failure rather than
+  silently starting fresh. This restores conversation selection, not a running
+  turn across a daemon restart.
+- Task dependencies stop blocking once all their referenced tasks are done, or
+  archived after completion. Missing or unfinished dependencies still block,
+  and reopening one blocks again. The read-only `open_blocked_by` projection is
+  used consistently by the board, task summaries, attention filters, bootstrap
+  and TUI; stored `blocked_by` relationships remain intact. A task that has
+  already entered execution cannot be deleted by first moving it back to planned.
+  The assignee picker now includes Group members even if they have not reported
+  a working state or been assigned another task.
+- A running headless process without an authoritative turn observation reports
+  unknown rather than an invented idle state and duration. Managed-session and
+  Dots observations still take precedence, and a paused Group remains paused.
+- Failed managed deliveries that exhaust their retry budget retain an explicit
+  `retryable: false` result. Automatic recovery no longer resets those deliveries
+  and claims them again; an explicit delivery request can still retry them.
+  Older failed receipts without the flag keep their existing behavior.
+- The MCP message-send retry key now selects the daemon's existing replay for
+  local and same-instance cross-Group sends too. Reuse a key with the same
+  arguments; it does not turn a changed message body into a new send. Connect
+  message and file sends reject unknown top-level arguments before acceptance
+  or file handling, matching the validation on other message writes.
+- Configuring an already active ChatGPT or Grok Web connector no longer replaces
+  its credential. Creation returns the existing connector without its secret;
+  replacing the credential requires explicit rotation. Rotation preserves the
+  conversation pairings and Dots state and returns the new secret once.
+- Retrying ChatGPT pairing can clear CCCC's own unsent setup message after an
+  interrupted attempt. It does so only when the focused composer still contains
+  exactly that setup message, one valid pairing code and no attachment. Other
+  drafts and attachments remain untouched, and a failed read-back stops the
+  attempt. Browser command replies also preserve non-string command IDs.
+- A repeated Dots wake that already completed is reported as idle instead of
+  incorrectly claiming a turn is still in progress. Checks for unfinished work
+  and the completion cleanup window still take precedence.
+- Interrupting a managed Claude turn sends the required nullable `terminal` and
+  `mux` attach capabilities before Escape. Claude Code 2.1.317 rejected the
+  earlier incomplete capability object, so the turn continued instead of being
+  interrupted. A refused attach does not send Escape.
+- The project-context view, including Tasks, refreshes after changes from another
+  tab or member.
+  A timer callback previously invoked `clearTimeout` without its Window receiver
+  and could leave later updates unseen until the panel was reopened. Backlog
+  entries use task-style rows, with linked tasks opening independently. Group
+  creation quick picks are translated and stack on phones. A Group without a
+  project folder explains why AGENTS.md is unavailable instead of offering a
+  Create action that cannot work. Segmented controls size their options to the
+  labels so touch-screen minimum widths do not clip an option. English labels
+  are consistent: Edit agent, Documents in the Voice Secretary, and New session
+  in the agent menu, page and failed-resume hint.
+- Build fingerprints are generated at the CLI, Web and MCP entry packages
+  instead of invalidating core and all its dependents whenever a workspace Rust
+  source changes. Each executable registers its compiled identity; a library
+  without a registered identity reports none rather than reading the current
+  checkout as if it were the running build. Web and MCP libraries can still
+  rebuild when their package fingerprint changes.
+
+### Removed
+
+- Coordination notes: the Web Coordination log tab, `cccc_coordination`'s
+  `add_decision` and `add_handoff` actions, the `coordination.note.add` context
+  operation and the two note lists in context/bootstrap recovery. Removed
+  actions fail as unsupported and the operation fails as unknown. Existing
+  stored notes stay in the context file, including through task/brief writes
+  and migration, but are no longer projected to clients. The coordination brief
+  remains available. SDK callers must remove the retired note helpers and
+  result-field dependencies when upgrading the SDK with this release.
+- The unreachable capability-source-instance view and its unused result/request
+  fields, along with two unused message fields. A browser tab opened before the
+  upgrade can still send the removed cross-Group reply field and receive
+  `unknown_arguments`; reload the tab before retrying.
+
+## [0.4.54]
+
+### Added
+
+- A managed agent that starts a new conversation although one was saved now leaves a record. Until
+  now the saved conversation was replaced without a trace when the agent's runtime, command, model,
+  workspace, launch settings or launch environment no longer matched it. The agent's page shows a
+  small information mark after its status; hovering over it or selecting it gives the time of the
+  record and the compared settings that had changed. For managed Claude and Pi agents and for ACP
+  agents other than Antigravity, a changed launch `PATH` and a changed CCCC program location are
+  named separately from the other launch settings when both the saved record and the new one contain
+  that detail; a record saved by an earlier version does not. CCCC also attempts to write one
+  system notice addressed to the user, which an enabled IM bridge can forward, and the Actor
+  listing reports `runtime_session_replaced_at` and `runtime_session_replaced_reasons`. Which
+  conversation a start selects is unchanged.
+
+### Changed
+
+- CCCC Web ignores file-open notifications when it watches Group ledgers. On Linux, read-only
+  opens of a ledger could queue redundant ledger checks. Writes, rotations, Group removal and the
+  periodic recovery scan are handled as before.
+
+### Fixed
+
+- History and the Inbox read a Group's rotated ledger segments in the order they were rotated,
+  even when the system clock went backwards between two rotations. Segments were read in
+  file-name order, and a name starts with the time of its rotation, so a later segment stamped
+  with an earlier time was read first: history showed its messages out of order and an Inbox
+  read could skip Mail. Nothing was removed from the ledger. A ledger is rotated only by an
+  explicit compaction such as `cccc ledger compact`. In a Group that was already read in the
+  wrong order, new Mail arrives normally after the update, but Mail that an Inbox read had
+  already passed over may not return to the Inbox; it remains in the Group's history.
+- On a phone-sized screen, the Edit button under a stopped agent's page no longer breaks its label
+  over two lines and grows taller than the buttons beside it. It shows its icon alone there, as it
+  already does while the agent is running.
+- The Group menu, opened from the run button in the header or from a Group in the sidebar, no
+  longer reserves extra width as if neighbouring items stood side by side. The labels filled only
+  part of it.
+- **Agent State** no longer shows an agent that was removed from the Group. Removal cleared the
+  agent's state but left an empty entry in the stored context, so Project Context kept a card
+  for it and context reads returned it. Context reads now return states only for agents still in
+  the Group, including for entries left by earlier removals. States of agents still in the Group
+  are kept even if they are disabled or stopped. This filtering does not rewrite the stored
+  context.
+- Three smaller layout defects in CCCC Web. In the add-agent dialog, Cancel no longer grows
+  taller than the create button beside it when that button has a hint line under it. A settings
+  choice whose options wrap onto a second row, such as the default recipient in Japanese and
+  English, now forms one block of aligned rows. The card that opens from a recipient in the
+  composer gives the recipient's kind more room on wider screens; it was cut off in Japanese and
+  English.
+
+## [0.4.53]
+
+### Added
+
+- The guide has a starter path for a two-agent team. The Builder + Reviewer Pair use case now goes
+  from registering two agents to handoff, review and integration, and a new page holds a short
+  `AGENTS.md` template to copy and adapt. Supported Runtimes explains where a Claude Code agent
+  that CCCC starts edits files: Claude Code has such a background session enter a worktree before
+  it edits files in the main checkout by default. The page shows how to pass Claude Code's
+  `worktree.bgIsolation` setting in that agent's command; CCCC's own default is unchanged.
+
+### Changed
+
+- Message calls now reject arguments they do not recognize. A misspelt or misplaced argument,
+  such as `mdoe` for the mode or a question's `options` given at the top level, used to be stored
+  or ignored while the call reported success. The call now fails with `unknown_arguments`, names
+  the arguments without their values, and makes no new changes. This covers sending, replying,
+  sending files, cross-Group sends on the same instance, tracked sends, system notifications,
+  slash-skill dispatch, native session sends and upload preflights; new messages and files sent
+  through CCCC Connect are not covered yet. A caller-supplied `scope_key` is now rejected instead
+  of dropped, and sender snapshot fields are rejected at these entries too. A retry that carries
+  such an argument also fails, even when the message was accepted before.
+
+### Fixed
+
+- A message a native session sends directly, and the record a cross-Group send keeps in its own
+  Group, no longer store the session's internal binding with the message. Messages already in a
+  ledger keep what they stored.
+- The collaboration guidance no longer suggests Mail for useful context that has no higher-order
+  perspective. Under the MCP profile, an agent's Mail to another agent still needs an insight, so
+  following that line led to a rejected call.
+- For a native session, the calls `cccc_bootstrap` suggests now include the explicit `group_id`
+  that session's tools require. The agent-state examples omit an unnecessary `actor_id`
+  placeholder and use the caller's session identity. A native session's tool parameter
+  descriptions also state that `group_id` must be given explicitly.
+
+### Security
+
+- Web and MCP message calls now reject caller-supplied IM origin fields, such as
+  `source_platform` or `transport`. A caller, including a non-administrator Web token limited to
+  one Group, could use them to put a false platform and sender in the envelope a recipient sees.
+  When forwarding a message in the Web, the sender must be able to access the referenced source
+  Group. Source references given through an MCP tool are not verified, and programs that call the
+  daemon directly on the same machine are trusted as before. An MCP server started before the
+  upgrade keeps the earlier behavior until it is started again.
+
+## [0.4.52]
+
+### Changed
+
+- Refreshing the browser tab brings back the resource panel's tabs: their order, the selected tab,
+  the side-by-side layout, and whether the panel was collapsed or maximized. A Group's side-by-side
+  layout also stays when you switch to another Group and back. Only which files, attachments and
+  Presentation slots were open is kept, in that browser tab's session storage, and their contents
+  are read again with your current permissions. A message's reference to a Presentation slot is
+  fetched again when its tab is shown; if the message no longer holds it, the tab says so rather
+  than showing the slot's current card, and a request that fails offers **Retry**. Unsaved edits,
+  reading positions, recently closed tabs and attachments the ledger has not confirmed yet are not
+  restored. Browser tabs do not share this state, and whether a tab the browser duplicates or
+  reopens keeps it depends on the browser.
+- The daemon's `message_history`, which Agents read through MCP, walks back from the newest message,
+  or from the given anchor, and stops once it has enough matches to fill the page and tell whether
+  more exist, instead of first collecting every message the reader can see. Results are unchanged.
+  On a synthetic Group of 37,500 events with its ledger already loaded, the median time of one call
+  for the default page fell from 2.0 ms to 0.3 ms, and for the page before an anchor near the end
+  from 2.7 ms to 0.8 ms.
+- The daemon builds most results by converting them to a JSON object, and copied that object once
+  more before replying. It now replies with the object itself. Responses are unchanged. On a
+  synthetic Group with its ledger already loaded, reading the latest 120 messages, their delivery
+  statuses or 50 messages of history requested 12–21% fewer bytes from the Rust allocator.
+- A Claude, Pi or OpenCode session connected to CCCC asks the daemon for its next message less
+  often while nothing is waiting for it: after an empty answer it now waits 500 ms instead of
+  200 ms before it asks again. Other timing, including Claude's existing notification limit, is
+  unchanged. Each request opens a new connection, so even an idle session cost its receiver and the
+  daemon CPU time. In an isolated test, one 60-second run for each version with five idle Claude
+  sessions, the daemon used 0.62% of one CPU core instead of 1.27%, and each session's receiver
+  0.10–0.12% instead of 0.27–0.30%. A message sent to an idle session can take longer to be picked
+  up: in a separate check, ten first notifications after idle periods appeared in the Claude
+  receiver's output 12–404 ms after they were sent, instead of 31–139 ms.
+- The actions each message in the chat receives (reply, copy link, relay, open the source message,
+  show recipients, open the message it replies to) were rebuilt on every render of the chat, so each
+  change to the chat's data, such as an incoming message, re-rendered every visible message and its
+  action bar. They now keep one identity across renders. In headless Chrome on a test Group of 150
+  messages, one incoming message re-rendered about 330 components instead of about 4,200, and the
+  script time of a Group switch fell from about 150 ms to about 110 ms. What these actions do is
+  unchanged; each uses the Group and settings current when it is clicked.
+
+### Fixed
+
+- A Ctrl-C after the daemon was ready and while the Web was starting, including just as its
+  **Local:** address appeared, ended `cccc web`, `cccc --headless` and `cccc` without the terminal
+  interface at once, instead of stopping them the usual way. Such a Ctrl-C now starts the usual
+  stop, and a second one still forces the exit. How these commands handle a Ctrl-C before their
+  daemon is ready is unchanged. The terminal interface on Linux and macOS had a similar gap right
+  after it began watching for signals, and now listens for Ctrl-C from that moment.
+- On Linux with glibc, the daemon could keep much of the memory it freed after busy periods, so its
+  resident memory could stay near the size of its busiest moment. It now asks the allocator every
+  five minutes to return unused pages to the system. This is not a memory limit: use still grows
+  while the daemon is busy, and returned pages take a little time to reuse. When the daemon runs
+  inside `cccc`, `cccc web` or `cccc --headless`, the whole process is trimmed, Web included; a
+  daemon started with `cccc daemon start` trims only itself. The daemon diagnostics log records the
+  first trim after the daemon starts and any trim that takes longer than 200 ms, with its duration
+  and resident memory before and after.
+- Every 30 seconds the Web read the whole history of every Group to find messages addressed to
+  Chet. When the Groups' ledger indexes exceeded the in-memory cache budget, these sweeps could
+  rebuild them again and again, which cost a burst of CPU on each sweep and raised resident
+  memory. The Web now keeps its place in each Group's ledger and reads only what was written
+  since. It reads a Group in full when the Web starts or first sees the Group, when the Group's
+  ledger files change in a way it cannot continue from (for example after rotation), and after a
+  failed read. Pending registration and dispatch are still retried. The sweep still checks every
+  Group at 30-second intervals to recover messages the live event feed missed. To diagnose the
+  previous behavior, an isolated test with nine synthetic Groups holding 56.8 MB of ledgers ran
+  the previous Web for 180 seconds with its Chet input worker active and again with the worker
+  held inactive. With the worker active, the process used 0.19–0.38 s of CPU in the two seconds
+  around each 30-second mark, against 0.03–0.05 s, and its resident memory ranged from 346 to 597
+  MiB after the first 10 seconds, against 217 MiB.
+- Switching Groups briefly showed the header's connection symbol as reconnecting, and made a
+  member's unread mail mark disappear and come back. A switch replaces the Group's event stream; the
+  Web now keeps the connection shown as connected while the new stream opens, shows reconnecting
+  only if it has not opened within a second, and still shows a failed stream at once. A switch
+  whose stream opens within that second also no longer makes the Web check whether its server
+  restarted. The first member read after a switch has no unread counts; the counts already shown
+  now stay until fresh ones arrive. In a frame-by-frame check in headless Chrome, the reconnect
+  symbol had stayed on screen for 50–100 ms on each of 6 switches, and a mail mark had been gone
+  for 50–100 ms on each of 5 returns to a Group; with the change neither flicker occurred.
+- A package built from source gave its archive the release name, so building again before the
+  version number changed silently replaced a release archive of the same version in `dist/`. The
+  package scripts now name a local archive after its commit, for example
+  `cccc-v0.4.52+<commit>-x86_64-unknown-linux-gnu.tar.gz`, adding `-dirty` when the tree has
+  uncommitted changes and using `local` outside a Git checkout; rebuilding replaces only the archive
+  of the same name. Without a label the archive helper keeps the release name, which release builds
+  use, and no longer overwrites an existing archive of that name.
+
+## [0.4.51]
+
+### Added
+
+- DeepSeek Agents have a **DeepSeek connection** form for the API address, the model and the API
+  key, both when an Agent is created and in its Runtime settings; a Runtime Profile saved from the
+  form carries the same values. They go into the Agent's write-only private environment. Without a
+  saved value, an Agent uses `DEEPSEEK_BASE_URL` and `DEEPSEEK_MODEL` from the environment it starts
+  with (its own environment settings first, then the daemon's), and otherwise
+  `https://api.deepseek.com` and `deepseek-flash`, the name DeepSeek's API documentation gives for
+  its current Flash model. CCCC used to send `deepseek-v4-flash`, an older name DeepSeek says it
+  still routes to that model for now. **Use default** removes the Agent's saved address or model. An
+  address ending in `/chat/completions` is turned into its base URL, and a key pasted with spaces or
+  a newline around it is trimmed. A missing API key, or an authentication failure CCCC recognizes
+  (such as DeepSeek rejecting the key), stops the DeepSeek process and pauses automatic delivery
+  until you launch or restart the Agent; its pending messages are tried again after a successful
+  start. Custom gateways must support DeepSeek's streaming Chat Completions and tool calls.
+- A question's card lets you add a note to the option you choose: **+ Add a note (optional)** beside
+  **Send answer** opens a box, and the requester receives the choice and your words in one reply,
+  the choice line, a blank line and `Note:` with your text as written. A blank note sends the choice
+  alone, and **Other** keeps its own box. The daemon records this as a version 2 answer; a daemon
+  from before this release refuses it and the card keeps your note. The terminal interface still
+  answers with an option or **Other**.
+- PDFs from messages, links to this CCCC, the workspace and Presentation slots open in a reader
+  inside the page on devices whose main pointer is touch, such as phones and tablets, and in
+  browsers that report no built-in PDF viewer: the pages scroll, fit the width and zoom. Other
+  desktop browsers keep their own viewer, and so does a Presentation PDF from another site. The
+  reader, PDF.js bundled with CCCC, cannot select or search text, use a PDF's links and forms or
+  open a file that requires a password. A message attachment or workspace file keeps **Download**,
+  and outside a Connect frame it can still open in its own browser tab; a Presentation slot's viewer
+  offers **Copy URL/path**.
+
+### Changed
+
+- Workspace files, message attachments and Presentation slots now open as tabs in one resource
+  panel. It replaces the file editor over the messages, the full-window image, video and document
+  preview, and the docked Presentation viewer. Opening something already open selects its tab.
+  The panel sits in the right column or over the message list, a choice this browser remembers; it
+  can be maximized, and collapsing it keeps its tabs, with their number on the header's resource
+  button. Many tabs scroll sideways; **All** lists them with a filter and the recently closed ones,
+  and closing several at once can be undone. A file with unsaved edits asks before it closes, and
+  renaming or moving a file or folder in **Files** takes its open tabs and unsaved edits along.
+  Switching between workspace text, Markdown or table tabs, each shown alone, returns to where you
+  were reading, and **Side by side** shows two open tabs next to each other, stacked on a phone:
+  each side's header picks any open tab, the other side's included, a tab picked elsewhere opens on
+  the side last used, and the divider drags; workspace files show there as they read, with any
+  unsaved edits, and are edited one at a time. The eight images and four other attachments looked at
+  most recently stay loaded; an older one loads again, so a PDF's page or a video's position may
+  start over. Switching Groups, or between the phone and desktop layouts, loads the panel again:
+  tabs stay, reading positions do not. While the panel covers the messages they stay unread, and the
+  panel's collapse key shows how many arrived. Presentation slots open in the panel even if you
+  chose the window view before; **Open in window** in the viewer still shows one in a larger window.
+  The panel and the window share a slot's interactive page; when the slot is published again with
+  another address while that page is open, CCCC asks before replacing it, since someone may be
+  working in it. On a phone the panel is one full-screen surface, and **Back** returns to the
+  messages, the Files tree or the Presentation slots; the phone header keeps its room for the Group
+  title, and the menu lists **Resources** or offers to reopen what was closed last. Tabs stay until
+  you close them or reload the page. Git diffs from **Changes** still open over the messages, and
+  enlarged message diagrams and previews opened from a link, such as an image on another site, still
+  open over the page.
+- Message text now uses a proportional font by default: IBM Plex Sans, bundled with CCCC (about 130
+  KB), with Chinese and Japanese in the system's own fonts. Message headers, controls and code stay
+  in the monospace font. **Body font** in the appearance settings now offers **Sans**, **Mono** and
+  **Pixel**; a font you chose before stays as it was. Markdown no longer adds backticks around
+  inline code or quotation marks around a quote that the text does not contain.
+- The built-in stand-up and the team review texts now ask the foreman to pass questions between
+  them. For a question that needs a deeper look, the stand-up text asks the foreman to mark it
+  `Review:` in a related `optimization` task, or in a new planned one that authorizes no change, and
+  to suggest a team review rather than run one; in a Group with few tasks it may ask you whether to
+  run a review now. The review text asks the foreman to handle those questions and to keep a task
+  open while one is unresolved, to record changes made within the foreman's authority that are worth
+  checking later, to propose revising or removing a rule only when it did not work in real cases,
+  and to answer briefly when you asked for a review and nothing needs your decision. These are
+  instructions to the model, not checks CCCC enforces. A stand-up rule that uses the built-in text
+  gets the new wording; a custom stand-up text stays as it is.
+- From a message addressed only to the foreman, the built-in stand-up and team review texts now let
+  it share what the user authorized and the team's work needs, in its own words and within any
+  confidentiality limits the user set, and leave out the message's ID unless the user agreed. The
+  stand-up text used to keep everything from such a message out of shared tasks, so a request the
+  user meant the team to act on could not be recorded in one. A peer asked to run the team review
+  may also pass the foreman what the user authorized from a message addressed only to that peer, on
+  the same terms; the review text used to leave such content to the user.
+- Capability search no longer recommends unimported results saved from the retired SkillsMP remote
+  search, whose name and content may not match. They stay in the catalog: the Capability Center and
+  the member and profile pickers mark them **Unverified old search result** with an explanation,
+  existing bindings keep working, and they can still be used by ID. To rely on one, find a trusted
+  original source and import it with a supported method; when the source is gone, it may not be
+  recoverable. `capability_overview` rows gain `legacy_search_unverified` and `sync_state`.
+- The Capability Center and the member and profile pickers describe CCCC's built-in capabilities in
+  English, Chinese or Japanese. Their names stay as they are, so search still finds them.
+
+### Removed
+
+- The **Terminal history** button and panel on each Agent's terminal are removed. To look back, use
+  the Runtime terminal's own scrolling; a runtime that redraws its screen in place may keep no
+  earlier output there. Agents can still read retained terminal output through `cccc_terminal`,
+  within what the Group's terminal visibility allows.
+
+### Fixed
+
+- After CCCC is updated, an open page that fails to load one of its parts no longer reloads itself
+  while it holds unsaved workspace edits, an unsent message or an operation still in progress, such
+  as a message being sent or a voice recording; text typed into a question's card, and an answer
+  still being sent from it, are not counted. If that part is the PDF reader or voice input, it shows
+  its own error and the rest of the page keeps working, so you can save first.
+- An agent that sends the user a file or a new message without naming a mode no longer fails because
+  the omitted mode became Mail: for the user, who has no Inbox, the omitted mode is now Send. In a
+  connected native session, `cccc_file_send` now defaults to Send like `cccc_message_send`, as the
+  session's instructions say, instead of leaving files for agents as Mail; managed agents keep Mail
+  as their default for other agents. `cccc_file_send` now refuses a mode that is not text, as
+  `cccc_message_send` does, instead of treating it as Mail, and refuses `paths`, pointing to `path`,
+  which already takes a list of up to 10 files. Both tools refuse a recipient list with an entry
+  that is not text instead of dropping that entry.
+- Idle Grok webhook polling now reuses a cached summary of delivery claims instead of rereading the
+  entire Group ledger every two seconds. The summary catches up with new events and is rebuilt after
+  history is replaced or rotated, or after cache eviction. Previously, polling could consume CPU
+  even when no delivery was waiting.
+- The page buttons in the terminal view's header were larger than the other header buttons. They
+  now match them when you use a mouse; on a touch screen they keep the larger size.
+- Help and the Automation editor said an idle Group stops all automation. Only the built-in
+  stand-up's scheduled runs pause; other rules run as configured, and **Run now** still works.
+- A message whose only Markdown is simple bold text now shows the bold instead of the asterisks.
+- Messages from other participants now count as unread when they arrive while a full-screen diagram
+  or another window covers the chat, such as Settings, Search or Context, as they already did while
+  a workspace file was open. On phones this includes dialogs that fill the screen.
+
+### Security
+
+- Requests to a configured literal loopback endpoint (`127.0.0.0/8`, `[::1]` or `localhost`) now
+  start without a system proxy: the daemon's and CLI's calls to the local Web, and calls to an
+  external MCP server, Mattermost, Codex Voice, a Connect peer or a skill URL. Previously, a proxy
+  without a loopback `NO_PROXY` exclusion could receive those requests and their credentials, such
+  as the Web admin token. Hostnames that need DNS resolution still follow the proxy settings. Codex
+  Voice and skill URL downloads follow redirects, keeping the proxy choice made for the initial
+  endpoint.
+- Skills installed from a URL no longer keep or show the username, password, query string or
+  fragment of that URL. For direct HTTP(S) skill URLs, CCCC still downloads from the URL as given;
+  the saved source fields, returned target and direct URL download errors leave those parts out;
+  catalog views also omit them from previously saved skill sources. Downloaded skill text stays as
+  it is. A username and password or a token in a skill URL used to be stored in
+  `state/capabilities/catalog.json` and were visible through the capability overview and to agents
+  in other Groups through capability search. If you installed a skill that way, replace those
+  credentials; entries saved before stay on disk as they are.
+- A DeepSeek Agent whose API address is a literal loopback address now reaches it without a system
+  proxy. CCCC turns on Node's built-in proxy support for the DeepSeek process unless
+  `NODE_USE_ENV_PROXY` is set, so on a Node version that has it, with `HTTP_PROXY` or `HTTPS_PROXY`
+  set (in either case) and no loopback exclusion in `NO_PROXY`, a request to a gateway on this
+  machine, API key included, could go through the proxy. CCCC now adds that host to the `NO_PROXY`
+  list the process actually uses, keeping the list's other entries; a list of `*` already bypasses
+  every proxy, and other addresses keep your proxy settings.
+- When a DeepSeek turn fails, each private value the Agent was started with, and a
+  `DEEPSEEK_API_KEY` taken from the daemon's environment, is replaced by `[redacted]` wherever it
+  appears in full before the error is saved. Before, a gateway that repeated the key in its error
+  message could have it saved in the Agent's run records and in the Group's history. The rest of
+  the error is kept, so the reason can usually still be read.
+
+## [0.4.50]
+
+### Added
+
+- **Run now** in **Automation** sends a reminder rule's notification once without waiting for its
+  schedule. It runs the saved rule, also when the rule is off, does not count toward the rule's
+  maximum runs and does not change its schedule. A paused or stopped Group has to be resumed
+  first, and the notification may wake its recipients and use model credits. Agents can do the
+  same with `cccc_automation(action=run_now)`.
+- A Group's menu in the sidebar opens that Group's **Automation** settings.
+- `/cccc-self-evolution` is now a short team review. It reads what you said and how many messages,
+  scheduled reminders and open tasks each member has, then brings you at most three proposals, each on its
+  own card with its evidence. Standing rules and changes to members wait for your pick. Before, it
+  read the whole history
+  and kept a checkpoint in Group memory. When 10 more top-level tasks are finished, the foreman's next
+  task update carries a one-line reminder to run it; nobody is woken, and turning the skill off silences
+  it. `cccc_message_history` gains `sender`, and `cccc_group` gains `activity`.
+- Audio files in a message can now be played in the browser. Each keeps its download and gains a
+  play button. A message has one player, so you can switch between several clips to compare them.
+  Playback stops if the message scrolls far out of view.
+- Markdown, PDF and common text files in a message now open in the page when you click their name,
+  with their download next to it. PDF uses the browser's own viewer.
+- An address that starts with `http://`, `https://` or `www.` is now a link in a plain message too.
+  A link to an image, audio or video file opens in the same preview, as does a link to one of the
+  Group's files, and Markdown and text from `raw.githubusercontent.com` or
+  `gist.githubusercontent.com`. A preview loads when you click its link, and other links open in a
+  new tab.
+- A path with a directory, such as `docs/guide/web-ui.md` or `out/全片.mp4`, opens a supported file in
+  Files, as it is now rather than when the message was sent. So does a Markdown link to a file in the
+  workspace. Names may use letters in any language. Put a path in inline code when a name has spaces
+  or symbols other than `.`, `-` and `_`, or when a relative path starts with a folder named in
+  letters other than A to Z; otherwise it may be missed or only partly marked.
+
+### Changed
+
+- The built-in stand-up example now asks the foreman whether work serves the user's current goals
+  and outstanding requests; where waiting, rework, duplication, unclear handoffs or
+  misunderstandings cause friction and whether the team fits the work; whether repeated user
+  concerns have been addressed and adopted improvements have helped; and whether there is a better
+  way to collaborate. It asks for a brief report when the user requests one and otherwise for
+  silence when nothing needs attention.
+  It remains off by default; its default interval is now two hours instead of 15 minutes. Existing
+  rules keep their schedule, recipients and enabled state; those using the built-in stand-up snippet
+  without an override receive its new text, while custom text stays in place. When enabled, the
+  notification may wake an agent and use model credits.
+- On a phone, a message's sender, time and actions sit above its route, its text uses the full width,
+  and the sender's insight is set apart below it. **Back to latest** sits beside the members at the
+  bottom of the log, so it no longer covers a message.
+- A message to an agent that cannot stay up now says so. CCCC tries to start the agent a few times
+  over several seconds, then shows **Delivery failed for** that agent on the message, with the reason
+  and **Retry** in its recipients. After you fix the cause, **Retry** or starting the agent offers it
+  again. If the message may already have reached the agent, its recipients say **Delivery uncertain**
+  and leave the decision to you. Before, CCCC kept restarting the agent for as long as the message
+  waited, and the page showed only that it was stopped.
+- When an agent ends on its own with an error, the page now says so and points to its terminal, so
+  **Start Group** no longer looks ignored when an agent exits at once.
+- `cccc doctor` prints a short summary in a terminal. A pipe, a redirect or `--json` still gets the
+  full JSON report.
+- The details of a Codex native agent now say that closing its window may not stop it: it can still
+  receive CCCC work and use model credits. **Pause CCCC access** stops new deliveries from the Group.
+- `cccc_capability_search` no longer lists filters that have no effect in this version, and the
+  capability guides no longer promise remote search, which this version does not do. Installing
+  skills from a URL or GitHub remains available.
+- The first screen of a new Group explains Send, Mail, the foreman and tasks in plainer words.
+- The **Auto** theme now follows the light or dark setting of your system. It used to switch by the
+  local time of day.
+- In a Group with several members, agents are now asked to tell you privately when a teammate or
+  the team setup is helping or hurting the work. The foreman is asked to check who owns what and
+  whether each member's setup fits when it assigns work, hits a block or takes a handoff.
+- `cccc_message_history` now shows an agent only its own traffic. A foreman could name another
+  member, or `user`, and read what that member had sent only to you.
+- An exact `cccc_message_history` read no longer repeats a system notice's text that its delivery
+  text already shows, and `mcp_omitted_fields` names any field it left out.
+- An agent can now learn that its message may not have got through. When CCCC stops trying to
+  deliver it, the agent that sent it gets a notice that delivery failed or is uncertain. The notice
+  may be late or lost, it can start that agent for one more turn, and deliveries to Web Model
+  members are not covered yet. If a named recipient is disabled, or the Group is paused or stopped,
+  the send result says so at once.
+
+### Removed
+
+- The Group memory tools and their automatic recall prompt have been removed. Existing files remain
+  in `CCCC_HOME/groups/<group_id>/state/memory/` and are included when copying a Group; CCCC no
+  longer provides a dedicated tool to search or update them. Shared team rules can be kept in the
+  Context panel's **Working Summary** constraints.
+- Settings no longer offer options that could be saved but did nothing in this version:
+  **Collaboration Follow-ups** under Automation (keepalive, help refresh, agent idle alert and group
+  silence check), **Include tail in idle notifications** under Transcript, and **Log level** under
+  Developer. Values already saved in a Group stay there and are ignored. For a recurring reminder,
+  use an automation rule.
+- The capability center's Sources page no longer has an on/off switch for a source or a search box.
+  The switch could be saved but did not change search results in this version, and the search box
+  did not filter the sources.
+
+### Fixed
+
+- A file name such as `AGENTS.md` or `build.rs` in a formatted message is no longer a link to a
+  website, and formatted messages no longer rewrite `..` as an ellipsis or `(c)` as a symbol.
+- An agent that starts or resumes now gets the Group's constraints first. Before, the rest of its
+  recovery context could crowd them out, leaving a few of them or only a note that they were omitted.
+- Skills reach the agent again in this version. A skill chosen from the `/` menu sent the agent to
+  look for its rules in a place that no longer held them, and a skill assigned to an agent was never
+  mentioned to that agent. `cccc_capability_use` now returns a skill's rules, and `cccc_bootstrap`
+  lists the skills an agent may use. The settings text no longer says an assigned agent uses a skill
+  automatically: the agent can find the skill and read its rules.
+- `/install` now tells the agent which tool to use instead of naming a skill that no longer exists,
+  a Voice Secretary request no longer sends the agent to an inbox that does not hold it, and a
+  reminder about due replies names the messages.
+- An agent shown a message with more than eight files used to see only the first eight, with no sign
+  of the rest. It now sees up to sixteen, and how many more there are.
+- While the daemon is starting, `cccc` and `cccc web` now keep checking for its answer for a few
+  seconds before reporting that it is not answering. Before, one failed check was enough, and the
+  report could offer to stop a healthy daemon.
+- Codex native members now show recovery steps when their background server exits or Codex reports
+  the session ended. Sending a message in an open session to try reconnecting starts a model turn.
+- On a phone, the first tap on the members' row no longer gets lost while the message box is open.
+- A conversation that fits on the screen no longer shows "No more messages" above it.
+- The theme choice in English settings no longer cuts off; its third option is now **Auto**.
+- **Automation** shows the last and next run in your browser's local time with the time zone,
+  instead of a UTC timestamp. The last run now shows when the rule last ran and created its
+  notification, marked when the run came from **Run now**; before, it could show when the rule's
+  clock started, even for a rule that never ran, and runs from before this version are not shown.
+  A rule that will not run now says why instead of showing a next time: the Group is paused or
+  stopped, or it is idle and the rule is the built-in stand-up. A recurring rule saved in another
+  time zone shows that zone and keeps it when edited, and a schedule the daily, weekly and monthly
+  patterns cannot express shows as written instead of as daily at 09:00.
+
+## [0.4.49]
+
+### Added
+
+- An agent can now switch to or from a Web Model, including directly between a Web Model and a
+  native session, or through a Profile. Entering a Web Model starts nothing: connect it to a
+  conversation in its settings, and its messages wait until then. Leaving one retires its
+  connection, so coming back means connecting again. While CCCC is handing a message to the browser,
+  a switch asks you to try again in a moment.
+- An agent can now take up a planned or active task that nobody holds.
+- While a message with attachments is uploading, a stop button next to **Send** ends the wait and
+  keeps your draft for recovery. The message may already have arrived, so check the conversation
+  before sending it again.
+- Repeating reminders can stop after a chosen number of runs. The rule editor accepts an optional
+  limit, and the list shows its progress and completion. Thanks to
+  [@chriscoveries](https://github.com/chriscoveries) for [#193](https://github.com/ChesterRa/cccc/pull/193).
+
+### Changed
+
+- The interface moves toward an e-ink look: a soft paper light theme and a graphite dark theme, with
+  text colors retuned for each. Layout, fonts and components are unchanged.
+- Opening a message from a notification now says so when the message cannot be opened, and offers
+  **Try again**, instead of failing silently.
+- An eligible plain message between agents can now arrive in a Claude session's notification, with
+  no separate read. A message from you, Mail, a long message, one with attachments or its own
+  project path, or one containing `<`, `>` or `&` still asks for a read, and so does the next
+  delivery when the Group's instructions are due. An open Claude session gets this once it restarts
+  (for example `claude --resume`): on Claude Code 2.1.317,
+  `/reload-plugins` leaves a running Monitor in place, and its notifications can arrive cut off
+  with a note to read the message.
+- CCCC offers native agents their Group instructions more often: the next delivery after a
+  compaction that Claude or Codex reports, after the instructions change, or in a new hour carries
+  them or asks for a read. Between those deliveries, an agent works from its own summary.
+- Automation update events in the Group ledger now record the version change and which sections
+  changed, without including rule IDs, rule contents or snippet text. Thanks to
+  [@chriscoveries](https://github.com/chriscoveries) for [#187](https://github.com/ChesterRa/cccc/pull/187).
+
+### Fixed
+
+- Messages reach what is actually running. After you save another runtime or Profile for a running
+  agent, its terminal keeps receiving them, with the submit key it launched with, until a launch
+  replaces it. A Profile change takes effect at that launch, and a connector no longer takes work
+  from a terminal that still runs.
+- A message cut off part way into a terminal is kept for review, and CCCC does not automatically
+  write it again. Work claimed for a terminal that has since stopped, and never written to it,
+  moves to the agent's current runtime.
+- When a browser delivery has to wait, CCCC retries the same batch. If its retries run out, or a
+  daemon restart or upgrade leaves it unconfirmed, CCCC keeps the batch for review once the page is
+  ready, because the conversation may still hold its draft. Later messages wait until you review it.
+- A native foreman now gets the default foreman capabilities, as a managed one does: when it joins
+  a running Group, on Start or a daemon restart, and when a switch makes it native. A capability
+  you blocked stays blocked.
+- A message sent with `cccc send --path` now belongs to that project, and a relative path means the
+  directory you ran the command in.
+- A finished early Group Bridge delivery that names no source message no longer prevents the
+  retirement of old Group Bridge state, which left its files behind with a warning at every start.
+
+## [0.4.48]
+
+### Added
+
+- An administrator can switch the runtime that runs an agent without losing the agent: between
+  connected native sessions, between a native session and a CCCC-managed runtime, or between
+  managed runtimes and Profiles. In the agent editor, **Runtime** first offers CCCC managed, Native
+  session or Web Model, then the item within it. The agent keeps its ID, role, tasks, Mail, reply
+  requests, message history, agent state and notes. CCCC stops the managed process that ran it; a
+  native application's process stays open until you stop it. A message the old runtime may have
+  received without a confirmed result is listed in a handoff notice to the new runtime and is not
+  delivered again automatically. When the new runtime can receive during the switch, the notice
+  comes before the messages still waiting; an agent that is stopped, paused or has its access
+  paused receives them all later, in the order they were written. Switching to a native
+  session removes the agent's managed configuration, including its own private environment
+  variables, which cannot be recovered; **Save as Profile first** keeps a custom configuration.
+  The old native session is told it was replaced and does not take the agent back when it
+  reconnects. If the final step of a switch fails, the agent stops receiving until **Retry
+  completion** succeeds or the daemon restarts. Web Model agents keep **Save** and **Save and
+  restart** in this release. The CLI offers `cccc actor switch`; the daemon operations are
+  `actor_runtime_switch` and `actor_runtime_switch_complete`.
+- Agents are told when their instruction files change. After `AGENTS.md`, `AGENTS.override.md`,
+  `CLAUDE.md`, `CLAUDE.local.md` or `.claude/CLAUDE.md` in an agent's workspace or a directory
+  above it changes, appears or is removed, the next CCCC message that has room for it carries one
+  line asking the agent to check the current project instructions, naming the files where the
+  message carries its full text. This covers agents CCCC starts, connected native sessions and Web
+  Model agents. The line names paths only, and CCCC reloads nothing itself. Changes made before
+  CCCC began watching a session, or while the daemon was stopped, are not reported.
+- The `cccc` MCP server reports a version difference from the daemon address file, naming both
+  versions and whether to reconnect the MCP server or restart CCCC. When the versions match, it can
+  also report different source fingerprints so you can check which build should run. The same
+  difference is reported at most once every six hours. A native agent reading a message by exact ID
+  can also see a notice when its client did not report an identity; that alone does not prove its
+  MCP server is old. Reconnect existing MCP servers after upgrading even if no warning appeared.
+- A managed Claude agent whose startup confirmation closed before CCCC connected now says why it
+  is stopped. The Web shows **Confirmation closed**, with a note that CCCC will not retry on its own
+  while it keeps running, messages to the agent wait, and **Launch** tries again; the terminal
+  interface shows `confirm retry`. Actor rows and lifecycle results report this as
+  `runtime_confirmation_paused`. The pause itself is unchanged: an explicit retry or a CCCC
+  restart clears it.
+- Mail results can now report the state of named recipients. The result of a new
+  local Mail may list, as `mail_recipient_advisories`, explicitly addressed agents that are
+  disabled, in a paused or stopped Group, or reported by the daemon as not running, with a note that
+  writing Mail starts no agent and resumes no Group, and that Send, or delivering this Mail, can
+  request delivery to an enabled agent in an active Group. The check only reads state; Mail itself
+  is unchanged. A result without the list does not mean every recipient will read the Mail:
+  broadcasts, whether a native session or Web Model is running, cross-Group and Connect Mail, and
+  retries are not checked.
+
+### Changed
+
+- **Save and restart** after changing a managed agent's runtime, mode or Profile, or after the
+  linked Profile changed, now switches the agent as described above, with its handoff notice, so a
+  message cut off by the restart is not sent twice. A restart without such a change is unchanged.
+  The add-agent dialog lists the same runtime categories; its **Native session** category opens
+  **Connect existing sessions** for the current Group.
+- The default name of a native session is shorter and has no spaces: `Codex_cccc_0632d7` instead of
+  `Codex · cccc · 0632d7`. Spaces in the directory name become hyphens, and a title the session
+  supplies itself is still used. Agents already in a Group are not renamed at once; one that still
+  has its default name can take the new form when its session is restored.
+- An agent on a native session now opens the same agent editor as other agents, with its avatar,
+  display name, group role, behavior preset and notes. Its working directory is read-only, because
+  the original application sets it, and settings that apply only to a process CCCC starts are
+  hidden.
+- Copying a Group now stops and asks you to copy it again when its agents changed while the copy
+  was being made, instead of producing a copy whose agents do not match its history.
+- Chinese and Japanese interface text now uses the names from the published READMEs. Chinese says
+  语音秘书 instead of 小秘书, and 领班 where the English foreman remained. Japanese calls the
+  foreman and peers フォアマン and ピア instead of the English names or リーダー, and says 音声秘書
+  instead of Voice Secretary and グループを起動 instead of グループを開始. A runtime confirmation
+  message says "agent" instead of "Actor".
+- Dictation added to the message box continues the text instead of starting a new paragraph.
+  Chinese and Japanese text joins without a space, nothing is inserted next to full-width
+  punctuation or before a comma or full stop, and Latin words get one space. Whatever the draft
+  already ends with, such as a line break or trailing spaces, stays as typed. A polished draft
+  of several lines, such as a numbered list, starts on a new line.
+- When a dictation is polished after recording, the voice secretary is told the text is the
+  user's own words to tidy, not a request to answer or carry out. It is asked to keep numbers as
+  dictated, write spoken enumerations as a numbered list, and return text that already reads well
+  unchanged.
+- Voice secretary recording with the local or external speech recognizer now needs the browser's
+  AudioWorklet support; a page without it says so instead of starting those recognizers. Browser
+  speech recognition does not use it and is unaffected.
+- After you stop a recording, the panel shows that it is being finalized. With the local or
+  external recognizer, stopping releases the microphone at once. If the browser then does not
+  confirm the last captured audio, the page says the result may be incomplete, and for a
+  recording outside a document it leaves any recognized text in the message box for review
+  instead of sending it on. Browser speech recognition is asked to stop. When a manually stopped
+  browser recognition cycle returns no result, or a local or external non-document recording
+  returns an empty result, the page can say that no text was recognized.
+- While a recording outside a document waits for its final transcript, **Stop waiting** appears
+  after 20 seconds. It ends the wait and keeps any recognized text in the message box of the Group
+  where the recording started; audio not yet recognized may be lost. Document recordings do not
+  offer it.
+- When a recording with the local or external recognizer cannot start because the microphone you
+  selected is no longer available, the error offers **Use system default microphone**. Choosing it
+  changes the microphone choice for voice features in that browser; recording starts again only
+  when you start it.
+- While the local or external recognizer is recording, if audio frames stop arriving or all samples
+  are zero for about six seconds, a hint suggests checking the selected microphone and its mute
+  setting. This is a hint rather than a diagnosis; background noise can keep it from appearing.
+- The page asks the browser to warn before a reload or close while a message or slash command is
+  being sent, or a Voice Secretary recording is starting, recording or being finalized. Switching
+  away from a Connect remote workspace asks for confirmation after that workspace reports the work.
+  Browsers may suppress the warning; the warning itself does not save any content.
+- A voice model download that stops partway now continues instead of starting over. A dropped or
+  stalled connection is asked for the rest of the file, and what arrived is kept for the next
+  install. Continuing needs a server that supports range requests, as GitHub release downloads do;
+  every file is still checked against its SHA-256, and against its size when the model definition
+  lists one. A kept file is deleted when it fails that check or when the model is removed, and
+  cleanup deletes kept files that the model definition no longer lists or that nothing has added to
+  for seven days. A server file whose stated size differs from the model definition now fails the
+  install before anything is downloaded.
+- When CCCC pauses the automatic starts of a managed Claude agent because its confirmation closed,
+  an agent or automation that tries to start it is now told that starts are paused and that the
+  user can launch the agent again.
+- Chet's errors for Claude's workspace trust and bypass-mode disclaimer now both say whether a
+  manual retry should set `CLAUDE_CONFIG_DIR` to the settings directory they name or leave it unset.
+- `@` and `#` suggestions now open at the cursor, including after common punctuation or Chinese,
+  Japanese or Korean text, and choosing one keeps the text after the cursor. Chosen references are
+  highlighted in the composer, and messages highlight references to the Group's agents, in the
+  colour of each agent's name, and to the Groups they refer to; unrecognized names, common email
+  addresses, links and code are not highlighted.
+- Agents can read or reply to a message by the short ID that delivery headers print, such as
+  `56712672` from `(reply:56712672)`. A short ID resolves to the one message the agent can read
+  whose ID starts with it; when several match, the error lists them, and messages the agent cannot
+  read never match. CCCC records and compares the full ID, so a retry with the full ID, or with a
+  short ID that still names that one message, is the same reply. Full IDs work as before.
+- `cccc_file_send` takes a list of up to 10 paths and sends them as one message with one caption,
+  so a set of screenshots arrives as one message instead of one per file. Every path is checked
+  first; if any is outside the workspace or missing, nothing is sent. A single path works as
+  before.
+- The terminal interface now shows a managed agent waiting for its startup confirmation as
+  `confirm Web`, and the Members heading counts the agents marked `confirm Web` or `confirm retry`,
+  apart from messages waiting for your reply. Web Model agents show `access on` or `access paused`,
+  since CCCC access being on does not show whether a browser is connected.
+- **Waiting for you** no longer reopens empty. When it would open with nothing to show and its
+  count is known to be zero, for example when you come back to the Group after answering, the chat
+  shows **All** and keeps it, so a request that arrives later shows its count on the tab without
+  switching the view. Requests answered or withdrawn while you are in the view stay listed until
+  you leave, with any unsent answer, and a count or page that cannot be confirmed keeps the filter.
+  After you send from **Waiting for you**, its count is checked again at once, and a notice that
+  your message is hidden by the filters closes once the view shows it.
+
+### Fixed
+
+- A system notice without a message mode, such as a Voice Secretary request, was never delivered
+  to a connected Claude session: building its notification failed and ended that session's
+  delivery worker. Such notices are now delivered, with their text as the preview.
+- The Runtime Dock no longer calls a native session **Stopped** when CCCC only cannot deliver
+  to it; it shows the same receive status as the agent's tab. A Codex member that
+  cannot receive now says that CCCC reaches Codex only through the shared app-server and asks you
+  to check that the session is open in a Codex connected to it. When the `cccc` MCP server
+  identifies that Codex session on a tool call, the tool result can include a notice telling the
+  agent that messages may not reach it unless it looks, so it can ask the user to check. While that
+  state stays the same, each MCP server repeats this at most once every six hours.
+- A custom agent avatar now appears in the agent editor and the agent list after you upload it, and
+  stays after a reload, with **Reset** to remove it. Before, the upload was saved but those views
+  kept showing the default image. The avatar picker no longer offers SVG, because CCCC's file route
+  serves SVG as binary data rather than as an image, and says which formats work if you choose one
+  anyway.
+- Codex sessions started in a terminal are no longer labelled **VS Code** in **Connect existing
+  sessions** when Codex records the client that created the thread, as Codex 0.166 does. That
+  version records terminal threads with the source `vscode`, so CCCC now reads the recorded client
+  and uses the source only when no client is recorded. Threads created by other clients get no
+  origin badge. A session listed before this change can keep its old badge.
+- Switching away from a Connect remote workspace now asks before discarding an unsent message
+  draft or attachment, once that workspace has reported it. Drafts in other Groups on the same
+  remote page count too; an empty or whitespace-only draft does not.
+- Sending again after a send whose result was unknown, for example when the connection dropped
+  before the response arrived, no longer creates a duplicate message, including a message to another
+  Group. If the restored message is sent again without any change, the Web reuses the first
+  attempt's client ID, so the daemon returns the message it already accepted. Editing it, even back
+  to the same text, or replacing an attachment makes it a new message. The retry is remembered only
+  in the open page; reloading the page starts over.
+- A send that fails no longer overwrites a draft you started while it was in flight. If the composer
+  is still empty, the failed message comes back as before. Otherwise it waits under **N sends to
+  restore** with its destination, recipients, reply target, references and attachments, until you
+  restore it into the empty composer or discard it. Slash commands follow the same rule, and a
+  command that finishes after you switched Groups no longer clears the draft you started there. A
+  failed send may still have arrived, or a command may already have run, so the list says to check
+  the conversation before sending again.
+- The **N sends to restore** list appears in every Group, and in place of the composer when no Group
+  is open, so a send that fails after you switched Groups is not left behind. Its content shows only
+  in its own Group; elsewhere the list names that Group, and **Open** goes there. The error for such
+  a send names its Group as well. A send whose Group is no longer available cannot be viewed or
+  restored unless that Group becomes available again; it stays listed until you discard it. Waiting
+  sends live only in the open page: while any wait, the page asks the browser to warn before a
+  reload or close, and switching away from a Connect remote workspace asks first once that
+  workspace has reported them.
+- While a message is being sent, the Send button now shows that it is still sending and becomes
+  available again when the attempt finishes; you can keep editing the next draft meanwhile. Before,
+  a second send during that time looked possible but did nothing. Slash commands are unchanged.
+- A draft addressed to another Group now keeps that destination and its recipients when you switch
+  Groups and come back. A send naming a recipient who is no longer available stays in the composer
+  with a request to check the recipients; it used to go without that recipient, or to the Group's
+  default recipients when none was left. The recipients row shows such a recipient as unavailable
+  until you remove it, and choosing other recipients does not drop it. A reply to a message from an
+  agent that is no longer in the Group is addressed to that agent, shown as unavailable, so you
+  choose who receives it.
+- Images read with `cccc_file`, directly or through `cccc_code_exec`, now reach the model in Codex.
+  Codex gives the model only `structuredContent` when a tool result has it, so the image was dropped.
+  For Codex's MCP client (`codex-mcp-client`, checked with Codex CLI 0.166.0), a tool result that
+  contains an image now leaves out `structuredContent` and keeps the same metadata as text; structured
+  error results are left as they are. Other clients receive results as before; Codex hosts that
+  identify themselves differently are not covered.
+- A Connect remote workspace no longer closes when one of its periodic access checks, including the
+  administrator sign-in check, fails with a network error or a server error (HTTP 5xx), for example
+  from a reverse proxy or tunnel. It keeps the page that is already shown, with any unsent work, and
+  checks again at the usual interval. Until the workspace is ready, the frame says it is connecting
+  instead of staying blank.
+- A Connect remote workspace also stays open when its access proof expires, for example after the
+  computer slept, when the account directory is briefly unavailable, or when the target's Web
+  service restarts. The page is kept as it was, hidden behind a notice with the time of the last
+  connection attempt. Meanwhile it pauses new requests and live updates and disconnects its agent
+  terminals and browser views. The entry keeps trying and shows the page again once both instances
+  confirm the same account, administrator access on each side and a fresh access proof. **Close
+  this page** asks first when the page has reported unsent work. A change of account, or of the
+  target's device or address, or revoked administrator access on the entry still closes the page,
+  as does the target refusing access during recovery. A change that was being saved when the
+  connection dropped may already have been made; recovery does not automatically resend it. Both
+  instances need this version; with an older one the page closes as before.
+- A Connect remote page that needs to reload, from its update notice, its error screen or after
+  part of its code failed to load, now asks the entry to open it again, and the entry asks first
+  when the page has unsent work. Reloading inside the frame ended the connection. An entry older
+  than this version ignores the request, so reload the entry's page instead.
+- A dialog that fails to open, for example because its code could not be loaded, now shows an
+  error screen over the page with **Try again** and **Refresh**. The whole page used to go blank.
+- A Connect delivery whose window ended, or whose connection was disconnected, before the target
+  received it no longer tells the sender that the target did not accept it. The notice now says the
+  message did not arrive and can be sent again, after reconnecting when the connection was
+  disconnected. A delivery the target may have received keeps its warning to check first. Thanks to
+  [@chriscoveries](https://github.com/chriscoveries) for [#188](https://github.com/ChesterRa/cccc/pull/188).
+- A DeepSeek turn whose provider keeps sending valid ACP updates or permission requests is no
+  longer cut off after 300 seconds and sent again from the start. The timeout now counts only
+  silence: each validated update and each answered permission request restarts it, so a turn still
+  times out when the provider sends neither for 300 seconds.
+  Thanks to [@chriscoveries](https://github.com/chriscoveries) for [#184](https://github.com/ChesterRa/cccc/pull/184).
+- A notification an agent sends with the MCP `cccc_notify` tool without `target_actor_id` now
+  reaches its recipients. The tool stored the calling agent's own ID in the notification, where
+  routing reads it as the target, and an agent never receives its own notification, so such a
+  notification reached no one. The caller is now only the author, and an ordinary notification with
+  neither a target nor recipients is a broadcast to the Group, as the event standard says; one that
+  targets its sender still reaches no one. The tool refuses an `im_visibility` other than
+  `internal`, and the daemon refuses a `target_actor_id` or `to` it cannot read instead of treating
+  it as no target. Notifications from a native session or Web model no longer copy the binding CCCC
+  checked the call against into the Group's history. Thanks to
+  [@chriscoveries](https://github.com/chriscoveries) for finding and diagnosing this in
+  [#186](https://github.com/ChesterRa/cccc/pull/186).
+- Commands a Web model runs with `cccc_exec_command` now have the common pagers turned off by
+  default, so `git log` and similar commands no longer wait in a pager for a key press. On Unix the
+  session sets `PAGER`, `GIT_PAGER`, `GH_PAGER` and `MANPAGER` to `cat`, overriding inherited
+  values; on Windows only `GIT_PAGER` and `GH_PAGER`, leaving `PAGER` and `MANPAGER` inherited. A
+  pager set in the call's `env` still applies. The tool description now says the command runs in a
+  PTY.
+- `cccc_code_exec` no longer advises rerunning a cell that failed, had its output cut short, was
+  terminated or can no longer be found. Earlier calls in the cell may already have taken effect, so
+  the advice is to check their outcomes before repeating any of them.
+- Voice dictation into the composer keeps short answers the recognizer returns, such as 好, 嗯,
+  OK, yes or no, instead of discarding them as noise. The local and cloud recognizers still filter
+  out blank or punctuation-only text. For polish or Ask, words blocked by the speech-noise filter,
+  such as 好 or OK, are placed in the message box with a notice instead of being discarded.
+- When NotebookLM refuses a source refresh, rename or delete, or an artifact listing, with a status
+  CCCC recognizes, the operation now fails with that reason instead of reporting success or an empty
+  list. A status CCCC cannot read is reported as a changed response format rather than success.
+  Recognized refusals that are rate limits, timeouts or authentication failures are reported as
+  such, and waiting for an artifact rides out up to three brief listing failures in a row.
+- A recognized refusal of an artifact generation is reported as such. When NotebookLM answers a
+  generation with no result or a null artifact ID, CCCC says the artifact type may be unavailable to
+  the notebook or account and asks you to check the artifact list before retrying, instead of
+  reporting a changed response format.
+- A NotebookLM query whose response holds only stream bookkeeping and an end-of-stream frame, with
+  no answer or heartbeat frame, the form NotebookLM is reported to use when the chat quota runs out,
+  now fails as rate limited and says the quota may be exhausted, instead of reporting a changed
+  response format. Among the chunks NotebookLM marks as answers, the one marked final is used rather
+  than a longer earlier draft; without a final mark the previous choice applies. An answer payload
+  or answer row that is not a list is reported as a format change instead of an empty answer.
+- When adding a NotebookLM URL, Drive or file source has an unclear result, CCCC no longer reports a
+  source that existed before the request as the one it created, and a recognized refusal is no
+  longer turned into success because a new source with the same name or address appeared. These
+  cases now report the refusal or an unresolved outcome to check in the notebook.
+- NotebookLM artifacts scheduled for later show as `scheduled` instead of `unknown`; source types
+  follow NotebookLM's current codes, so Drive files, native Sheets and PowerPoint files are named
+  correctly; notebooks you own and have shared are reported as yours; and an artifact download
+  refused with HTTP 401 or 403 asks you to sign in again instead of reporting an upstream error.
+- Downloading a local speech model no longer fails after an hour on a slow connection that keeps
+  receiving data. A download is now treated as stalled when no data has arrived for 60 seconds,
+  and the error says so.
+- Transcript pieces merged during recording no longer get a space after full-width punctuation,
+  as in "好的。 然后".
+- Recognized speech from a recording outside a document is kept when the recording does not
+  finish normally. When the connection fails, the final transcript fails or is incomplete, a
+  polish or Ask request fails or its result is not confirmed, or you cancel a polish or it comes
+  back unchanged, any words the recognizer has returned are placed in the message box of the Group
+  where the recording started, with a notice saying what happened. If the page leaves the Group
+  view while recording, that text is saved to the same message box.
+- For document recordings, text that has not reached the document yet is kept the same way: with
+  browser speech recognition, pieces not yet sent; with the local recognizer, a part whose save
+  was still in progress. Other text from a local-recognizer document recording is left to the
+  server, which tries to finish the document after a disconnect.
+- With the local or external recognizer, an Ask dictated while an earlier Ask is still pending in
+  the same Group is submitted as its own request, as with browser recognition, instead of being
+  dropped.
+- If you dictate another polish while a previous one is pending, the new words stay in the message
+  box for review rather than being merged into that request or discarded.
+- Document recordings with the local recognizer no longer write the same text twice when a slow
+  save overlaps the next checkpoint. A save that fails is not retried; its text is placed in the
+  message box, and later text is still written to the document.
+- The errors for local speech models that are not ready and for missing external recognizer
+  credentials now give the full settings path, **Settings → This instance → Voice → Voice
+  Secretary**. A Group's settings have no Voice tab, so the shorter path could not be followed
+  from there.
+- The status shown for a delegation sent from a Group was always in Chinese; it now follows the
+  interface language.
+- The update time shown when you hover over an agent's state was labelled in English in every
+  interface language; it is now translated.
+- `cccc_file_send` ignored `idempotency_key` for sends on this instance, including to another
+  Group, so retrying with the same key posted the files again. The key now identifies the send,
+  and a retry returns the first message, also after a source file was removed.
+- Ctrl+Enter (Cmd+Enter on macOS) did not send a message ending in an `@` or `#` mention that matched
+  no suggestion, such as `see #34`; it now sends.
+
+### Security
+
+- Linking an agent to an Actor Profile now requires permission to read that Profile. Before, a
+  Group member without administrator access could link another user's private Profile to an agent,
+  through the Web or by asking an agent to do it, and the agent then started with that Profile's
+  command and private environment, such as API keys. Adding an agent with a Profile, linking or
+  relinking one, changing which user's Profile a link points to, and converting a linked agent to
+  a custom one now check that the caller may read the Profile, and an update's `patch` can no
+  longer set the link directly. A request made by an agent can list, read and link global Profiles
+  only, whatever authority fields it carries. The Web takes the caller from the signed-in session
+  instead of the request body, and the `cccc` MCP server drops authority fields supplied by a
+  model. Local `cccc` commands keep administrator access. Links made before this release are not
+  checked again: an administrator of a CCCC that others sign in to can see which agents use each
+  Profile under Settings → Agent Profiles → **Usage**, and should remove an agent that should not
+  use one or link it to another Profile. **Convert to Custom**, or deleting the Profile with
+  **Delete anyway and convert linked agents to custom**, would copy the Profile's keys into the
+  agent.
+
+## [0.4.47]
+
+### Added
+
+- **Chet**, the global assistant, can receive text without opening a voice call. The former
+  Voice Analyst is now called Chet; its Runtime is configured under **Settings → This instance →
+  Voice → Chet → Runtime**. Chet shares that session with assistant-mode voice. Sent inputs,
+  observed voice transcripts, work receipts and results are kept on the machine running CCCC; unsent drafts stay
+  in the browser. A selected Group is included as context when a message is sent. An
+  unconfirmed result stays visible and is not automatically replayed. Replies to messages Chet
+  sends to a Group as Chet stay in the Group's chat and can reach Chet whether or not a call is
+  active, as the next entry describes; replies to handoffs that earlier versions sent under your
+  name can reach Chet only during an assistant voice call, and delivery is not guaranteed.
+  Adjacent Chet voice
+  transcripts can be expanded from a grouped row, with incomplete transcripts marked; when shown
+  with a result, the voice task wording is also expandable. Chet's written results retain a solid
+  rule at the left; its spoken transcripts appear as lighter lines marked with the voice icon. Concise and standard voice instructions
+  prefer a brief spoken account over reading a long result, while detailed mode and the user's
+  explicit spoken requests remain in effect.
+- **Chet in Groups**: a Group member can message Chet by choosing `@chet` as the only recipient,
+  with **Send** or **Send + Reply**; Mail is not available for Chet, and a member whose ID or title is
+  `chet` makes `@chet` ambiguous, so the send is refused. In the Web UI a CCCC administrator can
+  choose `@chet` in a Group's recipient row. Group messages that Chet can take up are queued as
+  turns of their own, after the requests you type or speak, and Chet is instructed to answer
+  questions and requests in the Group, while an acknowledgement alone needs no reply; its messages
+  there are labelled **Chet**, and replying to one without other recipients goes back to Chet.
+  Group messages enter Chet's usual session, which can also hold your own
+  conversation and other Groups' content; keeping those out of a Group, and leaving work outside a
+  Group to you, are instructions to the model, not isolation or a permission limit. Chet's
+  conversation lists each Group message with its sender, Group and time and opens it in its Group;
+  once Chet has finished, it links the reply it finds in the Group or says that none is seen yet.
+  While the conversation is closed, the Chet entry shows a dot for a new Group message, answer or
+  request that did not start; a browser that has never opened the conversation counts such items
+  already in history as new. Cancelling your own request leaves Group messages waiting for Chet in
+  its queue. During a call, a member's reply to a message Chet sent while the call was recording
+  can be read aloud; the recording state approximates which messages belong to the call. Chet does
+  not forward messages between Groups or send through Connect: those requests are refused rather
+  than sent under your name.
+- When the Web interface on the server changes, for example after an upgrade, an open page offers **Refresh page** and **Later**. The page checks when it reconnects to the server or comes back into view, and never reloads by itself: **Refresh page** first asks for confirmation, since unsaved changes on the page could be lost, and **Later** hides the notice until the interface changes again. Pages opened before this version cannot show the notice; reload them once after upgrading.
+- **‘Waiting for you’ indicators** under Appearance can turn off what marks requests waiting for your answer: the sidebar's counts, including the archived Groups' total and the one on the phone's sidebar button, and the Waiting for you filter inside each Group. Those requests then read as ordinary messages: one without a question is answered with the message's Reply, and one that asks a question still shows it so you can answer in place, without the Waiting for you frame, and an answer already being sent keeps its form until it is confirmed; browser notifications keep their own switch under Settings → Notifications. The indicators show by default; the choice is saved in the browser.
+- **Quick reply**: the **More** menu of a message from one of the Group's agents offers four ready replies, **Agree, go ahead**, **Explain why**, **Try another way** and **Give me choices**, each led by an emoji under the caption **Quick reply · sends immediately**. Choosing one sends it at once to that agent alone as a reply quoting the message, without the composer, and a notice confirms it. Chet's messages, messages from or sent to another Group or CCCC instance and questions answered in their own card have no quick replies. When CCCC cannot confirm that a quick reply was sent, the notice says so and offers **Retry**; a retry can send the reply twice.
+- **Pinned messages**: a message's menu offers **Pin message**, and a small pin follows the time of
+  a pinned message. The chat's **Pinned** tab shows how many messages the Group has pinned and lists
+  them in full, in conversation order, each with **Show in chat**; one unpinned there stays listed,
+  so it can be pinned again, until the tab is left or the page is shown again. Pins belong to the
+  Group and are kept by the daemon outside the ledger: everyone who uses the Group in the Web UI
+  shares them, and a page reads them again when the Group opens or the page becomes visible. A
+  read-only exhibit neither shows nor changes them, agents do not receive them in messages or tools,
+  and Copy Groups packages leave them out. A Group keeps up to 100 pins; a pin whose message can no
+  longer be read is reported and can be removed.
+- **Claude's confirmations in its terminal**: when a managed Claude agent cannot start until you
+  trust its workspace or accept Claude's disclaimer for `--dangerously-skip-permissions`, CCCC
+  opens Claude's own prompt in the agent's terminal, with the agent's settings, and never answers
+  it for you. The agent shows **Awaiting your confirmation in the terminal**, and the terminal
+  says what to do. Launching or restarting the agent opens that terminal; if you have moved to
+  another tab of the Group, a notice offers **Open confirmation terminal** while confirmation is
+  pending, and from another Group the notice names the Group and agent. After you accept, CCCC
+  tries to connect the managed session, and messages wait for it. If the prompt ends
+  without a connection, for example because it was declined or closed, automatic starts do not
+  reopen that prompt during this daemon run. Choose **Launch** or **Relaunch**, or start the Group
+  yourself, to retry. A daemon restart can also retry agents in a running Group; it does not grant
+  confirmation. Messages stay queued, and the Group's other agents still start. Pausing or
+  stopping the Group closes a waiting prompt. Before, an unaccepted disclaimer stopped the start
+  with instructions to run Claude by hand, accept, exit and retry; workspace trust already used the
+  terminal.
+
+### Changed
+
+- The Web interface has a new look, a pixel-terminal screen, light or dark with the theme. It replaces the previous look, with no choice to bring that back, and covers the whole interface, including the chat page, the task board, Settings, the frames around terminals and terminal history, headless traces, workspace files, the capability center, Web Model panels, the global Chet panel and its dock, a Group's Voice Secretary panel and its notes in the composer, presentations, dialogs, menus and notices. Surfaces are separated by thin rules rather than shadows, dialogs dim the page behind them without blurring it, and keyboard focus shows a dashed outline. On desktop the members' status is one centered row of icons over the end of the conversation, with no band of its own: the conversation ends with room for it, so the last message scrolls clear of the row, and text scrolled under it fades out behind the icons only, so the conversation stays in view on either side of them. On phones the members' bar, one touch key tall, at least 44px and growing with the text size, floats the same way, and while it shows, the key back to the latest message rises above it. Icons are pixel glyphs, mainly from Pixelarticons; runtime logos keep their existing artwork. In the chat, your messages sit on the right and agents' messages on the left, each as wide as its content, header and attachments included; in a wide reading column both keep the same room from the opposite edge. Each run of messages from one sender opens with a thin line that spans its first message, while messages that follow from the same sender are set apart by space alone; space inside a message is reduced so that it reads apart from the space between messages, a Markdown rule inside a message is a short mark, recipients and time are set a step lighter than the author, attachments follow the message's text with no rule between them, and a sender's insight follows the text and attachments, with its label and no rule above. On screens 768px and wider the conversation keeps a centered reading column, which **Message area width** under Appearance widens to **Wide** or **Full**; the choice is saved in the browser. With a centered column the scrollbar sits beside it and the key back to the latest message at its lower right, and the mouse wheel scrolls the conversation from the blank space on either side. On phones, a message's actions menu (⋮) ends its header line, so the text gets more room. The task board follows: tasks read as rows, the open one in reverse; on desktop the search, assignee and filter row stays pinned above the board, and on phones a pinned row of keys jumps between columns; search highlights title matches, keeps matching IDs visible, and shows excerpts for matches in other fields. Settings reads as one configuration page: the scope and the open page are set in reverse, fields are framed and actions are keys. **Body font** under Appearance sets most of the page's text in monospace, the default, or in a pixel font. Characters a font lacks fall back to other available fonts; this includes Chinese and Japanese characters in monospace, and some Japanese and Traditional Chinese characters in pixel. In the Japanese interface, pixel body text prefers the bundled Japanese glyphs where available. With a Group open, the page loads about 0.8 MiB of fonts, which the browser may cache, and the pixel body font adds 0.3 MiB; their licenses ship with the Web assets. Tested in Chromium on Linux; Safari, Firefox, Windows display scaling, macOS and phones still need acceptance testing.
+- The interface calls a Group's members **agents** instead of Actors, in the Web UI, CLI help, the terminal interface, the README and the guides. Commands such as `cccc actor add`, API and MCP fields such as `actor_id`, and links to the guides' existing sections are unchanged.
+- Activity, feedback and the composer's typing hint move in whole steps. A busy member's icon has a ring of pixel dots with a bright head stepping round it; the ring can light briefly when the page sees that work return to idle. When the page sees a member start needing your attention, its icon's double line in the waiting color blinks three times, then stays; **+N** takes the same line when a member behind it needs attention. Waits for sending, history, files, quotes, Web Model delivery, runtime detection and key refresh show a small pixel spinner once they last longer than a quarter of a second; until then, buttons keep their existing icon or label. In a headless agent's live trace, a block cursor can follow the newest text, though not after code blocks, tables and some other structures: solid while text arrives, blinking after a short pause, hollow after 10 seconds without new text. Reconnecting shows three filling dots, the composer's typing hint uses the block cursor, and the Voice Secretary level meter lights 16 segments. **Motion** under Appearance stills these; the system's reduced-motion setting does the same, and Appearance says so. The level meter keeps showing the live level.
+- The Chet control below the Group list and the title of Chet's panel show Chet as a pixel head drawn in the screen's ink; when something needs a look, the control shows an alert mark in its place, as before. The head blinks now and then and moves while Chet has work being sent, queued or carried out; **Motion** under Appearance and the system's reduced-motion setting hold it still, with its working face shown while that work remains.
+- When **Send + Reply** is chosen while @all or @peers is among the recipients, the composer now shows how to fix it below the recipients: remove @all and @peers, or clear the recipients to ask the Foreman.
+- Answers you give under a request, which agents receive as `Selected B: <label>` or `Other: <text>`, show that prefix in the interface language in the chat when the message has that recognized form. The stored message, copying and search keep the original text.
+- OpenCode agents show the official OpenCode mark, unchanged from OpenCode's repository. License notices for it and for the Bootstrap Icons, LobeHub Icons, Pi, Cline and Pixelarticons artwork used in the Web interface now ship with the Web assets. The unused Claude PNG logo is removed; Claude agents keep the same icon. The bundled Cline SVG now identifies the changes made to its source file.
+- Short times such as "5m ago" and "Oct 23" in the Agents tab and agent state, the context panel, the task editor, message search, Inbox, the Web Model panel and headless traces now follow the interface language, for example 5分钟前 in Chinese and 5分前 in Japanese. English keeps its familiar short forms.
+- The chat's floating ↓ button is named **Back to latest**, and its name and tooltip include the number of new messages, up to 99+; that count is the Group's own and can include messages outside the current filter. In a list too short to scroll it appears only with such a count. It steps aside while you write an answer to a request, so it no longer covers the answer's send key. Focusing an item in the message list cancels a pending forced jump to the bottom, so the browser can bring it into view; following new messages while you stay at the bottom works as before.
+- The answer box under a request grows with your answer up to a height limit, then scrolls; it fits again when the screen turns or narrows. On narrow screens its send key shows only the send mark, leaving the box more room, while the key's name and tooltip keep the words.
+- While a message is being sent, the send key's name and tooltip say **Sending…**.
+- Changing a chat filter keeps your place. While you read earlier messages, the message you were reading, the last one you clicked, tapped or reached with Tab while it remains on screen, or the one across the middle of the list once you move on, stays at the same height when the new view has it, as far as the view can scroll; if it does not, the first other message from your screen that the new view has stays put instead. Otherwise the nearest loaded message from that part of the conversation takes its place, shown from its top and briefly outlined. Following the latest messages still follows them, except that a message you clicked or tapped keeps its height in a view that has it; this also carries a message over from a list too short to scroll. A view you only look at, without scrolling or interacting with its messages, leaves your place unchanged, so switching back returns exactly where you were. **Waiting for you** and **Pinned** keep a message from your screen only when they list it, and otherwise open at their newest message. Messages that are not loaded, such as older ones a filter has not reached yet, cannot be kept. Before, a filter that lacked the message at the top of the screen opened at its newest message, and the place you had been reading was lost.
+- Message actions: **Reply**, **Forward** and a copy icon, which copies the message content as **Copy text** did, stay on the bar shown with a message, and **Copy link** moves into its **⋯** menu. With a mouse, the bar shows beside the message header while the pointer or keyboard focus is on the message, after the time or before your name, in the free space next to it, so showing it moves nothing. Where the conversation's column is too narrow for the bar, such as beside the files panel or at a large text size, the message menu (⋮) at the end of its header holds every action instead, as on touch screens. On touch screens, the message menu lists every action in the same order. Copying text or a link is confirmed by a notice in the interface language; before, the link notice was always in English, and copying text from the touch menu showed no confirmation.
+- In a filtered chat view, **Show in chat** (定位到聊天位置 in Chinese, 会話で表示 in Japanese) leads the bar shown beside a message's header where the column has room for it; otherwise, and on touch screens, it follows the message's time. It replaces **View context**, which sat in the message's **⋯** menu. It opens the message with the messages around it in the whole conversation, and **Back to filtered conversation** returns to the filtered view at the place you were reading; before, the filtered view reopened at its newest message. If the message cannot be opened, a notice says so; before, the view stayed as it was without a word. Opened from the keyboard, focus moves to **Back to filtered conversation** instead of being lost. The opened view's status line no longer calls the nearby messages "context".
+- **Relay** is now **Forward** in English and 転送 in Japanese, including its dialog; Chinese already said 转发. A message that came from another Group is marked **From** that Group instead of **Relayed from** it, because messages sent directly from another Group, delegation requests and Connect messages carry the same mark as forwards. An agent's delegation request to another Group says **Delegated to** instead of **Relayed to**. The dialog's group search and its empty result are now translated into Chinese and Japanese.
+- On phones, the button for adding an agent stays in place beside the members instead of scrolling away with them.
+- In Settings, the ⓘ beside **This group** and **This instance** is now a key of its own that opens with a click, a tap or the keyboard, on desktop and on phones. It explains both scopes, including why **This instance** may be locked, and says so when no Group is open. Settings info popovers take keyboard focus when they open, stay within the screen and scroll when their text is long; Escape returns to the ⓘ. Web Access choices now expose their selected state to assistive technology.
+- Capability center: a built-in capability's details now offer one **Disable**, not two. **Disable** turns off its Group-wide enablement, which applies to everyone in the Group, and your own use of it there (for example, after a slash command). Agents keep their own use. If only part of it can be turned off, or it is still enabled afterwards, the page says so. If the capability state cannot be read, the page reports the error and keeps the last state it could read until it can be read again.
+- Web Model delivery choice: on touch screens its two keys are at least 44px wide and tall; with a mouse they are unchanged. While the choice is unavailable (read-only, or saving), it no longer reacts to the pointer.
+- Opening an archived Voice document scrolls to it and moves keyboard focus there.
+- Voice Secretary: on touch screens, the new document name field is at least 44px tall.
+- **Connect existing sessions** moved from the end of the Group list to a **Connect sessions** key above the Group list, or an icon under **New** when the sidebar is collapsed, so it stays in view however many Groups there are and no longer looks like a Group. The sidebar no longer shows a **Working Groups** heading; screen readers still name the list.
+- **Connect existing sessions** starts with the **Target Group** and the sessions to choose. Its setup steps show one app at a time, chosen under **App to connect**, with an example prompt to start from, and troubleshooting has a section of its own. Both stay folded, except that the setup steps open by themselves when the dialog first finds no sessions; when a listed session cannot take messages yet, the dialog offers **See troubleshooting**.
+- Creating a folder while choosing one, for a new Group, an agent's working folder or a Copy Groups import, keeps the typed name and says why a name was refused: it already exists, it is not a valid folder name, or you may not create a folder there. If the new folder cannot be opened, the picker says so and offers **Retry**. After a folder fails to open in Copy Groups, **Use this folder** waits until a folder opens; before, it could use the folder shown before.
+- **Settings and more** opens with your account, where your access includes it, and the full settings entry, which no longer carry arrows because they open dialogs, and ends with Appearance. Theme and language stay in view; body font, message area width, motion, ‘Waiting for you’ indicators and text size fold under **More appearance settings**, folded each time the menu opens.
+- In the Web chat, a message addressed only to you now names you as its recipient, as a message to an agent names the agent. Before, it showed no recipient, so where agents also write to each other you had to infer from a missing label that a message was for you; it now shows **→ You**, and a recipient list that includes you says **You** instead of `user`. A read-only exhibit, whose viewers are not the Group's user, shows **User**.
+- Enlarged message images and videos open over the whole window instead of a fixed-width panel. In image and diagram viewers, Ctrl/⌘ + wheel and pinch zoom at the pointer while the plain wheel still scrolls, a click switches between fit and actual size (double-tap on touch screens), and rendered diagrams and workspace SVG previews can grow to fill the view. A click on the empty area around an enlarged message image closes it; releasing a drag does not.
+- Web development tooling now overrides oxfmt's tinypool dependency from 2.1.0 to 2.1.2. This affects the development formatter dependency, not the shipped Web runtime.
+- `cccc_task` lists planned and active tasks as one short row each, with counts for every status, instead of returning every task with its notes, checklist and outcome. A row shows the task's id, title, status, owner, priority, blockers, checklist progress, revision and update time; `task_id` reads one task in full. `status`, `query` (which also finds done tasks), `attention`, `include_archived`, `limit` and `offset` choose and page what is listed. In a probe group of 60 tasks, 15 of them open, the default list falls from about 98,000 characters to about 2,900.
+- `cccc_coordination` no longer repeats the task list and the board. Its attention lists use the same short rows, at most 10 per list, with the full count beside a longer list. In the same group its result falls from about 196,000 characters to under 300.
+- Bootstrap suggests `cccc_context_get(detail="overview")` and `cccc_task()` as the next reads, and the help says to read a task in full before updating its notes or checklist.
+- MCP receipts from `cccc_message_send`, `cccc_message_reply`, `cccc_tracked_send` and `cccc_file_send` no longer echo text or insight that exactly matches what the caller sent; `mcp_omitted_fields` names each omission. Text the daemon changed, such as an expanded question, is still returned, and the ledger keeps every message in full.
+- The daemon's unfiltered `task_list` result includes `tasks_version`, so a full list and its version come from the same read.
+- The chat's **Mail** and **Requests** tabs make way for **Pinned**: the tabs are now **Waiting
+  for you** (while requests wait for you), **All**, **Pinned** and **User-related**. Mail and
+  requests still carry their marks in the conversation, but they can no longer be listed by type.
+  A Group last viewed under one of the removed tabs opens under **All**.
+- A web link (`http:`, `https:` or `//`) in a message, or anywhere else the Web UI renders
+  Markdown without its own link handling, opens in a new tab instead of replacing the CCCC page,
+  including a full link to CCCC itself. Relative links, in-page anchors and `mailto:` links work
+  as before.
+
+### Removed
+
+- The Web `delegate_contact` route and daemon `relay_user_delegation` operation, which sent a
+  human's request under a Group member's identity. Use the Web `send_cross_group` route to send as
+  `user`; replies return to the human sender instead of a relaying member.
+
+### Fixed
+
+- Images you sent from this page no longer turn into **Image preview unavailable** when the
+  conversation shows them again more than a minute after sending, for example after changing the
+  chat filter, opening **Show in chat** or scrolling back through a long conversation. They kept
+  loading the page's temporary copy of the file, which is released a minute after the upload is
+  confirmed, until the page was reloaded; they now load the stored copy.
+- On phones, touch-scrolling toward newer messages now also hides the header and filters when the
+  gesture starts on a message link or action, or after a filter was tapped. Hiding the members' bar
+  no longer removes the list's bottom space, which pulled a reader near the latest message to the
+  end and brought the header back. A deliberate touch scroll moves focus out of the main message
+  box, so the browser can dismiss its keyboard; a draft stays, and an input method's composition in
+  progress or an answer being written under a request is left alone. Scrolling done by the page,
+  such as for new messages, does not move focus.
+- When an agent's terminal is replaced while a queued message is being delivered, CCCC no longer
+  sends that submission to the new terminal on the strength of checks made on the old one.
+- Building the Web interface from source on a case-insensitive file system, as macOS and Windows
+  use by default, no longer resolves Chet's conversation view to a file of the same name in
+  other letter case.
+- A filtered conversation with older history offers **Load older results** above the messages,
+  even when the current matches do not fill the screen or an older page contains no matches.
+  A short unfiltered conversation with older history offers it too. Before, a nonempty list could
+  leave earlier messages unreachable because loading them depended on scrolling to the top.
+- Web access tokens restricted to certain Groups could access, change or delete other Groups.
+  Authorization now consistently checks the Group identified by the route.
+- Copy Groups excludes Weixin login credentials, DingTalk reply sessions, pending IM binding keys
+  and legacy actor secrets, as well as in-progress temporary files in the Group root and its
+  state directory. Previously these could be included in a copy package even though credentials
+  and temporary authorization state are meant to stay on the original instance.
+- The Web routes for sending, replying, sending attachments and sending to another Group now send
+  as the authenticated human's `user` identity and reject a caller-supplied agent or Chet author
+  and internal runtime authority fields. Previously a caller with Group access could claim an
+  agent's identity through the request body.
+- MCP `cccc_file` and `cccc_file_send` accept absolute paths inside the effective workspace,
+  including for Connect attachment sends. Paths outside that workspace and symlinks that escape
+  it are still rejected.
+- The MCP tool `cccc_message_send` now refuses `event_id` and `reply_to` and points to
+  `cccc_message_reply`, which answers an existing message. Before, a send that named a message
+  went out as a reply and dropped an explicit mode, so a request for a reply arrived as a plain
+  message. Blank values still count as absent.
+- Opening a message, for example from a notification, a message link or search, now shows it in
+  the live conversation when it is already loaded and no filter is on, so new messages keep
+  arriving. Before, every opened message showed a fixed excerpt that new messages never reached
+  until **Return to latest** was chosen. A message that is not loaded still opens on its own:
+  scrolling down past its end, or **Load newer messages**, loads the messages that follow, and
+  scrolling on from the newest returns to the live conversation when no filter is on. Earlier
+  messages cannot be loaded there, which the notice now says instead of "Context is truncated".
+  **Return to latest** is now also offered in the read-only exhibit view. While you read earlier
+  messages, a new message no longer sends the view to the top when the conversation reaches 80
+  messages, and the floating **Back to latest** button returns to the live conversation as **Return
+  to latest** does, keeping the new-message count until the live conversation is at or near its end.
+  Reaching the bottom of the older-message window, or coming back to that window from a workspace
+  file, no longer clears the count.
+- An opened message now appears just below the header and is held there briefly as the view settles, unless you scroll first. Before, messages settling above it could push it up, hiding its sender line, or on a phone the whole message.
+- On phones, opening a message, for example from a notification, and opening or reloading a page on a Group show the conversation instead of covering it with the Group list. Opening the Web UI without a Group still shows the list first.
+- A notification click is less likely to lose its message when an open page or the browser is
+  slow to respond. The notification worker now hands the message to the open page even when
+  focusing or finding that page takes longer than the brief time after a click, and the page acts
+  on a click that reaches it up to a minute late. Before, a slow lookup or focus could leave the
+  worker without handing off the click, and the page ignored one delivered over 10 seconds after
+  the worker's deadline.
+- The answer box under **Other** in a question card sends with Ctrl+Enter, or ⌘+Enter on a Mac, as
+  the composer does. While an input method is composing, Enter stays with it.
+- Web Model: a Codex-style `cccc_apply_patch` with an **Add File** or **Move to** target already
+  present when the patch is prepared now rejects the conflict before writing any section.
+  Previously, it could overwrite the target on Windows or apply earlier sections before failing
+  on Linux.
+- Windows: for PTY agents, cmd.exe now starts in the intended workspace when its local drive path
+  can be safely simplified. CCCC gave the PTY the workspace as a `\\?\` path, which cmd.exe does not
+  accept as a working directory, so agents started through cmd.exe began in the Windows directory.
+  Workspace paths shown to agents in bootstrap, the startup prompt, the context line of later
+  messages and `cccc_repo` drop the prefix in the same cases. UNC paths, reserved names and paths
+  over the legacy length limit keep it, so an agent that would start through cmd.exe there, directly
+  or for a `.cmd` or `.bat` shim, is now refused with an explanation instead of starting in the
+  Windows directory or failing with an invalid directory name. The check goes by the name of the
+  program CCCC starts: a custom command processor set in ComSpec, or cmd.exe started by the program
+  itself, is not checked.
+- Windows: the global secretary no longer stops at its permission check with "This Codex version
+  did not confirm the secretary permission profile". Codex reports the secretary's workspace
+  without the `\\?\` prefix of the path CCCC gives it, and CCCC compared the two as text. CCCC now
+  resolves the reported path and compares it with the workspace; a relative path or one that
+  cannot be resolved still fails the check. Checking that a Hermes session belongs to the
+  workspace before resuming it compares the directory the same way.
+- The read-only exhibit view now refuses a connection to the Voice Secretary's transcription before
+  it starts, as it refuses other changes; before, only the recording lease check stopped it.
+- Voice lifecycle and Web Access: applying a saved Web binding now stops the active Voice call and Chet Runtime before restarting Web. If cleanup cannot be confirmed, the current Web remains available and the new binding is not yet active; retry **Apply now** or start Voice again to retry cleanup.
+  - Voice Stop, Chet session reset, and Runtime settings replacement keep track of resources that still need cleanup, including when a request is interrupted. A new Voice start or Web Apply requires the earlier cleanup to be confirmed, or reports that Voice is busy or recovery is pending. The Web interface explains these states in English, Chinese and Japanese.
+  - On Unix, the Web host uses separate process recovery records for Voice when reusing an independently running daemon. If a previous Web process left resources whose cleanup cannot be confirmed, Web stays available while Voice waits for recovery. See the [Web UI guide](https://chesterra.github.io/cccc/guide/web-ui) for retry and diagnostics.
+  - When CCCC cannot confirm that processes from an earlier Web or daemon run have ended, the Voice error offers **Review earlier processes**, and the Secretary panel shows **Review** while the daemon's records wait. The review lists each record and why CCCC is still waiting; you can check a record again or accept it. Accepting stops CCCC waiting for that record but does not stop the old work, which may still change files or send requests that cost money. **Accept all** accepts two or more records one at a time and stops when anything changes. Records that need offline review show the `cccc daemon process-recovery` commands. This replaces removing records under `CCCC_HOME/web-processes` by hand.
+  - On Linux, process cleanup now prefers stronger process identity and leaves records it cannot confirm for review; some systems still rely on approximate matching, which can misjudge. When a trusted source shows that a record comes from an earlier boot, CCCC releases it without signalling, on the premise that one `CCCC_HOME` is used on one host at a time. On macOS, the crash watchdog is unchanged, but the next start no longer stops leftover process groups by approximate matching: it releases a record from this version once its process and its process group have both ended, or a record from an earlier version once its process group has ended, and keeps the others for review. This release was not verified natively on macOS or on older Linux kernels.
+- Local ASR models: a failed update no longer marks a working model as failed. If an update fails, the installed model is kept, with the error shown beside it when CCCC can record it; if CCCC stops during an update, it is kept too. It stays usable as long as it has every file the model requires. Before, a failed update left the model's files intact but showed it as failed. Each install now unpacks into a new directory and switches to it in one atomic step, only once that directory holds every file the model requires.
+  - Downloaded archives are deleted once unpacked, unless the model requires the archive file itself; the live model, for example, takes about 1.1 GB instead of 2.1 GB after its next install or update. A replaced version is deleted when the next install starts, after an install completes, or when CCCC Web starts, but not while a recognition in progress still uses it. Downloading, unpacking, writing and removing models no longer occupy the Web server's async workers.
+  - If a model's `install-state.json` cannot be read or is damaged, the model shows as failed instead of not installed, and installing does not overwrite the file: restore read access if it is intact, or reinstall, which replaces the model's files. Model IDs in a local `config/voice-models.json` must now start with a lowercase letter or digit and must not end with `.`. If that file exists but cannot be read, model operations report the error instead of quietly using only the built-in models.
+  - Earlier versions of CCCC show a model installed or updated by this version as not installed; after a downgrade, install it again.
+- The product name at the top of the sidebar now hides when it does not fit, for example at 125% text size, instead of being cut off.
+- On short screens, the header's settings menu can scroll to **All settings**. In message search on narrow screens, the sender filter moves to its own line instead of shrinking to its arrow.
+- In raw headless traces, queued, stalled and cancelled turn and control events no longer appear running; on narrow cards, titles and details wrap instead of overlapping.
+- In headless traces, a tool call that has finished is no longer marked as successful: a Pi agent's failed calls also finish, with a summary such as `bash failed`. For the calls it lists, the compact trace now shows such a summary on a line of its own when it says more than the call's title and tool name; previously, it showed the summary only in the tooltip.
+- Recorded tool calls made before an agent starts writing now appear in its headless trace when the text does, as long as the calls are in recent history. After a reload, both calls and text must be in the recent history the Web loads.
+- In the expanded agent view, long names no longer run under Close: they are truncated, with the full name in the tooltip, and the role label stays on one line. On touch screens, Close is at least 44px.
+- The agent quick-controls menu fits the available height and scrolls on short screens.
+- In the composer, the `/` menu narrows to fit narrow screens instead of scrolling its container sideways.
+- Workspace: the name field when creating, renaming or moving an entry shows its border again. A long path or error now scrolls on short screens, so the title, the close button and the actions stay reachable.
+- The Group connections dialog stays usable on short, narrow screens and with long Group names: the content scrolls, and on narrow screens the two connection modes stack.
+- The Voice document archive scrolls when it holds many documents, including when an error is shown.
+- On narrow screens, the Chet Runtime setup explanation wraps and scrolls instead of being squeezed out of view; its Cancel and Submit controls show icons, and the output keeps a minimum height.
+- Voice Secretary on narrow screens: the record key's label wraps instead of running past the panel, and while recording, the target document's name wraps (long names too) while the live text gives way. In the composer, the recording note keeps **Open document** in view.
+- Voice Secretary on narrow screens: scrolling a read-only document or transcript continues into the surrounding panel at its edge, so the request input below can be reached; the editor keeps its own scroll.
+- Voice Secretary: the compact recording notice wraps instead of being cut off, and when space is tight, a transcript entry's source, time and details wrap without being squeezed out.
+- Voice Secretary: an Ask whose outcome could not be confirmed is marked like one that needs your input (in the waiting color instead of grey), since it waits for you to confirm before it is retried.
+- On narrow screens, a presentation opened from a quote in the chat shows **Jump to chat** and **Reply in chat** as icon keys, so its title is no longer squeezed out of the header and the header keys stay on screen.
+- In the Voice Secretary editor, saving a document that changed since it was opened no longer silently overwrites the newer text. Your draft stays, and you can load the latest version or, after confirming, overwrite it with your draft; a document that moved or is no longer available cannot be overwritten from the old draft. Text typed while a save or request is in progress is kept, and an unsaved draft survives switching Groups in the same page. For SDK and IPC callers, daemon operation `assistant_voice_document_save` accepts `expected_content_sha256` and `expected_target_id`, sent together with `content` and taken from the document as last read; a changed file returns `voice_document_conflict` with its `current_sha256`, and a changed storage target returns `voice_document_target_conflict`, in both cases without writing. Save results, and `assistant_voice_document_list` with a `document_path`, carry the `content_target_id` to send. Calls without these fields save unconditionally, as before.
+- The Voice Secretary editor keeps leading and trailing whitespace, empty documents and consistent CRLF or CR line endings when a document is edited and saved.
+- Forward keeps the source message and form reachable on short screens, and long recipient IDs can wrap within the dialog. When there is room on a narrow screen, the selected recipient is visible alongside the destination when Forward opens; the source remains reachable by scrolling back.
+- Reselecting the current destination no longer clears its loaded members. When a selection includes individual members and the destination changes, Forward clears the selection and asks for a new choice before sending; group selectors remain selected when no individual members were selected.
+- Forward now describes an empty selection as the destination group's default recipients. Reset still uses that default, which may be the foreman or a broadcast, according to the destination group's settings. When Forward first opens it still explicitly selects `@all`.
+- On screens narrower than 640px, a presentation's **Quote** key and its snapshot key now sit in the row of actions above the card instead of floating over its lower corner, where they could hide part of an image or web page, and Markdown and table cards no longer keep empty space for them. In a tight row Quote shows only its icon, and the viewer's icon keys keep a 44px touch size at larger text sizes, so the action keys can stay on one line.
+- On screens up to 480px tall, such as a phone turned sideways, the presentation viewer leaves the room to the card: the slots, the card's details and its keys fold behind one **Slots and details** key, a window fills the whole screen inside the safe-area insets the browser reports, and **Quote** and the snapshot key sit with the details instead of floating over the card. A failed refresh of a linked file still shows above the card while the details are folded. In Chrome's touch emulation at 640×360, an image in a window grew from about 55×31 to 341×192 pixels.
+- Switching back to a presentation slot opened before, opening the side panel's card in a window, or opening a read-only viewer from an old quote of a slot that has since been emptied, keeps keyboard focus in the viewer instead of dropping it to the page, and each open window is named after its own card. A window shown again now appears at once, so focus can enter it; it still fades out.
+- In the Web chat, messages relayed in a row from another instance by different members each show their author. Before, a message that followed within three minutes could fold under the previous member's header, as if that member had written it.
+- The presentation viewer's "Quoting…" text is now translated into Chinese and Japanese.
+- Certain long Markdown messages and documents with many links take less time to display.
+- In the composer, a recipient chosen at the edge of the recipient row stays in view when the clear button appears.
+- On narrow screens, code block and diagram headers give their actions more room, so a copy confirmation no longer stacks one character per line.
+- Returning to an open Group, by switching back to its tab or window, now checks whether the live connection has gone quiet or fallen behind the server's latest event. If so, the page starts reconnecting, and a reconnect that was waiting out its delay starts immediately. A successful catch-up can retrieve the chat messages missed in between. While you read earlier messages, messages retrieved this way count towards **Back to latest**, once each, even if their live event also arrives or a sender filter loaded them first. Before, a stalled connection could stay silent until its 45-second watchdog fired, and retrieved messages added nothing to the count.
+- The README quick start, in English, Chinese and Japanese, and the parallel-tracks example in the use-cases guide added an agent named `foreman`, an ID CCCC reserves, so that step failed on every new setup. They now add `lead`, which as the first agent becomes the foreman, and the README sends to it with the `@foreman` selector; a bare `--to foreman` names no recipient.
+- Adding an agent with a reserved ID, such as `foreman`, `user` or `all`, now says that the ID is reserved. Before, it said the ID had to be letters or numbers, which it already was.
+- `cccc status` shows each Group's first member as its foreman, as the Web UI and the terminal panel do. Before, it read a role field that CCCC leaves empty when it adds or updates an agent, so every member was listed as a peer; it also no longer lists internal helpers.
+- Before any working group exists or is selected, the Web chat says to select one, or to create one where you may, and shows no message box. Before, it offered the message box and the Send key, and sending did nothing.
+- When the requested Web address is already in use, CCCC now reports the host and port and suggests `--port`. Before, it showed only the operating system error.
+- A Web Model peer, such as a ChatGPT or Grok Web Model agent that is not the foreman, can set and change reminders addressed to itself through `cccc_automation`, as other peers can. Its tool route refused every built-in capability tool to Web Model peers, so the call failed with "requires a Web Model foreman actor". The daemon still decides each change by role: reminders to others or the whole Group stay with the foreman or the user, scheduled Group or agent control stays with the user, and the other built-in capability tools that the Web Model schema does not list stay foreman-only for Web Model agents.
+- Two CLI daemon test fixtures now run in child processes, so their process-wide guard cannot retain a deleted temporary home in the test runner and break a later process launch. This changes test isolation only.
+- In Chinese and Japanese, about forty labels and messages that showed English or their internal
+  key name are now translated. They include the add-agent form's ID and role labels, the local
+  speech-recognition model settings, the message-template editor in automation rules, and the
+  Presentation heading on quoted messages. The Japanese local speech-recognition settings were also
+  rewritten in plain Japanese.
+- Local speech-recognition components show their state in words, such as Ready or Installing, in
+  all three languages, instead of internal values such as `not_installed`.
+- A searchable list with no match says so in the interface language; Chinese and Japanese showed
+  "No matching results" in English.
+- In the `/` menu, CCCC's own commands, `/install` and `/cccc-self-evolution`, are described in
+  Chinese and Japanese; other skills keep the description they come with.
+- The Notebook settings no longer show "Authentication browser is idle." before any Google sign-in
+  has started.
+- When Codex is not installed but another command-line runtime is, the add-agent form opens on an
+  installed one, such as Claude Code, instead of on Codex with Add disabled. A runtime, command or
+  Runtime Profile you choose yourself is kept, also when detection finishes after you have started.
+- The `cccc_task` and `cccc_coordination` tool descriptions now say which updates replace content
+  whole: a task's notes and checklist, and the brief's constraints. For a task they also say to
+  list it first and send the combined content with its revision. Sending only a new paragraph, a
+  changed checklist item or a new constraint replaces the existing content.
+
+## [0.4.46]
+
+### Added
+
+- Native sessions: Codex, Claude Code, Pi and OpenCode V2 CLI sessions that you started yourself can work with each other and in CCCC Groups through the local daemon. Each application keeps its own process, conversation, account, model, approvals and terminal; no history is imported and no provider API key is needed. This is experimental: it was tested on Linux and WSL, and macOS and native Windows still need acceptance testing.
+  - Enable a runtime once with `/setup` in the terminal interface or `cccc sessions enable --runtime codex|claude|pi|opencode`, then reload the integration in sessions that are already open. It needs Codex 0.163.0, Claude Code 2.1.306, Pi 1.4.0 or OpenCode V2 2.1.4, or later. Enabling registers the `cccc` MCP server and the runtime's own hooks, plugin or extension; `cccc sessions disable` changes only what this CCCC installation registered. Codex sessions receive through Codex's shared app-server only (`daemon_auto_start = true`).
+  - **Connect existing sessions** in the Web sidebar adds the sessions you select to an existing Group, or to a new one, as Actors. A session can also ask CCCC to contact another session, which creates or reuses a Group for them. `cccc sessions list` shows which sessions can receive.
+  - The [native sessions guide](https://chesterra.github.io/cccc/guide/local-sessions) has the setup steps, what to do after upgrading CCCC when the integration is already enabled, and the limits.
+- A terminal interface for a bare `cccc` in an interactive terminal. Within at most 100 columns it shows the actual Web address, `CCCC_HOME`, whether this launch owns the daemon, a Group table with each Group's status and running count, and the native sessions this CCCC knows. Tab on an empty command line, or typing `/`, lists the commands with their descriptions; there Tab completes without running, and in terminals with bracketed paste, pasted newlines do not run a command. `/setup` connects Codex, Claude Code, Pi and OpenCode sessions through the existing enable step, with nothing picked by default and each app's next step shown afterwards. `/sessions` lists every native session and shows one session's details. `/quit` or Ctrl+C stops what the launch started and then reports what actually stopped. Tested on Linux; macOS and Windows terminals still need acceptance testing.
+- Groups in the terminal interface use the Web UI's status words. On its regular screens, browsing and every action use the arrow keys, Enter, Tab and Esc, without letter shortcuts. Enter on a Group opens its page: its recorded state, its actors, a link that opens it in the Web UI, and rows for its tasks and for the actions its state allows. Start, Resume and Stop each ask for a confirmation that starts on Cancel, so pressing Enter twice changes nothing. A stopped Group offers Start, and Stop as well while it still reports running actors; a paused one offers Resume and Stop, and any other both Start and Stop. Start runs the enabled actors that are not running. A start or stop whose answer never arrives is reported as unconfirmed, never as done.
+- A Group's page shows how many tasks it has in each state, and its Tasks row lists them in pages, with Left/Right switching between the unfinished ones (Active, then Planned) and the Done ones. Enter shows one task read-only, with its status, assignee, checklist, notes and outcome; tasks are still edited in the Web UI.
+- `cccc --headless` starts the daemon and the Web UI without the terminal interface, with plain log output, for servers, containers, service managers and scripts. It is the same launch as `cccc web` and cannot be combined with a subcommand. `cccc --help` now describes the launch modes, the global options and every top-level command.
+- Agents can ask you to decide with a choice instead of an open question. A request to you may carry two to four options, each with its consequence, and a recommendation with its reason; you pick one or write your own answer under the message itself. The message text still contains the whole question for IM, the terminal and older clients, and the agent receives your answer as an ordinary reply such as `Selected B: <label>`. Requests without options can be answered in place with text as well.
+  - An answer is accepted only while the request is still open, and only when its sender is provably the same agent that asked. If that agent was removed, added again under the same ID, or cannot be confirmed, the request says so and nothing is sent to whichever agent now has that ID.
+  - Answering never resumes a paused or stopped Group or turns a disabled agent back on. The answer is recorded, and its delivery waits until you resume the Group or start the agent.
+  - Daemon operations `reply_request_answer`, `user_reply_requests` and `user_reply_requests_summary` answer a request and list and count your open ones per Group from the ledger. They act only as the user, and the Web refuses them in read-only (exhibit) mode. The MCP tool `cccc_message_send` accepts the `question`. Every agent is told, in its CCCC prompt and in the tool descriptions, to ask you this way whenever it needs your decision or information, unless you asked for another channel, and not to ask what it can responsibly decide itself.
+  - Requests that another Group or a Connect instance sent you are listed and counted, but are answered with an ordinary reply.
+  - When the Web chat follows the newest message and a request waiting for your answer is taller than the view, the chat stops at the start of the request so you read the question first. A reading position you already have, or a link to a message, takes precedence.
+  - In the Web, a Waiting for you filter appears first among the message filters while requests to you are open in the Group, with their number (`~2` when it may be out of date, `?` when it cannot be confirmed), and lists every one of them, however old. It stays while you are viewing it and goes once you switch away. The Reply requested filter, which lists every request, is now Requests. The sidebar shows how many requests wait in each Group, including stopped and archived ones; a count that cannot be confirmed shows as `?`, never as zero. In the terminal interface, the Group page shows Waiting for you (N), with the list, the request and its answer.
+  - Agents that were already connected need to reconnect their CCCC MCP server before they can ask with options.
+- System notifications. In the Web UI's settings each browser can subscribe to notifications, and while CCCC's Web service runs, it tries to notify that browser of every message an agent sends you and every request waiting for your answer, even with no CCCC page open. Opening a notification tries to show its message in CCCC. Browsers with Web Push can subscribe: desktop Chrome, Edge, Firefox and Safari, Chrome on Android, and iPhone and iPad with iOS 16.4 or later once CCCC is added to the Home Screen, on a page served over HTTPS or from `localhost`. A desktop browser generally receives them only while it, or its background process, runs; the Web UI guide has the steps and what each platform needs.
+  - Only what is written after a browser subscribes is announced; requests already waiting are under Waiting for you. Nothing is announced while the Web service is stopped, nor afterwards for that time, and imported Groups do not announce their history.
+  - A request that a push service does not take is offered again while the Web service runs and the request is still open, up to 10 per browser. A push service is asked to keep a notification for up to a day while the device cannot be reached; whether it is shown is up to the push service and the device.
+  - A notification shows the Group, the sender and up to 140 characters of the message, which a locked screen may show. It is encrypted for that browser and signed with a key kept in `CCCC_HOME/web_push.json`. Only the Google, Mozilla, Apple and Microsoft push services are used, through the system proxy settings.
+  - Notifications use the W3C declarative push format, as Apple recommends. Safari 18.5 or later for Mac and Home Screen apps on iOS and iPadOS 18.4 or later show them themselves, and opening one tries to load CCCC at its message; in a Home Screen app that can reload the open page, and unsent text there is then lost. Other browsers try to bring an open CCCC page to the message without reloading it; when that page does not answer in time, the message is in its Group's chat (a request also under Waiting for you).
+  - A subscription belongs to the access token the page was signed in with, or to the local administrator, and covers the Groups that token may see; a deleted token's subscriptions are removed. Read-only (exhibit) mode neither offers nor sends notifications.
+  - Disabling works even when the server cannot be reached, and signing out of a browser in Web Access asks the server to stop notifying it for that account.
+  - While requests wait for you in a Group, and this browser could show notifications for your account but they are not on yet, the Group's messages page offers them above the message box. **Turn on…** opens the notification settings, where enabling works as before; **Not now** hides the offer in that browser.
+  - Web API: `GET /api/v1/push/config`, `POST /api/v1/push/key`, and `PUT` and `DELETE /api/v1/push/subscription`.
+- While a ChatGPT Dots or Grok Bot actor has an unfinished turn, its panel also shows how long ago CCCC recorded the actor's claim of that turn, for example *Claimed 2 hours ago*, so a turn that has gone on for hours stands out. It does not show that the actor received the turn or is still working on it, and it is refreshed whenever the panel reads the actor's status. When no matching claim time is recorded, for example for a Grok Bot turn claimed before this version, the panel says *Claim time unavailable*. Daemon operations `dots_events_status` and `grok_webhook_status` return it as `active_turn_elapsed_seconds`.
+- A parent task's card on the Web task board shows how many of its direct subtasks are done, also when filters or paging hide some of them. The open task lists its subtasks, and each opens in the editor. Subtask progress never completes the parent. Requested in [#181](https://github.com/ChesterRa/cccc/issues/181).
+- Daemon operation `actor_list` reports each Actor's `effective_scope`, the workspace its CCCC tools use: for a running managed Actor, the directory it was launched in; otherwise the one its next start would use. For a native session it describes CCCC's tools only, not the application's own working directory. It is shown for information and grants no access. Requested in [#180](https://github.com/ChesterRa/cccc/issues/180).
+- An Actor can carry an optional `model_label` of up to 128 characters: a model its operator declares for people and external tools, such as `gpt-5-codex`. CCCC does not check it or use it to launch the runtime, and changing it does not restart the Actor. `cccc actor add` and `cccc actor update` take `--model-label`, where an empty value clears it; daemon operations `actor_add` and `actor_update` take `model_label`, and the MCP `cccc_actor` tool takes it when adding an Actor. It needs a daemon of this version: an older daemon that is still running reports success without keeping the label, and an older version that saves the Group afterwards, as after a downgrade, drops it. Thanks to [@chriscoveries](https://github.com/chriscoveries) for [#170](https://github.com/ChesterRa/cccc/pull/170).
+- `cccc inbox-summary --cutoff <RFC3339>` and daemon operation `inbox_summary` show, for every Actor in a Group, how much Mail the Inbox rules still count as waiting, how much of it was sent at or before the cutoff, and, when every waiting Mail has a valid time, when the oldest was sent and how long ago. It reads without consuming Mail, moving read positions, starting Actors or sending notices, and returns no message text. The user, the system and the Group's Foreman may use it; peers may not. Mail to `@all`, `@peers` or `@foreman` counts once for each recipient, as in their Inboxes. Thanks to [@chriscoveries](https://github.com/chriscoveries) for [#183](https://github.com/ChesterRa/cccc/pull/183).
+
+### Changed
+
+- When the Web server and the daemon report different versions, the Web shows a dismissible notice with both versions and guidance. Different versions do not by themselves prove a feature is unsupported, and missing version information does not trigger the notice. A `cccc daemon start`, `cccc web` or `cccc --headless` that reuses a daemon of another reported version also prints a diagnostic; it does not replace the daemon.
+- The offer to turn on system notifications above the message box is easier to notice. It still opens notification settings rather than enabling them directly.
+- **Migration:** a bare `cccc` in an interactive terminal now opens the terminal interface instead of printing launch logs. Scripts and tmux automation that start `cccc` in a terminal should use `cccc --headless` (or `cccc web`), which keeps the plain output. Launches without a terminal or in read-only Exhibit mode stay plain. Options such as `--port` no longer select the plain output: `cccc --port 9000` in a terminal opens the interface on port 9000.
+- **Migration:** OpenCode Actors that CCCC manages, including OpenCode as Voice Analyst or Secretary, now run on OpenCode V2 2.1.4 or later through its HTTP/SSE server instead of ACP. An Actor that last ran on V1 is not resumed as V2: choose **New session** to start it on V2; its earlier history stays with OpenCode. The runtime command no longer accepts V1's `--pure`. CCCC refuses to interrupt a single OpenCode turn, because V2 can only interrupt the whole session; interrupt it in OpenCode's own terminal, or use **Quit**. Kilo keeps its own ACP adapter.
+- The Web task board tells more about each task without opening it.
+  - Each card shows how long ago the task last changed, by the device's clock; a time it cannot place shows nothing. A Planned or Active task without a summary shows its first open checklist item.
+  - Done and archived cards no longer show old blocking, waiting or handoff marks as if they still needed attention. The fields are kept and show again when the task is reopened.
+  - A Done card whose checklist still has open items says how many remain. Moving a task to Done is not stopped or questioned.
+  - While a search or filter is active, the board says how many tasks match, counted by the server for that search; nothing is shown while results are loading or out of date. The filter buttons count every task, so they no longer show those counts while a search or assignee filter narrows the board.
+  - While searching, a card whose match is not near the start of its title or summary quotes the matched words from the task's title, notes, outcome or hidden handoff, with the match highlighted. The quote can repeat words the card already shows.
+  - On phone-width screens, where the columns stack, Active comes first instead of below every planned task.
+  - In the task editor, the outcome, notes and checklist items grow with their text instead of scrolling inside small boxes or cutting long items off.
+  - The Chinese label of a task's outcome reads 结果 (result) rather than 预期结果 (expected result).
+- The Web UI and the terminal interface call a Group that was not stopped or paused, but has no running actor, Offline instead of Stopped; Stopped now means only that the Group was stopped. An Offline Group still offers Stop in the Web UI.
+- When the daemon a launch started cannot be confirmed stopped, `cccc` and `cccc web` now exit with an error instead of only printing a warning. Normal starts and stops are unchanged.
+- The Web native-session setup section leads with `/setup` and the four enable commands; registration checks and runtime troubleshooting moved into a collapsed section. With no session connected yet it opens by itself, and when a listed session cannot receive, a link opens its troubleshooting steps.
+- After an explicit Codex **Refresh status** in a native member's panel, the Web reads the Actor list again, so the status line above it no longer lags behind the check.
+- Messages to a native Codex session that is in the middle of a turn are now added to that turn, as pressing Enter does in the Codex CLI. Before, they were queued until the turn ended and then each opened a turn of its own, so one long turn could be followed by dozens of short turns re-reading messages Codex had already handled. While Codex is idle, compacting, or waiting for an approval or an answer, messages are queued as before. Your own input mode in Codex clients is unchanged.
+- Messages and system notices delivered to an actor show their original timestamp, as `sent=2026-10-28T01:45:03Z` (UTC) in the header. A runtime can show queued input long after CCCC handed it over, so an agent can tell an old instruction from a new one without looking up the history. Scripts that match the exact header text need updating.
+- Reading one message by `event_id` with the MCP `cccc_message_history` tool returns it once: `delivery_text` as before, plus a single `message` holding the event, instead of a `messages` list that repeated its text and insight. Quotes, attachments, references and source fields stay in `message`, and a text the delivery does not show in full, such as a typed `/install` command, is kept. History lists and the daemon `message_history` result are unchanged.
+- Grok Bot Web Model actors show the Grok Bot icon instead of the mark used for the Grok Build CLI (`grok`), so the two runtimes can be told apart in lists and chats.
+- The Web chat is more compact and consistent. Thanks to [@waterbang](https://github.com/waterbang).
+  - The Group list scrolls on its own, apart from the **CCCC Connect** section, which starts collapsed, and the Voice dock.
+  - Sender, recipients, Mail mode and time share one line above each message. A quoted reply shows two lines that expand, with a separate link to the original. Your messages sit on the right with their actions, agents' messages on the left. On desktop, a message's actions appear on hover or keyboard focus; on touch screens they are under **More**.
+  - The message box has one send button, with an arrow beside it for the send mode. Attached images show as thumbnails before sending, with a larger preview on hover or focus. On wider screens, an empty message box cycles through typing hints.
+  - The runtime dock does less work while nothing changes: its notices expire on a timer instead of a check every 250 ms, and the ring of a working agent pauses in background tabs and does not animate when the system asks for reduced motion.
+- On phones and other screens narrower than 768 px, the chat gives more room to messages. With the header and filters shown, the visible message area on a 390×640 screen grows from 226 to 429 px, and on 320×568 at 125%, from about 35 to 352 px.
+  - The header is 48 px high instead of 56. The filter row stays on one line: the filters scroll sideways with the selected one kept in view, and the sender filter stays at the right.
+  - An empty composer that is not in use is a single row: attachment, message box, voice and Send, with a short label for a chosen recipient. Tapping the message box or a control expands it, and that first tap still reaches the control. It stays expanded while it holds text, an attachment, a reply or a quote, while a menu or voice input is open, and while another sending mode or destination Group is chosen. Otherwise it returns to one row when you tap elsewhere. The message box has a short placeholder; the rotating typing hints remain on wider screens.
+  - Scrolling the messages by touch toward newer ones slides the header, the filter row and the runtime dock out of view, the way a phone browser hides its toolbars. They return when you scroll back, tap the messages, reach the newest message or touch the composer. They do not return merely because scrolling stops, where they would cover the text you stopped to read. The header and the filter row lie over the messages, so the text does not move when they appear or disappear.
+  - The runtime dock sits in its own row below the messages instead of floating over them and shows only the latest activity. It is hidden while the message box or an answer field has focus and less than 500 px of the page is visible.
+  - Each message's More button sits beside the message instead of on a line below it.
+  - Icon-only buttons keep a 44 px touch size instead of growing with the app's font size, so the composer's buttons stay on one row at 125%.
+  - Phones in landscape also get the single-row composer and the More buttons beside messages, and opening a chat there no longer brings up the keyboard.
+- Moving a standard task to Done in the Web UI no longer requires Closeout Verdict and Verification Summary sections in its notes; no other client asked for them. A done task without an outcome gets a suggestion to add one, and task type requirements describe how complete a record is without blocking any change.
+- The Web task editor puts the title, status, assignee, priority and waiting on first, then the outcome, a checklist edited as items with checkboxes, notes and subtasks, with **Add subtask**. Parent, handoff, blocking tasks and task type are under **Advanced details**. Save stays on screen and is offered once something changed; Delete appears only for a task that can be deleted, and for others the editor says why.
+
+### Fixed
+
+- Resuming the same Claude Code or Pi conversation after its former host exits reconnects its original Group memberships, retaining roles, paused access and pending-work receipts. Matching requires the original conversation and provider configuration; live duplicate hosts and conflicting memberships are not taken over. Claude's in-app resume also reattaches its long-lived Monitor.
+- A native session's send that included an empty `to` or `source_ids` list, as some clients add for unused optional fields, was rejected as combining addressing modes. An empty or null list now counts as absent: a direct send still goes only to the selected sessions, and a Group send without recipients still goes to `@all`.
+- After the first Claude Code setup, the next step now says to restart Claude Code (`claude --resume` picks the conversation to continue). It said to run `/reload-plugins`, which loads the CCCC plugin, but Claude Code documents MCP configuration changes as taking effect at startup, and the `cccc` MCP server is configured separately from the plugin.
+- The terminal interface calls Codex sessions and actors `Codex CLI`, as the Web UI does.
+- Native `cccc_session` rejects message parameters on create-only, list or leave actions, instead of accepting them while discarding the message. Missing and paused memberships now identify the source and Group and explain the recovery action.
+- `cccc group set-state stopped` and the MCP `cccc_group` `set_state` action with `stopped` now stop the Group the way `group stop` does. Before, they recorded the stopped state while its actors kept running. The daemon's `group_set_state` now rejects `stopped`, as its IPC contract specifies; use `group_stop`. The Web API rejects `POST /api/v1/groups/<group_id>/state?state=stopped` the same way; use `POST /api/v1/groups/<group_id>/stop`.
+- Reading or writing a Group's history after the Group is deleted no longer recreates its directory. `cccc ledger snapshot` and `cccc ledger compact` now fail with `group_not_found` for a Group that does not exist, including a deleted one; before, they reported success and recreated files under the deleted Group's directory. Other late access, such as the next poll of an open event stream, now gets not found instead of leaving an empty Group directory behind. Before, such access during a deletion that then failed could also stop the Group from being restored.
+- Warnings and errors inside the daemon were discarded, so a failure such as an automation pass that kept failing left no trace. A daemon started by `cccc` now keeps them in `ccccd-diagnostics.log` in its daemon directory, at most 1 MiB plus one previous file, readable as **Daemon diagnostics** in the Web UI's developer log settings. Each line records when and where in the source code it happened and, when supplied and safe to keep, the Group or Actor ID and a short error category. It never records message or error text, paths on your machine or provider output. Repeats from the same place are written at most once a minute, with a count of the ones held back. An entry that arrives while the log is being written, read or cleared is skipped. The existing `ccccd.log` is unchanged.
+- Ctrl-C in `cccc --headless` or `cccc web` now stops the Web server and the daemon it started even when pressed while the Web server is still starting. Before, such a press printed "Stopping CCCC..." and nothing stopped until the forced exit 60 seconds later. This affected every early press on Windows, where the daemon runs as a separate process, and any launch that uses an already running daemon.
+- On devices that report a top safe area, such as the Web UI opened from the home screen, the page extended below the screen by that height and cut off the composer's buttons. The composer also keeps clear of the whole bottom safe area (the home indicator) instead of 60% of it.
+- On phones at 125% font size, the header was taller than the space reserved for it and covered the top of the filter row.
+- When the composer is narrow on a wide screen, for example on a phone in landscape with the sidebar open, the voice controls no longer overlap the Send button. The composer's toolbar now picks its compact or full layout from its own width instead of the screen's.
+- On touch screens, a recipient's details in the composer stayed open after a tap elsewhere and could cover the attachment controls. They now close on a tap outside them or on Escape, which also returns focus to the recipient.
+- In the terminal interface, tables span the same width as the separator and the command line. Their right edges now line up on every screen and at any terminal width. Before, Group names, directories and session names were cut at fixed widths, so each table ended at a different column, well short of the command line on wide terminals. Other changes:
+  - The Groups, native-session and member tables share one STATUS column.
+  - The native-session tables have column headings, with the session id moved to the end.
+  - A selected row is highlighted across the whole width.
+- Agent permissions for automation now match the documented rules. A peer can set, change, pause and delete its own reminders, which reach only itself; before, every change by a peer was refused. A rule a peer creates without `scope`, `owner_actor_id` or `to` is such a reminder. The foreman manages every notify reminder and can again replace the whole list, which had been refused to it. Scheduled group_state and actor_control rules stay with the user. Before, the foreman could disable, delete or rewrite them, or wipe them with a bulk update or reset. Now any request that would change, remove or reorder them is refused as a whole and saves nothing. The disabled built-in stand-up reminder no longer drops off the list after a Group's first change. The `cccc_automation` MCP tool describes its actions, rule format and these permissions, and no longer lists an `op` field it never supported.
+- An automation change could silently delete or disable rules it did not name:
+  - Enabling or disabling a rule without `enabled: true` or `false` disabled it; such a request is now refused.
+  - Adding, changing or removing one rule dropped saved rules that had no id or shared one with another rule, and one of two rules whose ids differed only in surrounding spaces. That second case also let a change aimed at one of them hit the other.
+  - Rule ids are now compared exactly as saved, as the scheduler already did. A list with a rule that cannot be kept as it is reports `group_automation_state_invalid` until the user saves or resets it.
+- Saving a task in the Web UI sent every field, so it could overwrite what an agent or another browser had changed since the task was opened. It now sends only the fields you changed, and only onto the version you opened: if the task has changed since, the save is refused and your edits stay in the editor until you reload the latest version. Moving a card and restoring one are refused the same way when the task changed after the board showed it.
+- A task write in the Web UI counted as done whenever its HTTP request succeeded, even with an empty or unrelated answer, and as failed when only reloading the context afterwards failed. Saving could then replace your edits with the version from before the save, without a word. A write now counts as done only when the daemon's answer confirms it. When it cannot be confirmed, the editor keeps your edits and reads the task to tell whether they were saved, and the board is read again after a move, restore or deletion.
+- Saving a task in the Web UI also rewrote its checklist: items with a status the Web did not know became pending, and spaces around item text were removed. Items you did not change are now saved as they were.
+- If the connection dropped while a task was being created in the Web UI, creating it again made a second task. The Web now sends a request id the daemon recognizes, so creating it again unchanged from the same form finishes the first; changing it first asks before possibly making another.
+- Deleting a task in the Web UI could also delete subtasks added after you confirmed. A deletion is now refused, deleting nothing, when the task or anything below it changed after you confirmed, and the confirmation counts the subtasks without the task itself.
+- **Restore** on an archived task card in the Web UI moved the task to Planned. It now returns it to the status it had before it was archived.
+- In the Web task editor, a task that is deleted while open no longer closes the editor and discards your edits; they stay until you close it. Escape closes only the editor, no longer all of Project Context, and returns focus to the task's card, also after creating a subtask from it. Escape while moving a card with the keyboard cancels only the move.
+- Opening a notification or a link to another Group while Project Context had unsaved task, summary or AGENTS.md edits discarded them without asking. It now asks first, as for unsaved file edits, and closing or reloading the browser tab asks too.
+- Moving a card on the Web task board sent the whole task as the board had loaded it, so notes or other fields changed elsewhere in the meantime could be overwritten. A move now changes only the status, and opening a task to edit it loads its current details first.
+- On the Web task board, an error from moving or restoring a card appeared in the editor of a task opened meanwhile; it now stays on the board. **Reload latest version** after a conflicting save could fail until the board caught up, and deleting a task whose open draft had gone stale reported a change on every try; both now read the task as it is. A delete whose checks could not reach the daemon says that nothing was deleted, instead of that its result is unknown.
+- On Windows, saving a Group's settings, its tasks or other CCCC state could fail with "Access is denied" when another part of CCCC was reading the same file at that moment. A save can now replace a file while another CCCC reader has it open; a file marked read-only is still left as it is.
+- Fixed keyboard selection in non-searchable dropdowns, including lists with an empty-valued option.
+- A Copy Groups import that gave the Group a new id, or a new active scope, left the source Group's id and scope on history that had been compacted into ledger segments, so Waiting for you could not list requests from that history. Compacted and current history now follow the same rule: the source Group's events take the copied Group's id, and its active scope where they had the old one; event ids stay the same. Other bytes in each decoded history line are kept; compressed segments are recompressed when rewritten. Other Groups' events stay as they were and damaged records stay unreadable. History whose identity does not change is copied byte for byte. An import now fails before the new Group is published when the first gzip member of a compressed segment cannot be decompressed or would take the import past its 2 GiB limit, or when history it must rewrite has a line over 64 MiB or data after the first gzip member of a compressed segment. Groups imported earlier keep their history as it was.
+- Copy Groups now rejects archive file entries whose expanded size differs from the declared size, unsafe path aliases and staged file collisions before publishing the copy. This closes gaps that allowed a specially constructed package to bypass the size limit, replace the copied ledger, or bring in private files that copies leave out. On Windows, names that the system would reinterpret or cannot represent are also rejected.
+- The Web Changes list showed a new folder as a single untracked item, so its count fell short of what code editors such as VS Code show. It now lists each new file in the folder. A folder stays a single item when it holds a separate repository. It also stays one item when listing its files would exceed the list's time or size limit, and the list then says that it is incomplete. In Files, the contents of a new folder are marked untracked as well. A workspace that is itself a new folder of its repository, which Changes used to show as having no changes, is listed the same way.
+- When the Web was served together with a running daemon that has no Waiting for you, such as one still running from an earlier version, every Group showed `?` and the filter said its requests could not be refreshed. The Web now says that the running daemon does not support Waiting for you; the counts stay unknown rather than zero. The recovery instructions identify the running daemon: restarting only the Web can leave that daemon in place.
+- Moving a card with the keyboard is announced to screen readers with the task's title and the column's name in the page's language, instead of internal ids in English. The English delete confirmation says "its 1 unexecuted task" for a single subtask.
+- A Copy Groups import made its new Group usable before the copied history was in place, so a message sent to it, or a change made to it, in that moment could be overwritten by the import. An import is now assembled out of sight and appears complete, history included. A Group id that is still registered, as while that Group is being deleted, now counts as taken, so the import makes a new copy instead.
+- In the Web message box, keys pressed while an input method is composing text, for example Chinese or Japanese, now stay with the input method. Before, an open @ or / menu took Enter, Tab, the arrow keys and Escape, so confirming a word could pick a menu item instead, and during composition Ctrl/⌘+Enter could send the message and Escape could drop the message being replied to. Composition is recognized by the browser's composing flag or by key code 229, which some browsers report for the Enter that confirms the text. Tested with simulated keyboard events, not with each platform's input methods.
+- In Chinese and Japanese messages and Markdown previews, bold, italic and strikethrough text (`**…**`, `*…*`, `~~…~~`) that ends in full-width punctuation and is followed directly by text, such as `**加粗：**紧跟文字`, now shows as formatted. Before, the markers stayed visible, as CommonMark's rules left them unmatched next to that punctuation. Underscores (`__bold__`) still follow CommonMark and can stay literal in such text.
+- The Web page now declares the language it is shown in (`<html lang>`), following the interface language, so browsers can choose the Chinese or Japanese forms of shared characters where the fonts support it. Before, it always declared English. Text in another language inside a message or task is not detected on its own; it takes the page's language.
+- The Web task board now keeps touch gestures on a task card's handle for dragging, and on wide screens shows the handle whenever the browser reports a touch pointer. Before, the browser could take over the gesture: in Chromium's touch emulation the drag was cancelled, and a sideways drag could navigate the page away. On wide screens the handle appeared only on mouse hover or keyboard focus, so a touch screen did not show it. Tested with Chromium's touch emulation, not on real phones or tablets.
+- In the Web, the reply progress under a message that asked agents for replies now tells a cancelled request apart from a replied one. Cancelling a reply request ends the wait for the replies still outstanding, but before, the progress counted those replies as received: a cancelled request to one agent showed a green "Reply 1/1", as if that agent had replied, and the recipient status dialog showed "Cancelled" in green too. The progress now reads, for example, "Reply 0/1 · 1 cancelled" in a neutral color, and its accessible name carries the same counts instead of only "Show obligation status". In the same dialog, a local delivery reported as uncertain no longer shows a green check mark. The progress and the dialog's cancelled state were tested in Chromium, not with screen readers.
+- The Web message list's "No more messages" and "Loading…" notices, and the accessible labels of the status symbols in the recipient status dialog, were English in every language; they now follow the interface language. Those symbols are now exposed as images with those labels; whether screen readers announce them was not tested. The Japanese dialog now says 取り消し済み, matching its 取り消す button.
+- On narrow screens, the Web message box now shows the name of the send mode when it is not the plain send, instead of an icon alone. When Send + reply cannot be used, as with @all selected, the menu now says under that option how to make it available: remove @all and @peers, or clear the recipients to ask the Foreman. Before, the only hint was in a tooltip, which is not reliably available by touch, and its advice to choose specific agents did not help while @all stayed selected. Tested in Chromium at 320 to 390 pixels wide, in three languages and three text sizes, not on real phones or with screen readers.
+- The reply button in search results now has an accessible name in the interface language that names the message's sender when known; before, it was English in every language.
+
+## [0.4.45]
+
+### Added
+
+- Native Webhook Routine delivery for Grok Bot Actors through the Grok subscription and CCCC remote MCP connector, with ordered admission, task-scoped credentials, exact completion and explicit interrupted-task recovery. Existing Grok Actors require Routine setup; browser delivery is removed.
+- Retry-safe task creation with caller-owned `client_request_id`, `parent_ref` and `blocked_by_refs`; optional per-task `rev`/`if_task_rev` checks for existing-task operations.
+- Optional Context task pagination and rendered-response byte limits, exact stored-recipient and timestamp filters for history search, and passive terminal output timestamps/quiet durations in Actor queries.
+- Opt-in repeat Mail reminders through `delivery.mail_notice_repeat_seconds`, defaulting to zero. Repeats preserve pending-delivery ownership and never replay the underlying work.
+
+### Changed
+
+- Align Web Model access controls and connection setup while retaining browser login, Dots event pairing and Grok Routine differences. Actor details focus on operation, editors on setup; Dots retains vertical progress. Enabled-Actor edits preserve drafts and apply only when the runtime lifecycle permits.
+- Show claimed Dots/Grok turns as awaiting completion and allow users to end an exact unfinished turn without first pausing. Retire its execution authority while preserving access and connection state, without stopping cloud work or replaying inputs.
+- Stream Inbox and startup-recovery ledger facts into compact projections, bound archive file handles, and batch selected gzip records by segment. Bound recoverable Web Group caches and retire unused terminal streams while protecting active output and drafts.
+- Clarify Direct/account invitation flows, local/remote Group identity, retrying connection errors and approval state.
+
+### Fixed
+
+- Protect ChatGPT drafts, generation and exact user/assistant receipt boundaries in the current page layout; distinguish current readiness from stale login/delivery status and provide a shared-login entry point.
+- Clear old Grok Routine drafts and credentials when switching Bots; acknowledge canonical Bot URLs after saving; prevent stale completion credentials from completing a newer task.
+- Distinguish paused Dots access from host-identity and Actor lifecycle failures, preserve paused access during setup, and add bounded salted identity diagnostics. Clarify current-turn credential handoff through host tool arguments without putting credentials in saved handlers or CCCC business code.
+- Persist new task reference targets before dependents across task-number digit widths and partial-write retries. Clear removed Actors' open-task assignment/handoff references and hot/warm working state while preserving progress and historical ownership; prevent foreman self-removal and record user-triggered succession.
+- Preserve Claude sessions across queued-input interruption and late replies, pause repeated automatic restoration failures, and retain resources until authoritative stop. Honor Codex command model selection, avoid replaying failed DeepSeek turns, expose safe Pi tool activity, and settle Pi length stops without final text as failed.
+- Avoid claim-table pruning for unrelated ledger events, blocking optional terminal observations, and command-substitution secrets in Pi activity summaries. Correct cloudflared multicall fixtures, Chrome CI selection and lazy Guidance test readiness.
+
 ## [0.4.44]
 
 ### Added

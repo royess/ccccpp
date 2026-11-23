@@ -25,11 +25,25 @@ import {
   isBrowserWebModelRuntime,
 } from "../../types";
 import { VirtualMessageList } from "../../components/VirtualMessageList";
+import { AttachmentLightbox } from "../../components/messageBubble/AttachmentLightbox";
+import { getReadingTopAnchorOffset } from "../../components/virtualMessageListAnchorRestore";
+import { PendingReplyEditingContext } from "../../components/messageBubble/PendingReplyEditingContext";
+import { LivePendingStatusContext } from "../../features/pendingReplies/liveStatusContext";
+import { MessagePathContext } from "../../components/messageBubble/messagePathContext";
+import { useWaitingFilterIndicator } from "../../features/pendingReplies/useWaitingFilterIndicator";
+import { useLivePendingStatuses } from "../../features/pendingReplies/useLivePendingStatuses";
+import { NotificationPrompt } from "../../features/pushNotifications/NotificationPrompt";
+import { useNotificationPromptOffer } from "../../features/pushNotifications/useNotificationPromptOffer";
 import { classNames } from "../../utils/classNames";
+import { buttonVariants } from "../../components/ui/button-variants";
 import { ChatComposer } from "./ChatComposer";
+import { ComposerFailedSends } from "./ComposerFailedSends";
+import { ChatFilterTabs } from "./ChatFilterTabs";
+import { usePinnedIds } from "../../features/pins/pinStore";
 import { GroupWorkArea, type RuntimeActorRenderer } from "./GroupWorkArea";
 import { RuntimeDock } from "./RuntimeDock";
 import { ChatSenderFilter } from "./ChatSenderFilter";
+import { pinnedEmptyKey } from "../../hooks/chat/chatMessageFilters";
 import { useChatTab } from "../../hooks/useChatTab";
 import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/react/shallow";
@@ -40,6 +54,9 @@ import { buildPresentationRefForSlot } from "../../utils/presentationRefs";
 import { clearPresentationSlot } from "../../services/api";
 import { ResizableSidePanel } from "../../components/layout/ResizableSidePanel";
 import { MOBILE_APP_HEADER_HEIGHT_PX } from "../../utils/responsiveLayout";
+import { useShortTouchViewport } from "../../hooks/useShortTouchViewport";
+import { useMobileReadingChrome } from "../../hooks/useMobileReadingChrome";
+import { useKeepInlineReplyVisible } from "../../hooks/useKeepInlineReplyVisible";
 import {
   buildWebModelDeliveryStatusByEventId,
   latestWebModelDeliveryStatusNeedingAppPermissionHint,
@@ -50,22 +67,31 @@ import {
   readChatGptAppPermissionHintDismissed,
 } from "../../utils/chatGptAppPermissionHint";
 import { useRuntimeDockWorkCards } from "./useRuntimeDockWorkCards";
+import { useFloatingDockReserve } from "./useFloatingDockReserve";
+import { useWorkspaceTabChoice } from "./useWorkspaceTabChoice";
+import { usePreloadQuickReplyTemplates } from "../../features/quickReplies/templateStore";
 import { type ComposerMentionKind } from "./chatMentionSuggestions";
 import { useWorkspaceFiles } from "../../components/workspace/useWorkspaceFiles";
 import { WorkspaceFilesTrigger } from "../../components/workspace/WorkspaceFilesTrigger";
 import { useSidePanelSelection } from "../../hooks/useSidePanelSelection";
+import { ResourcePanelTrigger } from "../../components/resourcePanel/ResourcePanelTrigger";
+import {
+  type ClosedEntry,
+  type PresentationResource,
+  useGroupResourcePanel,
+  useResourcePanelStore,
+} from "../../stores/useResourcePanelStore";
+import type { WorkspaceOpenFileOptions } from "../../components/workspace/useWorkspaceEditor";
 import { ensurePresentation } from "../../utils/presentation";
 import { PresentationTrigger } from "../../components/presentation/PresentationTrigger";
 import { MobilePresentationSurface } from "../../components/presentation/MobilePresentationSurface";
 
+// The filter's 44px content row has a 1px bottom border.
+const MOBILE_READING_CHROME_HEIGHT_PX = MOBILE_APP_HEADER_HEIGHT_PX + 45;
+
 const PresentationRail = lazy(() =>
   import("../../components/presentation/PresentationRail").then((module) => ({
     default: module.PresentationRail,
-  })),
-);
-const PresentationViewerSplitPanel = lazy(() =>
-  import("../../components/presentation/PresentationViewerModal").then((module) => ({
-    default: module.PresentationViewerSplitPanel,
   })),
 );
 const WorkspaceFilesPanel = lazy(() =>
@@ -78,6 +104,11 @@ const WorkspaceViewer = lazy(() =>
     default: module.WorkspaceViewer,
   })),
 );
+const ResourcePanel = lazy(() =>
+  import("../../components/resourcePanel/ResourcePanel").then((module) => ({
+    default: module.ResourcePanel,
+  })),
+);
 const SetupChecklist = lazy(() =>
   import("./SetupChecklist").then((module) => ({ default: module.SetupChecklist })),
 );
@@ -87,23 +118,13 @@ function ChatLazyFallback({ className }: { className?: string }) {
   return <div className={classNames("min-h-0", className)} />;
 }
 
-function ChatGptAppPermissionNotice({
-  isDark,
-  onDismiss,
-}: {
-  isDark: boolean;
-  onDismiss: () => void;
-}) {
+function ChatGptAppPermissionNotice({ onDismiss }: { onDismiss: () => void }) {
   const { t } = useTranslation("chat");
+  // Framed like the notification offer above the composer, with the same key.
   return (
     <div className="flex-shrink-0 px-2 pb-1.5 sm:px-2.5">
       <div
-        className={classNames(
-          "mx-auto flex max-w-5xl items-start gap-2 rounded-md border px-3 py-2 text-xs leading-5 shadow-sm",
-          isDark
-            ? "border-amber-400/25 bg-amber-500/10 text-amber-100"
-            : "border-amber-200 bg-amber-50 text-amber-800",
-        )}
+        className="chat-reading-width mx-auto flex max-w-5xl items-start gap-2.5 rounded-lg border border-[var(--color-border-primary)] bg-[var(--color-bg-elevated)] px-3 py-2 text-xs leading-5 text-[var(--color-text-primary)] shadow-sm"
         role="status"
         aria-live="polite"
       >
@@ -112,12 +133,8 @@ function ChatGptAppPermissionNotice({
         <button
           type="button"
           onClick={onDismiss}
-          className={classNames(
-            "inline-flex min-h-7 shrink-0 items-center justify-center rounded-md px-2.5 text-[11px] font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-current",
-            isDark ? "hover:bg-white/10" : "hover:bg-amber-100",
-          )}
-          aria-label={t("webModelDelivery.permissionHintDismiss")}
-          title={t("webModelDelivery.permissionHintDismiss")}
+          className={buttonVariants({ variant: "ghost", size: "sm" })}
+          data-lcd-key
         >
           {t("webModelDelivery.permissionHintDismiss")}
         </button>
@@ -131,11 +148,15 @@ export interface ChatTabProps {
   isDark: boolean;
   isSmallScreen: boolean;
   readOnly?: boolean;
+  /** The viewer may create a Group, so the empty chat can offer it. */
+  canCreateGroup?: boolean;
   mobileAppHeaderReserved?: boolean;
+  onMobileReadingHiddenChange?: (hidden: boolean) => void;
+  onMobileReadingOverlayChange?: (overlay: boolean) => void;
 
   // Core data (must be passed from App)
   selectedGroupId: string;
-  selectedGroupRunning: boolean;
+  selectedGroupRunning: boolean | null;
   selectedGroupActorsHydrating: boolean;
   selectedGroupActorStatusProvisional: boolean;
   groupLabelById: Record<string, string>;
@@ -184,7 +205,10 @@ export function ChatTab({
   isDark,
   isSmallScreen,
   readOnly,
+  canCreateGroup = false,
   mobileAppHeaderReserved = false,
+  onMobileReadingHiddenChange,
+  onMobileReadingOverlayChange,
   selectedGroupId,
   selectedGroupRunning,
   selectedGroupActorsHydrating,
@@ -218,6 +242,34 @@ export function ChatTab({
   setMentionActorScope,
   setMentionTargetGroupId,
 }: ChatTabProps) {
+  usePreloadQuickReplyTemplates(!readOnly);
+  const shortTouchViewport = useShortTouchViewport();
+  const [composerInputFocused, setComposerInputFocused] = useState(false);
+  const [mentionTriggerIndex, setMentionTriggerIndex] = useState<number | null>(null);
+  const [inlineReplyEditor, setInlineReplyEditor] = useState<string | null>(null);
+  const updateInlineReplyFocus = useCallback((editorId: string, focused: boolean) => {
+    setInlineReplyEditor((current) => (focused ? editorId : current === editorId ? null : current));
+  }, []);
+  const [shortVisualViewport, setShortVisualViewport] = useState(
+    () =>
+      typeof window !== "undefined" && (window.visualViewport?.height ?? window.innerHeight) < 500,
+  );
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    const update = () => setShortVisualViewport((viewport?.height ?? window.innerHeight) < 500);
+    update();
+    viewport?.addEventListener("resize", update);
+    window.addEventListener("resize", update);
+    return () => {
+      viewport?.removeEventListener("resize", update);
+      window.removeEventListener("resize", update);
+    };
+  }, []);
+  const hideDockForKeyboard =
+    (isSmallScreen || shortTouchViewport) &&
+    (composerInputFocused || inlineReplyEditor !== null) &&
+    shortVisualViewport &&
+    !mobileAppHeaderReserved;
   // Use the refactored hook for business logic
   const {
     // Chat state
@@ -231,6 +283,16 @@ export function ChatTab({
     setChatSenderFilter,
     senderHistoryError,
     retrySenderHistory,
+    pendingPageError,
+    pendingDaemonUnsupported,
+    retryPendingPage,
+    pendingActive,
+    pinnedActive,
+    pinnedError,
+    pinnedUnavailable,
+    retryPinned,
+    pinnedTabOffered,
+    toggleMessagePin,
     viewMessageContext,
     chatViewKey,
     chatWindowProps,
@@ -238,6 +300,8 @@ export function ChatTab({
     chatInitialScrollAnchorId,
     chatInitialScrollAnchorOffsetPx,
     chatInitialScrollOffsetPx,
+    chatInitialScrollHighlight,
+    liveJumpActive,
     chatHighlightEventId,
     isLoadingHistory,
     hasMoreHistory,
@@ -246,6 +310,9 @@ export function ChatTab({
 
     // UI state
     busy,
+    sendInFlight,
+    uploadInFlight,
+    stopUploadWaiting,
     showScrollButton,
     chatUnreadCount,
     sendScrollRequest,
@@ -273,6 +340,7 @@ export function ChatTab({
     setQuotedVoiceDocumentRef,
     clearQuotedVoiceDocumentRef,
     toTokens,
+    unavailableRecipients,
     toggleRecipient,
     clearRecipients,
     messageMode,
@@ -292,14 +360,16 @@ export function ChatTab({
     // Actions
     sendMessage,
     copyMessageLink,
-    copyMessageText,
     startReply,
     showRecipients,
     relayMessage,
     openSourceMessage,
-    exitChatWindow,
+    returnToLatest,
     handleScrollButtonClick,
     handleScrollChange,
+    onContextReady,
+    onReachedContextEnd,
+    onLoadNewerContext,
     handleScrollSnapshot,
     addAgent,
   } = useChatTab({
@@ -311,6 +381,7 @@ export function ChatTab({
     mentionFilter,
     mentionKind,
     mentionActorScope,
+    mentionTriggerIndex,
     composerRef,
     fileInputRef,
     chatAtBottomRef,
@@ -334,17 +405,10 @@ export function ChatTab({
       ? getChatSession(selectedGroupId, state.chatSessions).mobileSurface
       : "messages",
   );
-  const presentationDisplayMode = useUIStore((state) =>
-    selectedGroupId
-      ? getChatSession(selectedGroupId, state.chatSessions).presentationDisplayMode
-      : "modal",
+  const workView = useUIStore((state) =>
+    selectedGroupId ? getChatSession(selectedGroupId, state.chatSessions).workView : "messages",
   );
-  const setChatFilesPanelOpen = useUIStore((state) => state.setChatFilesPanelOpen);
   const setChatMobileSurface = useUIStore((state) => state.setChatMobileSurface);
-  const setChatPresentationDockOpen = useUIStore((state) => state.setChatPresentationDockOpen);
-  const setChatPresentationDisplayMode = useUIStore(
-    (state) => state.setChatPresentationDisplayMode,
-  );
   const showError = useUIStore((state) => state.showError);
   const setQuotedPresentationRef = useComposerStore((state) => state.setQuotedPresentationRef);
   const setComposerDestGroupId = useComposerStore((state) => state.setDestGroupId);
@@ -405,8 +469,21 @@ export function ChatTab({
   }, []);
 
   const isHydratingEmptyState = chatMessages.length === 0 && chatEmptyState === "hydrating";
+  // Pending pages already carry authoritative statuses for all retained rows.
+  // Only the ordinary conversation needs a separate status hydration.
+  const livePendingStatuses = useLivePendingStatuses(
+    selectedGroupId,
+    chatMessages,
+    !readOnly && !pendingActive,
+  );
   const isBusinessEmptyState = chatMessages.length === 0 && chatEmptyState === "business_empty";
   const isFilteredEmptyState = chatMessages.length === 0 && chatEmptyState === "filtered_empty";
+  // Waiting for you and Pinned are read from the server rather than the loaded conversation.
+  const projectionActive = pendingActive || pinnedActive;
+  // The open Group's pins, read when it opens and again when the page becomes visible.
+  const groupPins = usePinnedIds(selectedGroupId, pinnedTabOffered);
+  const pinnedCount = groupPins?.loaded ? groupPins.ids.length : null;
+  const pinnedEmpty = pinnedEmptyKey(pinnedError, pinnedCount);
   const listIsLoadingHistory = isLoadingHistory || isHydratingEmptyState;
   const listHasMoreHistory = hasMoreHistory || isHydratingEmptyState;
   const liveWorkCards = useRuntimeDockWorkCards({
@@ -415,19 +492,59 @@ export function ChatTab({
     bucket: liveWorkBucket,
   });
 
-  const preferredPresentationSurface =
-    !isSmallScreen && presentationDisplayMode === "split" ? "split" : "modal";
-  const splitPresentationViewer =
-    !isSmallScreen &&
-    presentationViewer?.groupId === selectedGroupId &&
-    presentationViewer.surface === "split"
+  // A request for the side-by-side viewer, which is now a resource tab (see below).
+  const panelPresentationRequest =
+    presentationViewer?.groupId === selectedGroupId && presentationViewer.surface === "split"
       ? presentationViewer
       : null;
   // One right-hand column, two surfaces. The activity rail selects which one occupies it.
   const { activeSidePanel, selectSidePanel } = useSidePanelSelection(selectedGroupId);
-  const showSplitFiles = !isSmallScreen && activeSidePanel === "files";
-  const showSplitPresentation = !isSmallScreen && activeSidePanel === "presentation";
-  const showSplitSurface = showSplitPresentation || showSplitFiles;
+  const resourceDock = useResourcePanelStore((state) => state.dock);
+  const resourcePanel = useGroupResourcePanel(selectedGroupId);
+  const setResourcePanelOpen = useResourcePanelStore((state) => state.setOpen);
+  const resourcePanelEmpty = resourcePanel.tabs.length === 0;
+  // An empty panel waits in the right column, wherever it is docked, so the messages whose
+  // attachments it waits for stay in reach. A phone shows no empty panel.
+  const resourcePanelDock = resourcePanelEmpty ? "right" : resourceDock;
+  const resourcePanelExpanded =
+    !!selectedGroupId && resourcePanel.open && (!resourcePanelEmpty || !isSmallScreen);
+  // A phone shows the panel as its own full-screen surface instead.
+  const resourcePanelShown = !isSmallScreen && resourcePanelExpanded;
+  // Docked right, the panel takes the column over the surface beneath it; collapsing it shows
+  // that surface again.
+  const resourcePanelInColumn = resourcePanelShown && resourcePanelDock === "right";
+  // Docked over the messages it belongs to the message view: the terminal view hides it
+  // without collapsing it. Maximized, it covers the messages wherever it is docked.
+  const resourcePanelCoversChat =
+    resourcePanelShown &&
+    workView !== "terminals" &&
+    (resourcePanelDock === "left" || resourcePanel.maximized);
+  const showSplitFiles = !isSmallScreen && activeSidePanel === "files" && !resourcePanelInColumn;
+  const showSplitPresentation =
+    !isSmallScreen && activeSidePanel === "presentation" && !resourcePanelInColumn;
+  const showSplitSurface = showSplitPresentation || showSplitFiles || resourcePanelInColumn;
+  const columnSurface = resourcePanelInColumn ? "resources" : activeSidePanel;
+  const [chatWorkSurface, setChatWorkSurface] = useState<HTMLDivElement | null>(null);
+  const [resourceColumnSlot, setResourceColumnSlot] = useState<HTMLDivElement | null>(null);
+  // Files and Presentation share the column with the docked panel: choosing one of them while
+  // the panel covers the column shows it instead of toggling it away unseen.
+  const selectColumnSurface = useCallback(
+    (surface: "files" | "presentation") => {
+      if (resourcePanelInColumn) {
+        setResourcePanelOpen(selectedGroupId, false);
+        if (activeSidePanel !== surface) selectSidePanel(surface);
+        return;
+      }
+      selectSidePanel(surface);
+    },
+    [
+      activeSidePanel,
+      resourcePanelInColumn,
+      selectSidePanel,
+      selectedGroupId,
+      setResourcePanelOpen,
+    ],
+  );
   // A phone has no room for a side column, so the tree becomes its own full-screen surface.
   const showMobileFiles = isSmallScreen && mobileSurface === "files" && !!selectedGroupId;
   // The tree lives in the right column while the opened file takes the main area, so the
@@ -437,36 +554,163 @@ export function ChatTab({
       ? state.groupDoc.scopes?.find((scope) => scope.scope_key === state.groupDoc?.active_scope_key)
       : undefined,
   );
+  const workspaceScopeReady = useGroupStore(
+    (state) => state.groupDoc?.group_id === selectedGroupId && Array.isArray(state.groupDoc.scopes),
+  );
   const workspaceFiles = useWorkspaceFiles(
     selectedGroupId,
     showSplitFiles || showMobileFiles,
     workspaceScope?.scope_key || "",
     workspaceScope?.url || "",
   );
-  const openedReport = useRef("");
-  const openReportFile = workspaceFiles.openFile;
-  useEffect(() => {
-    const link = workspaceReportLink(window.location.search);
-    if (!link || link.group !== selectedGroupId || !workspaceScope?.url) return;
-    const key = JSON.stringify([link.group, workspaceScope.scope_key, link.file]);
-    if (openedReport.current === key) return;
-    openedReport.current = key;
-    if (isSmallScreen) setChatMobileSurface(selectedGroupId, "files");
-    else if (activeSidePanel !== "files") selectSidePanel("files");
-    void openReportFile(link.file);
-  }, [selectedGroupId, workspaceScope, isSmallScreen, activeSidePanel, selectSidePanel,
-    setChatMobileSurface, openReportFile]);
-  const hasWorkspaceViewer =
-    workspaceFiles.mode === "changes" ? !!workspaceFiles.changes.selection : !!workspaceFiles.file;
-  const showWorkspaceFileViewer = showSplitFiles && hasWorkspaceViewer;
+  // Changes are not part of the resource panel: a selected diff still opens over the messages.
+  const changesSelection = workspaceFiles.changes.selection;
+  // A panel the user brought back over the messages stays on top; the diff returns when it goes.
+  const showChangesViewer =
+    showSplitFiles &&
+    workspaceFiles.mode === "changes" &&
+    !!changesSelection &&
+    !resourcePanelCoversChat;
+  const chatCovered = resourcePanelCoversChat || showChangesViewer;
   const setWorkspaceFileViewerGroupId = useUIStore((state) => state.setWorkspaceFileViewerGroupId);
   useLayoutEffect(() => {
-    if (!showWorkspaceFileViewer) return;
-    // The editor covers the message area. Do not mark hidden messages as viewed
-    // or suppress their Voice notifications while that overlay is present.
+    if (!chatCovered) return;
+    // The panel or a diff covers the message area. Do not mark hidden messages as viewed
+    // or suppress their Voice notifications while it is there.
     setWorkspaceFileViewerGroupId(selectedGroupId);
     return () => setWorkspaceFileViewerGroupId("");
-  }, [selectedGroupId, showWorkspaceFileViewer, setWorkspaceFileViewerGroupId]);
+  }, [selectedGroupId, chatCovered, setWorkspaceFileViewerGroupId]);
+  // A diff picked while the panel covers the messages would open underneath it, so the panel
+  // steps aside; its tabs stay.
+  const panelCoverRef = useRef({ covers: resourcePanelCoversChat, groupId: selectedGroupId });
+  useLayoutEffect(() => {
+    panelCoverRef.current = { covers: resourcePanelCoversChat, groupId: selectedGroupId };
+  }, [resourcePanelCoversChat, selectedGroupId]);
+  useEffect(() => {
+    const { covers, groupId } = panelCoverRef.current;
+    if (changesSelection && covers && groupId) setResourcePanelOpen(groupId, false);
+  }, [changesSelection, setResourcePanelOpen]);
+
+  const workspaceScopeKey = workspaceScope?.scope_key || "";
+  const workspaceScopeUrl = workspaceScope?.url || "";
+  // Every file the editor ends up holding gets a tab. A file the user asks for is also selected
+  // once it is read, wherever it was asked for: the tree, the path box, Changes, a diff's Open
+  // file, a path in a message, a link in a document or a tab.
+  const {
+    choose: chooseWorkspaceTab,
+    settle: settleWorkspaceTab,
+    follow: followWorkspaceTab,
+  } = useWorkspaceTabChoice(
+    selectedGroupId,
+    workspaceScopeKey,
+    workspaceScopeUrl,
+    workspaceFiles.file?.path || "",
+  );
+  const requestWorkspaceFile = useCallback(() => {
+    const choice = chooseWorkspaceTab();
+    // Docked over the messages, the panel shows only in the message view: a file picked while
+    // the terminals are up brings that view back now, not when a slow read finishes.
+    if (selectedGroupId && !isSmallScreen && resourceDock === "left" && workView === "terminals")
+      useUIStore.getState().setGroupWorkView(selectedGroupId, "messages");
+    return choice;
+  }, [chooseWorkspaceTab, isSmallScreen, resourceDock, selectedGroupId, workView]);
+  const { openFile: openWorkspaceFile, locatePath: locateWorkspaceFile } = workspaceFiles;
+  const locateWorkspaceTab = useCallback(
+    async (path: string) => {
+      const choice = requestWorkspaceFile();
+      const opened = await locateWorkspaceFile(path);
+      if (opened) settleWorkspaceTab(opened, choice);
+      return opened;
+    },
+    [locateWorkspaceFile, requestWorkspaceFile, settleWorkspaceTab],
+  );
+  const panelWorkspaceFiles = useMemo(
+    () => ({
+      ...workspaceFiles,
+      // Reopening the current file leaves the editor unchanged, so its tab is selected here.
+      openFile: async (path: string, options?: WorkspaceOpenFileOptions) => {
+        const choice = requestWorkspaceFile();
+        const opened = await openWorkspaceFile(path, options);
+        if (opened) settleWorkspaceTab(opened, choice);
+        return opened;
+      },
+      locatePath: locateWorkspaceTab,
+      // Loads the file of the tab already in front without choosing a tab. A load that counted
+      // as a choice could take the selection from the file the user just opened, and the two
+      // tabs would then keep taking it from each other. A file now found at another path, as
+      // after it became a symlink, gives that path's tab the front instead.
+      loadFile: async (path: string, options?: WorkspaceOpenFileOptions) => {
+        const since = useResourcePanelStore.getState().generation;
+        const opened = await openWorkspaceFile(path, options);
+        if (opened && opened !== path) followWorkspaceTab(opened, since);
+        return opened;
+      },
+    }),
+    [
+      followWorkspaceTab,
+      locateWorkspaceTab,
+      openWorkspaceFile,
+      requestWorkspaceFile,
+      settleWorkspaceTab,
+      workspaceFiles,
+    ],
+  );
+  // A diff's Open file asks for its file like the path box does.
+  const viewerWorkspaceFiles = useMemo(
+    () => ({ ...workspaceFiles, locatePath: locateWorkspaceTab }),
+    [locateWorkspaceTab, workspaceFiles],
+  );
+  const setGroupWorkView = useUIStore((state) => state.setGroupWorkView);
+  // Docked over the messages, the panel is hidden in the terminal view without being collapsed;
+  // the header entry then brings back the messages with it rather than collapsing it unseen.
+  const resourcePanelVisible =
+    resourcePanelShown && (resourcePanelDock === "right" || workView !== "terminals");
+  // A message attachment opens in the panel only while the panel is on screen beside it.
+  const setResourcePanelShown = useResourcePanelStore((state) => state.setShown);
+  useEffect(() => {
+    setResourcePanelShown(resourcePanelVisible ? selectedGroupId : "");
+    return () => setResourcePanelShown("");
+  }, [resourcePanelVisible, selectedGroupId, setResourcePanelShown]);
+  const toggleResourcePanel = useCallback(() => {
+    if (!selectedGroupId) return;
+    if (resourcePanelVisible) {
+      setResourcePanelOpen(selectedGroupId, false);
+      return;
+    }
+    if (!isSmallScreen && resourcePanelDock === "left" && workView === "terminals") {
+      setGroupWorkView(selectedGroupId, "messages");
+    }
+    setResourcePanelOpen(selectedGroupId, true);
+  }, [
+    isSmallScreen,
+    resourcePanelDock,
+    resourcePanelVisible,
+    selectedGroupId,
+    setGroupWorkView,
+    setResourcePanelOpen,
+    workView,
+  ]);
+  const closeResourcePanel = useCallback(() => {
+    if (selectedGroupId) setResourcePanelOpen(selectedGroupId, false);
+  }, [selectedGroupId, setResourcePanelOpen]);
+  // Reopening what was closed, from the empty panel: its tabs go where the panel is docked.
+  const restoreResourceEntry = useCallback(
+    (entry: ClosedEntry) => {
+      if (!selectedGroupId) return;
+      if (!isSmallScreen && resourceDock === "left" && workView === "terminals") {
+        setGroupWorkView(selectedGroupId, "messages");
+      }
+      useResourcePanelStore.getState().restore(selectedGroupId, entry.id);
+      const last = entry.tabs[entry.tabs.length - 1];
+      if (
+        last?.kind === "workspace" &&
+        last.scopeKey === workspaceFiles.scopeKey &&
+        last.scopeUrl === workspaceFiles.scopeUrl
+      )
+        void workspaceFiles.openFile(last.path);
+    },
+    [isSmallScreen, resourceDock, selectedGroupId, setGroupWorkView, workView, workspaceFiles],
+  );
 
   const showMobilePresentationViewer =
     isSmallScreen &&
@@ -474,53 +718,74 @@ export function ChatTab({
     presentationViewer.surface !== "split";
   const splitLayoutRef = useRef<HTMLDivElement | null>(null);
 
-  const openPresentationSlot = useCallback(
-    (slotId: string) => {
+  // A Presentation slot, or one message's reference to it, opens as a resource tab like any other
+  // resource.
+  const openPresentationTab = useCallback(
+    (
+      slotId: string,
+      reference?: { ref: PresentationMessageRef; eventId: string; refIndex: number } | null,
+      /** The tab's own key, when it comes back from the window. */
+      tabRefKey?: string,
+    ) => {
       if (!selectedGroupId || !slotId) return;
-      if (preferredPresentationSurface === "split") {
-        setChatPresentationDockOpen(selectedGroupId, true);
-        setChatFilesPanelOpen(selectedGroupId, false);
+      const slot = findPresentationSlot(groupPresentation, slotId);
+      const slotIndex = slot?.index ?? (Number(slotId.replace("slot-", "")) || 0);
+      const title =
+        String(reference?.ref.title || slot?.card?.title || "").trim() ||
+        t("resourcePanel.fromSlot", { slot: slotIndex });
+      if (!isSmallScreen && resourceDock === "left" && workView === "terminals") {
+        setGroupWorkView(selectedGroupId, "messages");
       }
-      setPresentationViewer({
-        groupId: selectedGroupId,
-        slotId,
-        surface: preferredPresentationSurface,
-      });
+      useResourcePanelStore.getState().open(
+        selectedGroupId,
+        {
+          kind: "presentation",
+          slotId,
+          slotIndex,
+          refKey: tabRefKey || (reference ? `${reference.eventId}:${reference.refIndex}` : "live"),
+          focusEventId: reference?.eventId || undefined,
+          focusRef: reference?.ref ?? null,
+        },
+        title,
+      );
     },
     [
-      preferredPresentationSurface,
+      groupPresentation,
+      isSmallScreen,
+      resourceDock,
       selectedGroupId,
-      setChatFilesPanelOpen,
-      setChatPresentationDockOpen,
-      setPresentationViewer,
+      setGroupWorkView,
+      t,
+      workView,
     ],
   );
 
-  const openPresentationRef = useCallback(
-    (ref: PresentationMessageRef, event: LedgerEvent) => {
-      if (!selectedGroupId) return;
-      const slotId = String(ref.slot_id || "").trim();
-      if (!slotId) return;
-      if (preferredPresentationSurface === "split") {
-        setChatPresentationDockOpen(selectedGroupId, true);
-        setChatFilesPanelOpen(selectedGroupId, false);
-      }
-      setPresentationViewer({
-        groupId: selectedGroupId,
-        slotId,
-        surface: preferredPresentationSurface,
-        focusRef: ref,
-        focusEventId: String(event.id || "").trim() || null,
-      });
-    },
-    [
-      preferredPresentationSurface,
-      selectedGroupId,
-      setChatFilesPanelOpen,
-      setChatPresentationDockOpen,
-      setPresentationViewer,
-    ],
+  const openPresentationSlot = useCallback(
+    (slotId: string) => openPresentationTab(slotId),
+    [openPresentationTab],
   );
+
+  const openPresentationRef = useCallback(
+    (ref: PresentationMessageRef, event: LedgerEvent, refIndex = 0) => {
+      const slotId = String(ref.slot_id || "").trim();
+      const eventId = String(event.id || "").trim();
+      openPresentationTab(slotId, eventId ? { ref, eventId, refIndex } : null);
+    },
+    [openPresentationTab],
+  );
+
+  // Callers outside this page (a slot just pinned, the window's "open beside" action) ask for the
+  // side-by-side viewer; that viewer is now a resource tab.
+  useEffect(() => {
+    if (!panelPresentationRequest) return;
+    const { slotId, focusRef, focusEventId, refKey } = panelPresentationRequest;
+    setPresentationViewer(null);
+    openPresentationTab(
+      slotId,
+      focusRef && focusEventId ? { ref: focusRef, eventId: focusEventId, refIndex: 0 } : null,
+      refKey,
+    );
+  }, [openPresentationTab, panelPresentationRequest, setPresentationViewer]);
 
   const openTaskRef = useCallback(
     (ref: TaskMessageRef, _event?: LedgerEvent) => {
@@ -563,6 +828,49 @@ export function ChatTab({
     [groupPresentation, readOnly, selectedGroupId, setPresentationPin],
   );
 
+  const { setMode: setWorkspaceMode } = workspaceFiles;
+  const openMessagePath = useCallback(
+    (path: string) => {
+      if (!selectedGroupId) return;
+      // Beside a panel docked over the messages the tree stays in view; a panel docked right
+      // takes the column itself. A phone opens the file in its panel surface, and Back returns
+      // to the messages.
+      if (!isSmallScreen && resourceDock === "left" && activeSidePanel !== "files")
+        selectSidePanel("files");
+      setWorkspaceMode("files");
+      void locateWorkspaceTab(path);
+    },
+    [
+      activeSidePanel,
+      isSmallScreen,
+      locateWorkspaceTab,
+      resourceDock,
+      selectSidePanel,
+      selectedGroupId,
+      setWorkspaceMode,
+    ],
+  );
+  const scopeKey = workspaceScope?.scope_key || "";
+  const scopeRoot = workspaceScope?.url || "";
+  // An exhibit has no workspace, and a Group without a project folder has nothing to open.
+  const messagePaths = useMemo(
+    () =>
+      readOnly || !scopeKey || !scopeRoot
+        ? null
+        : { scopeKey, rootPath: scopeRoot, open: openMessagePath },
+    [openMessagePath, readOnly, scopeKey, scopeRoot],
+  );
+
+  const openedReport = useRef("");
+  useEffect(() => {
+    const link = workspaceReportLink(window.location.search);
+    if (!link || !messagePaths || link.group !== selectedGroupId) return;
+    const key = JSON.stringify([link.group, messagePaths.scopeKey, link.file]);
+    if (openedReport.current === key) return;
+    openedReport.current = key;
+    messagePaths.open(link.file);
+  }, [selectedGroupId, messagePaths]);
+
   const closeMobileFiles = useCallback(() => {
     const gid = String(selectedGroupId || "").trim();
     if (!gid) return;
@@ -595,16 +903,21 @@ export function ChatTab({
       setComposerDestGroupId(gid);
       setChatMobileSurface(gid, "messages");
       setPresentationViewer(null);
+      // A phone's panel or a maximized one covers the composer the reference goes into.
+      if (isSmallScreen || resourcePanel.maximized) setResourcePanelOpen(gid, false);
       window.setTimeout(() => composerRef.current?.focus(), 0);
     },
     [
       composerRef,
       groupPresentation,
+      isSmallScreen,
+      resourcePanel.maximized,
       selectedGroupId,
       setChatMobileSurface,
       setComposerDestGroupId,
       setPresentationViewer,
       setQuotedPresentationRef,
+      setResourcePanelOpen,
       showError,
       t,
     ],
@@ -628,17 +941,49 @@ export function ChatTab({
     ],
   );
 
-  const handleOpenPresentationWindow = useCallback(() => {
-    const gid = String(selectedGroupId || "").trim();
-    if (!gid || !splitPresentationViewer) return;
-    setChatPresentationDisplayMode(gid, "modal");
-    setPresentationViewer({ ...splitPresentationViewer, surface: "modal" });
-  }, [
-    selectedGroupId,
-    setChatPresentationDisplayMode,
-    setPresentationViewer,
-    splitPresentationViewer,
-  ]);
+  const handleOpenPresentationWindow = useCallback(
+    (tab: PresentationResource) => {
+      const gid = String(selectedGroupId || "").trim();
+      if (!gid) return;
+      // The window has its own viewer of the slot; the panel steps aside rather than show two.
+      setResourcePanelOpen(gid, false);
+      setPresentationViewer({
+        groupId: gid,
+        slotId: tab.slotId,
+        surface: "modal",
+        focusRef: tab.focusRef ?? null,
+        focusEventId: tab.focusEventId ?? null,
+        reuseExistingSession: true,
+        // Coming back beside the messages finds the same tab, not the message's first reference.
+        refKey: tab.refKey,
+      });
+    },
+    [selectedGroupId, setPresentationViewer, setResourcePanelOpen],
+  );
+  // Showing a resource's message brings the message view forward: a phone's full-screen panel, a
+  // panel over the messages and a maximized one step aside, and the terminal view gives way.
+  const locateMessageFromPanel = useCallback(
+    (eventId: string) => {
+      const gid = String(selectedGroupId || "").trim();
+      if (!gid || !eventId) return;
+      if (isSmallScreen || resourceDock === "left" || resourcePanel.maximized) {
+        setResourcePanelOpen(gid, false);
+      }
+      if (isSmallScreen) setChatMobileSurface(gid, "messages");
+      else if (workView === "terminals") setGroupWorkView(gid, "messages");
+      void useGroupStore.getState().openChatWindow(gid, eventId);
+    },
+    [
+      isSmallScreen,
+      resourceDock,
+      resourcePanel.maximized,
+      selectedGroupId,
+      setChatMobileSurface,
+      setGroupWorkView,
+      setResourcePanelOpen,
+      workView,
+    ],
+  );
 
   const handleSplitReplaceSlot = useCallback(
     (slotId: string) => {
@@ -682,16 +1027,121 @@ export function ChatTab({
       t,
     ],
   );
+  const resourcePresentation = useMemo(
+    () => ({
+      data: groupPresentation,
+      readOnly: !!readOnly,
+      handlers: {
+        onQuoteInChat: handleQuotePresentationReference,
+        onOpenMessageContext: locateMessageFromPanel,
+        onReplaceSlot: handleSplitReplaceSlot,
+        onClearSlot: (slotId: string) => {
+          void handleSplitClearSlot(slotId);
+        },
+        onSelectSlot: openPresentationSlot,
+        onPinSlot: pinPresentationSlot,
+      },
+      // A phone's panel is already the whole screen.
+      onOpenWindow: isSmallScreen ? undefined : handleOpenPresentationWindow,
+    }),
+    [
+      groupPresentation,
+      handleOpenPresentationWindow,
+      handleQuotePresentationReference,
+      handleSplitClearSlot,
+      handleSplitReplaceSlot,
+      isSmallScreen,
+      locateMessageFromPanel,
+      openPresentationSlot,
+      pinPresentationSlot,
+      readOnly,
+    ],
+  );
 
-  const filterOptions: Array<["all" | "user" | "mail" | "request_reply", string]> = [
-    ["all", t("filterAll")],
-    ["user", t("filterUser")],
-    ["mail", t("filterMail")],
-    ["request_reply", t("filterNeedReply")],
-  ];
+  const waitingIndicator = useWaitingFilterIndicator(
+    selectedGroupId,
+    chatFilter === "pending_user",
+  );
   const hasChatFilter = chatFilter !== "all" || chatSenderFilter.length > 0;
-  const showMessageFilters = !readOnly && !chatWindowProps && (hasAnyChatMessages || hasChatFilter);
-  const showSetupNotice = !readOnly && (needsScope || needsActors) && chatMessages.length > 0;
+  const showMessageFilters =
+    !readOnly &&
+    !chatWindowProps &&
+    (hasAnyChatMessages || hasChatFilter || waitingIndicator !== null);
+  const showSetupNotice =
+    !readOnly &&
+    (needsScope || needsActors) &&
+    chatMessages.length > 0 &&
+    !(inlineReplyEditor !== null && hideDockForKeyboard);
+  const notificationOffer = useNotificationPromptOffer((waitingIndicator?.count ?? 0) > 0);
+  const messageFiltersRef = useRef<HTMLDivElement | null>(null);
+  const focusActiveFilter = useCallback(() => {
+    messageFiltersRef.current?.querySelector<HTMLElement>('[aria-pressed="true"]')?.focus();
+  }, []);
+  // The key that opened a message from a filtered view leaves with its row. Focus goes to
+  // the opened view's way back, not into the message list, where it would end the brief
+  // hold that keeps the message in place.
+  const windowReturnKeyRef = useRef<HTMLButtonElement | null>(null);
+  const showInConversation = useCallback(
+    (eventId: string) => {
+      viewMessageContext(eventId);
+      requestAnimationFrame(() => {
+        if (document.activeElement === document.body) windowReturnKeyRef.current?.focus();
+      });
+    },
+    [viewMessageContext],
+  );
+  // Keep the scroll viewport fixed beneath the mobile header and filters, so
+  // showing or hiding those controls cannot move the reader's anchor. The
+  // overlay reserves a fixed height, so extra rows under the filters keep the
+  // controls in the normal flow instead.
+  const overlayMobileChrome =
+    isSmallScreen &&
+    !mobileAppHeaderReserved &&
+    mobileSurface === "messages" &&
+    workView === "messages" &&
+    !activeRuntimeActorId &&
+    !chatCovered &&
+    !showSetupNotice &&
+    !senderHistoryError &&
+    !pendingPageError &&
+    !pinnedError &&
+    !(pinnedUnavailable.length > 0 && toggleMessagePin) &&
+    showMessageFilters;
+  useLayoutEffect(() => {
+    onMobileReadingOverlayChange?.(overlayMobileChrome);
+    return () => onMobileReadingOverlayChange?.(false);
+  }, [onMobileReadingOverlayChange, overlayMobileChrome]);
+  const reachedLatestWhileHidden = useRef("");
+  const rememberReachedLatest = useCallback(() => {
+    reachedLatestWhileHidden.current = selectedGroupId;
+  }, [selectedGroupId]);
+  const reading = useMobileReadingChrome(
+    overlayMobileChrome && inlineReplyEditor === null,
+    selectedGroupId,
+    scrollRef,
+    onMobileReadingHiddenChange,
+    rememberReachedLatest,
+  );
+  // The phone's members grow with a line of agent activity; the list's end room follows them.
+  const [dockFade, setDockFade] = useState<HTMLDivElement | null>(null);
+  useFloatingDockReserve(dockFade, scrollRef, isSmallScreen);
+  useKeepInlineReplyVisible(
+    scrollRef,
+    (isSmallScreen || shortTouchViewport) && inlineReplyEditor !== null,
+    overlayMobileChrome ? MOBILE_READING_CHROME_HEIGHT_PX : 0,
+  );
+  useLayoutEffect(() => {
+    if (reading.hidden || !reachedLatestWhileHidden.current) return;
+    const reachedGroup = reachedLatestWhileHidden.current;
+    reachedLatestWhileHidden.current = "";
+    if (reachedGroup !== selectedGroupId) return;
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    // Restoring the Dock reduces the viewport after the user has reached the
+    // end. Keep the newest message visible and resume the existing follow mode.
+    scroll.scrollTop = scroll.scrollHeight;
+    handleScrollButtonClick();
+  }, [handleScrollButtonClick, reading.hidden, scrollRef, selectedGroupId]);
 
   return (
     <div className="flex flex-col h-full w-full overflow-hidden bg-transparent">
@@ -701,70 +1151,87 @@ export function ChatTab({
           {!isSmallScreen || mobileSurface === "messages" ? (
             <section
               className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+              onTouchStartCapture={reading.onTouchStartCapture}
+              onTouchMoveCapture={reading.onTouchMoveCapture}
+              onTouchEndCapture={reading.onTouchEndCapture}
+              onTouchCancelCapture={reading.onTouchCancelCapture}
+              onCompositionStartCapture={reading.onCompositionStartCapture}
+              onCompositionEndCapture={reading.onCompositionEndCapture}
+              onScrollCapture={reading.onScrollCapture}
+              onPointerDownCapture={(event) => {
+                if (event.target instanceof Element && event.target.closest("footer")) {
+                  reading.reveal();
+                }
+              }}
+              onClickCapture={reading.onClickCapture}
+              onFocusCapture={(event) => {
+                reading.onFocusCapture(event);
+                if (event.target instanceof HTMLTextAreaElement && event.target.closest("footer")) {
+                  setComposerInputFocused(true);
+                  reading.reveal();
+                }
+              }}
+              onBlurCapture={(event) => {
+                if (event.target instanceof HTMLTextAreaElement && event.target.closest("footer")) {
+                  setComposerInputFocused(false);
+                }
+              }}
               style={{
                 paddingTop:
-                  isSmallScreen && !mobileAppHeaderReserved
+                  isSmallScreen && !mobileAppHeaderReserved && !overlayMobileChrome
                     ? MOBILE_APP_HEADER_HEIGHT_PX
                     : undefined,
               }}
             >
-              <div className="relative flex min-h-0 flex-1 flex-col" data-chat-work-surface>
+              <div
+                ref={setChatWorkSurface}
+                className="relative flex min-h-0 flex-1 flex-col"
+                data-chat-work-surface
+              >
                 {(chatWindowProps || showSetupNotice) && (
                   <div
                     className="shrink-0"
-                    inert={showWorkspaceFileViewer || undefined}
-                    aria-hidden={showWorkspaceFileViewer || undefined}
+                    inert={chatCovered || undefined}
+                    aria-hidden={chatCovered || undefined}
                     data-chat-notices
                   >
                     {/* Jump-to window banner */}
                     {chatWindowProps && (
                       <div className="px-4 pt-4">
                         <div
-                          className={classNames(
-                            "flex items-center justify-between gap-3 rounded-2xl border px-4 py-3 shadow-sm",
-                            isDark
-                              ? "border-slate-700/50 bg-slate-900/40"
-                              : "border-gray-200 bg-white/70",
-                          )}
+                          className="flex items-center justify-between gap-3 border border-[var(--color-border-primary)] bg-[var(--color-bg-elevated)] px-4 py-3"
                           role="status"
                           aria-label={t("viewingMessage")}
                         >
                           <div className="min-w-0">
-                            <div
-                              className={classNames(
-                                "text-sm font-semibold",
-                                isDark ? "text-slate-200" : "text-gray-800",
-                              )}
-                            >
+                            <div className="text-sm font-semibold text-[var(--color-text-primary)]">
                               {t("viewingMessage")}
                             </div>
-                            <div
-                              className={classNames(
-                                "text-xs mt-0.5",
-                                isDark ? "text-slate-400" : "text-gray-600",
-                              )}
-                            >
+                            <div className="mt-0.5 text-xs text-[var(--color-text-secondary)]">
                               {isLoadingHistory
                                 ? t("loadingContext")
-                                : chatWindowProps.hasMoreBefore || chatWindowProps.hasMoreAfter
+                                : chatWindowProps.hasMoreBefore
                                   ? t("contextTruncated")
-                                  : t("contextLoaded")}
+                                  : chatWindowProps.hasMoreAfter
+                                    ? t("contextNewerNotLoaded")
+                                    : t("contextLoaded")}
                             </div>
                           </div>
-                          {!readOnly && (
-                            <button
-                              type="button"
-                              className={classNames(
-                                "flex-shrink-0 text-xs font-semibold px-3 py-1.5 min-h-[36px] flex items-center rounded-full border transition-colors",
-                                isDark
-                                  ? "border-slate-600 text-slate-200 hover:bg-slate-800/60"
-                                  : "border-gray-200 text-gray-800 hover:bg-gray-100",
-                              )}
-                              onClick={exitChatWindow}
-                            >
-                              {t(hasChatFilter ? "returnToFilteredChat" : "returnToLatest")}
-                            </button>
-                          )}
+                          <button
+                            ref={windowReturnKeyRef}
+                            type="button"
+                            className={buttonVariants({ variant: "ghost", size: "sm" })}
+                            data-lcd-key
+                            onClick={(event) =>
+                              returnToLatest(
+                                event.detail === 0 ||
+                                  document.activeElement === event.currentTarget,
+                                hasChatFilter,
+                              )
+                            }
+                          >
+                            {t(hasChatFilter ? "returnToFilteredChat" : "returnToLatest")}
+                          </button>
                         </div>
                       </div>
                     )}
@@ -791,7 +1258,7 @@ export function ChatTab({
                 )}
 
                 <GroupWorkArea
-                  covered={showWorkspaceFileViewer}
+                  covered={chatCovered}
                   availableGroupIds={Object.keys(groupLabelById)}
                   readOnly={readOnly}
                   groupId={selectedGroupId}
@@ -808,61 +1275,77 @@ export function ChatTab({
                   sidePanelControls={
                     !selectedGroupId ? undefined : !isSmallScreen ? (
                       <>
+                        <ResourcePanelTrigger
+                          groupId={selectedGroupId}
+                          shown={resourcePanelVisible}
+                          onToggle={toggleResourcePanel}
+                        />
                         <WorkspaceFilesTrigger
-                          active={activeSidePanel === "files"}
-                          onToggle={() => selectSidePanel("files")}
+                          active={columnSurface === "files"}
+                          onToggle={() => selectColumnSurface("files")}
                         />
                         <PresentationTrigger
                           presentation={groupPresentation}
                           attentionSlots={presentationAttention}
                           isDark={isDark}
-                          isOpen={activeSidePanel === "presentation"}
-                          onOpen={() => selectSidePanel("presentation")}
+                          isOpen={columnSurface === "presentation"}
+                          onOpen={() => selectColumnSurface("presentation")}
                         />
                       </>
                     ) : !chatWindowProps ? (
-                      <PresentationTrigger
-                        mobile
-                        presentation={groupPresentation}
-                        attentionSlots={presentationAttention}
-                        isDark={isDark}
-                        isOpen={mobileSurface === "presentation"}
-                        onOpen={() => setChatMobileSurface(selectedGroupId, "presentation")}
-                      />
+                      // A phone's header keeps room for the Group title; its open resources
+                      // are listed in the menu instead.
+                      <>
+                        <PresentationTrigger
+                          mobile
+                          presentation={groupPresentation}
+                          attentionSlots={presentationAttention}
+                          isDark={isDark}
+                          isOpen={mobileSurface === "presentation"}
+                          onOpen={() => setChatMobileSurface(selectedGroupId, "presentation")}
+                        />
+                      </>
                     ) : undefined
                   }
                 >
                   {showMessageFilters && (
                     <div
-                      className="shrink-0 border-b border-[var(--glass-border-subtle)] px-4"
+                      className={classNames(
+                        "shrink-0 border-b border-[var(--glass-border-subtle)] px-4",
+                        overlayMobileChrome &&
+                          "absolute inset-x-0 z-20 transition-transform duration-150 motion-reduce:transition-none",
+                        reading.hidden && "pointer-events-none",
+                      )}
+                      style={
+                        overlayMobileChrome
+                          ? {
+                              top: MOBILE_APP_HEADER_HEIGHT_PX,
+                              transform: reading.hidden
+                                ? `translateY(-${MOBILE_READING_CHROME_HEIGHT_PX}px)`
+                                : undefined,
+                              backgroundColor: "var(--color-bg-primary)",
+                              backgroundImage:
+                                "linear-gradient(var(--color-chat-bg), var(--color-chat-bg))",
+                            }
+                          : undefined
+                      }
+                      inert={reading.hidden || undefined}
+                      aria-hidden={reading.hidden || undefined}
                       data-message-filters
                     >
                       <div
-                        className="chat-reading-width flex min-h-11 flex-wrap items-center gap-x-3"
+                        ref={messageFiltersRef}
+                        className="chat-reading-width flex min-h-[44px] md:min-h-9 flex-nowrap md:flex-wrap items-center gap-x-2"
                         role="group"
                         aria-label={t("chatFilters")}
                       >
-                        <div className="flex h-11 min-w-0 items-stretch gap-4 overflow-x-auto scrollbar-hide">
-                          {filterOptions.map(([key, label]) => {
-                            const active = chatFilter === key;
-                            return (
-                              <button
-                                key={key}
-                                type="button"
-                                className={classNames(
-                                  "shrink-0 px-0.5 text-[13px] leading-5 whitespace-nowrap transition-colors focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--color-text-secondary)]",
-                                  active
-                                    ? "font-semibold text-[var(--color-text-primary)] shadow-[inset_0_-2px_0_var(--color-text-primary)]"
-                                    : "font-medium text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)]",
-                                )}
-                                onClick={() => setChatFilter(key)}
-                                aria-pressed={active}
-                              >
-                                {label}
-                              </button>
-                            );
-                          })}
-                        </div>
+                        <ChatFilterTabs
+                          filter={chatFilter}
+                          onChange={setChatFilter}
+                          waiting={waitingIndicator}
+                          pinned={pinnedTabOffered ? { count: pinnedCount } : null}
+                          isSmallScreen={isSmallScreen}
+                        />
                         <ChatSenderFilter
                           value={chatSenderFilter}
                           actors={actors}
@@ -884,6 +1367,55 @@ export function ChatTab({
                           </button>
                         </div>
                       ) : null}
+                      {pinnedError ? (
+                        <div
+                          role="status"
+                          className="chat-reading-width flex items-center gap-2 pb-2 text-xs text-[var(--color-text-secondary)]"
+                        >
+                          <span>{t("pins.loadFailed")}</span>
+                          <button type="button" className="min-h-9 underline" onClick={retryPinned}>
+                            {t("common:retry")}
+                          </button>
+                        </div>
+                      ) : null}
+                      {pinnedUnavailable.length && toggleMessagePin ? (
+                        <div
+                          role="status"
+                          className="chat-reading-width flex items-center gap-2 pb-2 text-xs text-[var(--color-text-secondary)]"
+                        >
+                          <span>{t("pins.unavailable", { count: pinnedUnavailable.length })}</span>
+                          <button
+                            type="button"
+                            className="min-h-9 underline"
+                            onClick={() => {
+                              for (const id of pinnedUnavailable) void toggleMessagePin(id, false);
+                            }}
+                          >
+                            {t("pins.removeUnavailable")}
+                          </button>
+                        </div>
+                      ) : null}
+                      {pendingPageError ? (
+                        <div
+                          role="status"
+                          className="chat-reading-width flex items-center gap-2 pb-2 text-xs text-[var(--color-text-secondary)]"
+                        >
+                          <span>
+                            {t(
+                              pendingDaemonUnsupported
+                                ? "pendingReply.daemonUnsupported"
+                                : "pendingReply.loadFailed",
+                            )}
+                          </span>
+                          <button
+                            type="button"
+                            className="min-h-9 underline"
+                            onClick={retryPendingPage}
+                          >
+                            {t("common:retry")}
+                          </button>
+                        </div>
+                      ) : null}
                     </div>
                   )}
 
@@ -900,6 +1432,7 @@ export function ChatTab({
                             "w-full max-w-md",
                             isDark ? "text-slate-200" : "text-gray-800",
                           )}
+                          data-setup-checklist
                         >
                           {readOnly ? (
                             <div
@@ -907,6 +1440,7 @@ export function ChatTab({
                                 "text-sm",
                                 isDark ? "text-slate-400" : "text-gray-600",
                               )}
+                              data-status-tone="muted"
                             >
                               {t("noMessagesYet")}
                             </div>
@@ -935,75 +1469,190 @@ export function ChatTab({
                       readOnly={readOnly}
                       messages={chatMessages}
                     >
-                      <VirtualMessageList
-                        messages={chatMessages}
-                        actors={actors}
-                        agentStates={agentStates}
-                        taskById={taskById}
-                        isDark={isDark}
-                        readOnly={readOnly}
-                        groupId={selectedGroupId}
-                        groupLabelById={messageGroupLabelById}
-                        webModelDeliveryStatusByEventId={webModelDeliveryStatusByEventId}
-                        viewKey={chatViewKey}
-                        followOnViewChangeKey={chatViewKey}
-                        initialScrollTargetId={chatInitialScrollTargetId}
-                        initialScrollAnchorId={chatInitialScrollAnchorId}
-                        initialScrollAnchorOffsetPx={chatInitialScrollAnchorOffsetPx}
-                        initialScrollOffsetPx={chatInitialScrollOffsetPx}
-                        highlightEventId={chatHighlightEventId}
-                        scrollRef={scrollRef}
-                        onReply={startReply}
-                        onShowRecipients={showRecipients}
-                        onCopyLink={copyMessageLink}
-                        onCopyContent={copyMessageText}
-                        onViewContext={
-                          hasChatFilter && !chatWindowProps ? viewMessageContext : undefined
-                        }
-                        onRelay={relayMessage}
-                        onOpenSource={openSourceMessage}
-                        onOpenPresentationRef={openPresentationRef}
-                        onOpenTaskRef={openTaskRef}
-                        showScrollButton={showScrollButton}
-                        onScrollButtonClick={handleScrollButtonClick}
-                        chatUnreadCount={chatUnreadCount}
-                        sendScrollRequest={sendScrollRequest}
-                        onSendScrollRequestConsumed={consumeSendScrollRequest}
-                        onScrollChange={handleScrollChange}
-                        onScrollSnapshot={handleScrollSnapshot}
-                        isLoadingHistory={listIsLoadingHistory}
-                        hasMoreHistory={listHasMoreHistory}
-                        isFilteredEmpty={isFilteredEmptyState}
-                        onLoadMore={loadMoreHistory}
-                      />
+                      <PendingReplyEditingContext.Provider value={updateInlineReplyFocus}>
+                        <LivePendingStatusContext.Provider
+                          value={pendingActive ? null : livePendingStatuses}
+                        >
+                          <MessagePathContext.Provider value={messagePaths}>
+                            <VirtualMessageList
+                              messages={chatMessages}
+                              actors={actors}
+                              agentStates={agentStates}
+                              taskById={taskById}
+                              isDark={isDark}
+                              readOnly={readOnly}
+                              groupId={selectedGroupId}
+                              groupLabelById={messageGroupLabelById}
+                              webModelDeliveryStatusByEventId={webModelDeliveryStatusByEventId}
+                              viewKey={chatViewKey}
+                              topInsetPx={overlayMobileChrome ? MOBILE_READING_CHROME_HEIGHT_PX : 0}
+                              followOnViewChangeKey={projectionActive ? undefined : chatViewKey}
+                              initialScrollTargetId={
+                                projectionActive ? undefined : chatInitialScrollTargetId
+                              }
+                              // Waiting for you and Pinned open at their newest message unless given
+                              // a message to keep. A message given no height starts at the reading top.
+                              initialScrollAnchorId={
+                                projectionActive
+                                  ? chatInitialScrollAnchorId || chatMessages.at(-1)?.id
+                                  : chatInitialScrollAnchorId
+                              }
+                              initialScrollAnchorOffsetPx={
+                                chatInitialScrollAnchorOffsetPx ??
+                                getReadingTopAnchorOffset(
+                                  overlayMobileChrome ? MOBILE_READING_CHROME_HEIGHT_PX : 0,
+                                )
+                              }
+                              initialScrollOffsetPx={chatInitialScrollOffsetPx}
+                              highlightInitialScrollAnchor={chatInitialScrollHighlight}
+                              highlightEventId={chatHighlightEventId}
+                              liveJumpActive={liveJumpActive}
+                              contextWindow={!!chatWindowProps}
+                              className={
+                                // Room to scroll the last message clear of the members over the
+                                // list. It stays while reading hides them, so hiding them never
+                                // moves the list, and goes only for a keyboard (chatMessage.css).
+                                !chatWindowProps && runtimeActors.length > 0 && !hideDockForKeyboard
+                                  ? classNames(
+                                      "chat-list-over-dock",
+                                      !reading.hidden && "chat-dock-shown",
+                                    )
+                                  : undefined
+                              }
+                              scrollRef={scrollRef}
+                              onReply={startReply}
+                              onShowRecipients={showRecipients}
+                              onCopyLink={copyMessageLink}
+                              onTogglePin={toggleMessagePin}
+                              onViewContext={
+                                hasChatFilter && !chatWindowProps ? showInConversation : undefined
+                              }
+                              onRelay={relayMessage}
+                              onOpenSource={openSourceMessage}
+                              onOpenPresentationRef={openPresentationRef}
+                              onOpenTaskRef={openTaskRef}
+                              // The jump key floats over the list's corner; while an answer is being
+                              // written it would cover that card's send key, so it waits.
+                              showScrollButton={
+                                showScrollButton &&
+                                !(pendingActive && isSmallScreen) &&
+                                inlineReplyEditor === null
+                              }
+                              onScrollButtonClick={handleScrollButtonClick}
+                              chatUnreadCount={chatUnreadCount}
+                              sendScrollRequest={sendScrollRequest}
+                              onSendScrollRequestConsumed={consumeSendScrollRequest}
+                              onScrollChange={handleScrollChange}
+                              onContextReady={onContextReady}
+                              onReachedContextEnd={onReachedContextEnd}
+                              onLoadNewerContext={onLoadNewerContext}
+                              isLoadingNewerContext={chatWindowProps?.isLoadingAfter}
+                              newerContextError={chatWindowProps?.afterError}
+                              onScrollSnapshot={handleScrollSnapshot}
+                              isLoadingHistory={listIsLoadingHistory}
+                              hasMoreHistory={listHasMoreHistory}
+                              hasActiveFilters={hasChatFilter && !chatWindowProps}
+                              isFilteredEmpty={isFilteredEmptyState}
+                              emptyMessage={
+                                !selectedGroupId
+                                  ? t(
+                                      readOnly
+                                        ? "noGroupSelectedReadOnly"
+                                        : canCreateGroup
+                                          ? "noGroupSelected"
+                                          : "noGroupSelectedNoCreate",
+                                    )
+                                  : pendingActive
+                                    ? t(
+                                        pendingDaemonUnsupported
+                                          ? "pendingReply.daemonUnsupported"
+                                          : pendingPageError
+                                            ? "pendingReply.loadFailed"
+                                            : "pendingReply.empty",
+                                      )
+                                    : pinnedActive && pinnedEmpty
+                                      ? t(pinnedEmpty)
+                                      : undefined
+                              }
+                              onLoadMore={loadMoreHistory}
+                            />
+                          </MessagePathContext.Provider>
+                        </LivePendingStatusContext.Provider>
+                      </PendingReplyEditingContext.Provider>
                     </MessageSelection>
                   )}
 
                   {!chatWindowProps && runtimeActors.length > 0 ? (
-                    <div
-                      className="relative z-10 shrink-0 border-t border-[var(--glass-border-subtle)] pb-1"
-                      data-runtime-dock-row
-                    >
-                      <RuntimeDock
-                        groupId={selectedGroupId}
-                        runtimeActors={runtimeActors}
-                        liveWorkCards={liveWorkCards}
-                        activeRuntimeActorId={activeRuntimeActorId}
-                        isDark={isDark}
-                        isSmallScreen={isSmallScreen}
-                        readOnly={readOnly}
-                        actorStatusProvisional={selectedGroupActorStatusProvisional}
-                        onAddAgent={!readOnly ? addAgent : undefined}
-                        onOpenRuntimeActor={onOpenRuntimeActor}
-                      />
-                    </div>
+                    !isSmallScreen && workView === "messages" ? (
+                      // Only the member controls catch input. The list keeps its full
+                      // viewport and can scroll its final message above this overlay; text
+                      // passing under it fades out behind the members' keys (chatMessage.css).
+                      <div
+                        className={classNames(
+                          "pointer-events-none absolute inset-x-0 bottom-0 z-20 px-2 sm:px-4",
+                          // A touch screen's keyboard leaves little height; the input needs it.
+                          hideDockForKeyboard && "hidden",
+                        )}
+                      >
+                        <div className="chat-reading-width">
+                          <div className="chat-dock-fade">
+                            <RuntimeDock
+                              placement="row"
+                              motionVisible={!hideDockForKeyboard}
+                              groupId={selectedGroupId}
+                              runtimeActors={runtimeActors}
+                              liveWorkCards={liveWorkCards}
+                              activeRuntimeActorId={activeRuntimeActorId}
+                              isDark={isDark}
+                              isSmallScreen={isSmallScreen}
+                              readOnly={readOnly}
+                              actorStatusProvisional={selectedGroupActorStatusProvisional}
+                              onAddAgent={!readOnly ? addAgent : undefined}
+                              onOpenRuntimeActor={onOpenRuntimeActor}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div
+                        className={classNames(
+                          "pointer-events-none absolute inset-x-0 z-20",
+                          // On a phone the dock floats over the message list; elsewhere it
+                          // floats over the work area's panes, which keep their own ground.
+                          isSmallScreen ? "bottom-0" : "bottom-2",
+                          (hideDockForKeyboard || reading.hidden) && "hidden",
+                        )}
+                        data-runtime-dock-keyboard-hidden={hideDockForKeyboard || undefined}
+                      >
+                        {/* Hidden by display, its rings restart on return; this lets them
+                            take the shared phase again instead of their old offsets. */}
+                        <div
+                          ref={setDockFade}
+                          className={isSmallScreen ? "chat-dock-fade" : undefined}
+                        >
+                          <RuntimeDock
+                            motionVisible={!(hideDockForKeyboard || reading.hidden)}
+                            groupId={selectedGroupId}
+                            runtimeActors={runtimeActors}
+                            liveWorkCards={liveWorkCards}
+                            activeRuntimeActorId={activeRuntimeActorId}
+                            isDark={isDark}
+                            isSmallScreen={isSmallScreen}
+                            readOnly={readOnly}
+                            actorStatusProvisional={selectedGroupActorStatusProvisional}
+                            onAddAgent={!readOnly ? addAgent : undefined}
+                            onOpenRuntimeActor={onOpenRuntimeActor}
+                          />
+                        </div>
+                      </div>
+                    )
                   ) : null}
                 </GroupWorkArea>
 
                 {/* `--color-chat-bg` is a 75% glass tint, so it alone would let the chat
                   underneath show through. The overlay composites it over the opaque page
                   background to match the chat surface exactly while staying fully opaque. */}
-                {showWorkspaceFileViewer ? (
+                {showChangesViewer ? (
                   <div
                     className="absolute inset-0 z-20 flex min-h-0 flex-col"
                     style={{
@@ -1015,7 +1664,7 @@ export function ChatTab({
                   >
                     <Suspense fallback={<ChatLazyFallback className="flex-1" />}>
                       <WorkspaceViewer
-                        files={workspaceFiles}
+                        files={viewerWorkspaceFiles}
                         isDark={isDark}
                         readOnly={!!readOnly}
                         onAttach={attachWorkspacePath}
@@ -1027,170 +1676,208 @@ export function ChatTab({
               {!readOnly && (
                 <>
                   {showAppPermissionNotice ? (
-                    <ChatGptAppPermissionNotice
-                      isDark={isDark}
-                      onDismiss={dismissAppPermissionNotice}
+                    <ChatGptAppPermissionNotice onDismiss={dismissAppPermissionNotice} />
+                  ) : null}
+                  {notificationOffer.visible && !hideDockForKeyboard ? (
+                    <NotificationPrompt
+                      onDismiss={notificationOffer.dismiss}
+                      restoreFocus={focusActiveFilter}
                     />
                   ) : null}
-                  <ChatComposer
-                    isDark={isDark}
-                    isSmallScreen={isSmallScreen}
-                    selectedGroupId={selectedGroupId}
-                    actors={actors}
-                    recipientActorsBusy={recipientActorsBusy}
-                    selectedGroupActorsHydrating={selectedGroupActorsHydrating}
-                    destGroupId={destGroupId}
-                    setDestGroupId={setDestGroupId}
-                    composerGroupSettled={composerGroupSettled}
-                    composerRouteGroups={composerRouteGroups}
-                    destGroupScopeLabel={destGroupScopeLabel}
-                    busy={busy}
-                    recentMessages={chatMessages}
-                    suggestionSourceMessages={suggestionSourceMessages}
-                    replyTarget={replyTarget}
-                    onCancelReply={cancelReply}
-                    quotedPresentationRef={quotedPresentationRef}
-                    onClearQuotedPresentationRef={clearQuotedPresentationRef}
-                    quotedVoiceDocumentRef={quotedVoiceDocumentRef}
-                    onQuoteVoiceDocumentRef={handleQuoteVoiceDocumentReference}
-                    onClearQuotedVoiceDocumentRef={clearQuotedVoiceDocumentRef}
-                    toTokens={toTokens}
-                    onToggleRecipient={toggleRecipient}
-                    onClearRecipients={clearRecipients}
-                    composerFiles={composerFiles}
-                    onRemoveComposerFile={removeComposerFile}
-                    appendComposerFiles={appendComposerFiles}
-                    fileInputRef={fileInputRef}
-                    composerRef={composerRef}
-                    setComposerText={setComposerText}
-                    composerGroupMentionTokens={composerGroupMentionTokens}
-                    setComposerGroupMentionTokens={setComposerGroupMentionTokens}
-                    composerAgentMentionTokens={composerAgentMentionTokens}
-                    setComposerAgentMentionTokens={setComposerAgentMentionTokens}
-                    messageMode={messageMode}
-                    setMessageMode={setMessageMode}
-                    onSendMessage={sendMessage}
-                    showMentionMenu={showMentionMenu}
-                    setShowMentionMenu={setShowMentionMenu}
-                    mentionSuggestions={mentionSuggestions}
-                    connectMentionStatus={
-                      mentionKind === "group" ? connectMentionStatus : undefined
-                    }
-                    mentionSelectedIndex={mentionSelectedIndex}
-                    setMentionSelectedIndex={setMentionSelectedIndex}
-                    setMentionFilter={setMentionFilter}
-                    setMentionKind={setMentionKind}
-                    setMentionActorScope={setMentionActorScope}
-                    setMentionTargetGroupId={setMentionTargetGroupId}
-                    slashCommands={slashCommands}
-                  />
+                  {selectedGroupId ? (
+                    <ChatComposer
+                      isDark={isDark}
+                      isSmallScreen={isSmallScreen}
+                      keepExpanded={mobileAppHeaderReserved}
+                      selectedGroupId={selectedGroupId}
+                      actors={actors}
+                      recipientActorsBusy={recipientActorsBusy}
+                      selectedGroupActorsHydrating={selectedGroupActorsHydrating}
+                      destGroupId={destGroupId}
+                      setDestGroupId={setDestGroupId}
+                      composerGroupSettled={composerGroupSettled}
+                      composerRouteGroups={composerRouteGroups}
+                      destGroupScopeLabel={destGroupScopeLabel}
+                      busy={busy}
+                      sendInFlight={sendInFlight}
+                      uploadInFlight={uploadInFlight}
+                      onStopUploadWaiting={stopUploadWaiting}
+                      recentMessages={chatMessages}
+                      suggestionSourceMessages={suggestionSourceMessages}
+                      replyTarget={replyTarget}
+                      onCancelReply={cancelReply}
+                      quotedPresentationRef={quotedPresentationRef}
+                      onClearQuotedPresentationRef={clearQuotedPresentationRef}
+                      quotedVoiceDocumentRef={quotedVoiceDocumentRef}
+                      onQuoteVoiceDocumentRef={handleQuoteVoiceDocumentReference}
+                      onClearQuotedVoiceDocumentRef={clearQuotedVoiceDocumentRef}
+                      toTokens={toTokens}
+                      unavailableRecipients={unavailableRecipients}
+                      onToggleRecipient={toggleRecipient}
+                      onClearRecipients={clearRecipients}
+                      composerFiles={composerFiles}
+                      onRemoveComposerFile={removeComposerFile}
+                      appendComposerFiles={appendComposerFiles}
+                      fileInputRef={fileInputRef}
+                      composerRef={composerRef}
+                      setComposerText={setComposerText}
+                      composerGroupMentionTokens={composerGroupMentionTokens}
+                      setComposerGroupMentionTokens={setComposerGroupMentionTokens}
+                      composerAgentMentionTokens={composerAgentMentionTokens}
+                      setComposerAgentMentionTokens={setComposerAgentMentionTokens}
+                      messageMode={messageMode}
+                      setMessageMode={setMessageMode}
+                      onSendMessage={sendMessage}
+                      showMentionMenu={showMentionMenu}
+                      setShowMentionMenu={setShowMentionMenu}
+                      mentionSuggestions={mentionSuggestions}
+                      connectMentionStatus={
+                        mentionKind === "group" ? connectMentionStatus : undefined
+                      }
+                      mentionSelectedIndex={mentionSelectedIndex}
+                      setMentionSelectedIndex={setMentionSelectedIndex}
+                      setMentionFilter={setMentionFilter}
+                      setMentionKind={setMentionKind}
+                      setMentionActorScope={setMentionActorScope}
+                      setMentionTargetGroupId={setMentionTargetGroupId}
+                      setMentionTriggerIndex={setMentionTriggerIndex}
+                      slashCommands={slashCommands}
+                    />
+                  ) : (
+                    // With no Group open there is no composer, but sends waiting to be restored
+                    // still need a place to be seen and discarded.
+                    <div className="flex-shrink-0 px-2 pb-2 sm:px-4">
+                      <div className="chat-reading-width">
+                        <ComposerFailedSends groupId="" isDark={isDark} />
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             </section>
           ) : null}
 
-          {showSplitSurface && activeSidePanel ? (
+          {showSplitSurface && columnSurface ? (
             <ResizableSidePanel
               groupId={selectedGroupId}
-              surface={activeSidePanel}
-              viewing={!!splitPresentationViewer}
+              surface={columnSurface}
               container={splitLayoutRef}
               isDark={isDark}
             >
-              {({ compact, toggleCompact }) =>
-                showSplitFiles ? (
-                  <Suspense fallback={<ChatLazyFallback className="flex-1" />}>
-                    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-                      <WorkspaceFilesPanel
-                        files={workspaceFiles}
-                        isDark={isDark}
-                        readOnly={!!readOnly}
-                        // Routed through the selector so closing clears the column instead of
-                        // letting the other surface pop up in its place.
-                        onClose={() => selectSidePanel("files")}
-                        onAttachPath={attachWorkspacePath}
-                        onPinPath={pinWorkspacePath}
-                      />
-                    </div>
-                  </Suspense>
-                ) : splitPresentationViewer && !compact ? (
-                  <Suspense fallback={<ChatLazyFallback className="flex-1" />}>
-                    <PresentationViewerSplitPanel
-                      key={`${selectedGroupId}:${splitPresentationViewer.slotId}`}
-                      isDark={isDark}
-                      readOnly={readOnly}
-                      groupId={selectedGroupId}
-                      slotId={splitPresentationViewer.slotId}
-                      presentation={groupPresentation}
-                      focusRef={splitPresentationViewer.focusRef || null}
-                      focusEventId={splitPresentationViewer.focusEventId || null}
-                      onQuoteInChat={handleQuotePresentationReference}
-                      onReplaceSlot={handleSplitReplaceSlot}
-                      onClearSlot={(slotId) => {
-                        void handleSplitClearSlot(slotId);
-                      }}
-                      onOpenWindow={handleOpenPresentationWindow}
-                      onSelectSlot={(slotId) =>
-                        setPresentationViewer({
-                          groupId: selectedGroupId,
-                          slotId,
-                          surface: "split",
-                        })
-                      }
-                      onPinSlot={pinPresentationSlot}
-                      onCollapse={() => {
-                        toggleCompact();
-                        requestAnimationFrame(() =>
-                          document
-                            .querySelector<HTMLButtonElement>(
-                              '[data-presentation-density="compact"] button',
-                            )
-                            ?.focus(),
-                        );
-                      }}
-                      onClose={() => selectSidePanel("presentation")}
+              {({ compact, toggleCompact }) => (
+                <>
+                  {columnSurface === "resources" ? (
+                    // The docked panel is mounted once and laid over this slot; it never moves
+                    // into the column, because moving an iframe reloads it.
+                    <div
+                      ref={setResourceColumnSlot}
+                      className="flex min-h-0 min-w-0 flex-1"
+                      data-resource-panel-slot
                     />
-                  </Suspense>
-                ) : (
-                  // Presentation with no slot opened: the slot list that phones already use.
-                  <Suspense fallback={<ChatLazyFallback className="flex-1" />}>
-                    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-                      <PresentationRail
-                        groupId={selectedGroupId}
-                        compact={compact}
-                        onToggleCompact={() => {
-                          toggleCompact();
-                          if (compact) {
-                            const slots = ensurePresentation(groupPresentation);
-                            const slot =
-                              slots.slots.find(
-                                (item) => item.slot_id === slots.highlight_slot_id && item.card,
-                              ) || slots.slots.find((item) => item.card);
-                            if (slot)
-                              setPresentationViewer({
-                                groupId: selectedGroupId,
-                                slotId: slot.slot_id,
-                                surface: "split",
-                              });
-                          }
-                        }}
-                        presentation={groupPresentation}
-                        isDark={isDark}
-                        readOnly={readOnly}
-                        attentionSlots={presentationAttention}
-                        onOpenSlot={openPresentationSlot}
-                        onPinSlot={pinPresentationSlot}
-                        onClose={() => selectSidePanel("presentation")}
-                      />
+                  ) : null}
+                  {activeSidePanel === "files" ? (
+                    // The tree stays mounted under a panel docked over the column, so coming back
+                    // to it finds the same scroll position and typed path. The wrapper hides the
+                    // loading placeholder too.
+                    <div
+                      className="flex min-h-0 min-w-0 flex-1 flex-col"
+                      hidden={columnSurface === "resources"}
+                    >
+                      <Suspense fallback={<ChatLazyFallback className="flex-1" />}>
+                        <WorkspaceFilesPanel
+                          files={panelWorkspaceFiles}
+                          isDark={isDark}
+                          readOnly={!!readOnly}
+                          // Routed through the selector so closing clears the column instead of
+                          // letting the other surface pop up in its place.
+                          onClose={() => selectSidePanel("files")}
+                          onAttachPath={attachWorkspacePath}
+                          onPinPath={pinWorkspacePath}
+                        />
+                      </Suspense>
                     </div>
-                  </Suspense>
-                )
-              }
+                  ) : columnSurface === "presentation" ? (
+                    // Presentation: the slot list that phones already use; a slot opens as a tab.
+                    <Suspense fallback={<ChatLazyFallback className="flex-1" />}>
+                      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+                        <PresentationRail
+                          groupId={selectedGroupId}
+                          compact={compact}
+                          onToggleCompact={toggleCompact}
+                          presentation={groupPresentation}
+                          isDark={isDark}
+                          readOnly={readOnly}
+                          attentionSlots={presentationAttention}
+                          onOpenSlot={openPresentationSlot}
+                          onPinSlot={pinPresentationSlot}
+                          onClose={() => selectSidePanel("presentation")}
+                        />
+                      </div>
+                    </Suspense>
+                  ) : null}
+                </>
+              )}
             </ResizableSidePanel>
           ) : null}
 
+          {!isSmallScreen &&
+          selectedGroupId &&
+          (resourcePanel.tabs.length > 0 || resourcePanel.open) ? (
+            <Suspense fallback={null}>
+              <ResourcePanel
+                key={selectedGroupId}
+                groupId={selectedGroupId}
+                dock={resourcePanelDock}
+                visible={resourcePanelDock === "right" || workView !== "terminals"}
+                slot={resourcePanelDock === "right" ? resourceColumnSlot : chatWorkSurface}
+                container={splitLayoutRef}
+                files={panelWorkspaceFiles}
+                scopeReady={workspaceScopeReady}
+                isDark={isDark}
+                readOnly={!!readOnly}
+                presentation={resourcePresentation}
+                onLocateMessage={locateMessageFromPanel}
+                onAttachPath={attachWorkspacePath}
+                onRestore={restoreResourceEntry}
+                // Files or Presentation in the right column comes back when the last tab closes,
+                // as when the panel collapses; otherwise the empty panel waits for the next one.
+                onEmptied={activeSidePanel ? closeResourcePanel : undefined}
+              />
+            </Suspense>
+          ) : null}
+
           <MobilePresentationSurface
-            isOpen={showMobileFiles}
+            isOpen={isSmallScreen && resourcePanelExpanded}
+            keepMounted={isSmallScreen && !!selectedGroupId && resourcePanel.tabs.length > 0}
+            isDark={isDark}
+            surface="resources"
+            label={t("resourcePanel.tabs")}
+            onClose={closeResourcePanel}
+          >
+            <Suspense fallback={<ChatLazyFallback className="flex-1" />}>
+              <ResourcePanel
+                key={selectedGroupId}
+                groupId={selectedGroupId}
+                dock={resourceDock}
+                layout="phone"
+                visible={resourcePanelExpanded}
+                slot={null}
+                container={splitLayoutRef}
+                files={panelWorkspaceFiles}
+                scopeReady={workspaceScopeReady}
+                isDark={isDark}
+                readOnly
+                presentation={resourcePresentation}
+                onLocateMessage={locateMessageFromPanel}
+                onAttachPath={attachWorkspacePath}
+                onEmptied={closeResourcePanel}
+              />
+            </Suspense>
+          </MobilePresentationSurface>
+
+          <MobilePresentationSurface
+            isOpen={showMobileFiles && !resourcePanelExpanded}
+            keepMounted={showMobileFiles}
             isDark={isDark}
             surface="files"
             label={t("workspaceFilesTitle", { defaultValue: "Files" })}
@@ -1198,9 +1885,9 @@ export function ChatTab({
           >
             <Suspense fallback={<ChatLazyFallback className="flex-1" />}>
               <div className="flex min-h-0 flex-1 flex-col">
-                {hasWorkspaceViewer ? (
+                {workspaceFiles.mode === "changes" && workspaceFiles.changes.selection ? (
                   <WorkspaceViewer
-                    files={workspaceFiles}
+                    files={viewerWorkspaceFiles}
                     isDark={isDark}
                     readOnly
                     onAttach={(path) => {
@@ -1210,7 +1897,7 @@ export function ChatTab({
                   />
                 ) : (
                   <WorkspaceFilesPanel
-                    files={workspaceFiles}
+                    files={panelWorkspaceFiles}
                     isDark={isDark}
                     readOnly
                     onClose={closeMobileFiles}
@@ -1226,8 +1913,12 @@ export function ChatTab({
 
           <MobilePresentationSurface
             isOpen={
-              isSmallScreen && mobileSurface === "presentation" && !showMobilePresentationViewer
+              isSmallScreen &&
+              mobileSurface === "presentation" &&
+              !showMobilePresentationViewer &&
+              !resourcePanelExpanded
             }
+            keepMounted={isSmallScreen && mobileSurface === "presentation"}
             isDark={isDark}
             label={t("presentationSectionLabel", { defaultValue: "Presentation" })}
             onClose={closeMobilePresentation}
@@ -1247,6 +1938,14 @@ export function ChatTab({
               </Suspense>
             </div>
           </MobilePresentationSurface>
+
+          {selectedGroupId ? (
+            <AttachmentLightbox
+              groupId={selectedGroupId}
+              isDark={isDark}
+              canOpenInPanel={!isSmallScreen}
+            />
+          ) : null}
         </div>
       </main>
     </div>

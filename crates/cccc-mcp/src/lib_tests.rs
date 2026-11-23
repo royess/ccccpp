@@ -3,6 +3,127 @@ use std::collections::BTreeSet;
 use serde_json::json;
 
 #[tokio::test]
+async fn unavailable_process_observation_does_not_break_stdio_initialization() {
+    const MARKER: &str = "CCCC_TEST_OPTIONAL_MCP_OBSERVATION";
+    if let Some(root) = std::env::var_os(MARKER) {
+        let home = cccc_core::HomeLayout::from_path(std::path::PathBuf::from(root)).expect("home");
+        crate::run_stdio_loop(&home, None, None)
+            .await
+            .expect("stdio stays usable");
+        return;
+    }
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let temp = tempfile::tempdir().expect("isolated MCP state");
+    let home = temp.path().join("home");
+    let provider = temp.path().join("provider");
+    std::fs::create_dir(&provider).expect("provider home");
+    let mut child = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "lib_tests::unavailable_process_observation_does_not_break_stdio_initialization",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("HOME", &provider)
+        .env("CODEX_HOME", provider.join("codex"))
+        .env("CLAUDE_CONFIG_DIR", provider.join("claude"))
+        .env("CCCC_HOME", &home)
+        .env(MARKER, &home)
+        .env(
+            "CCCC_MCP_BINDING_FILE",
+            temp.path().join("missing-binding.json"),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("isolated stdio fixture");
+    let mut input = child.stdin.take().expect("fixture input");
+    for request in [
+        json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"isolated-test","version":"1"}}}),
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}),
+    ] {
+        writeln!(input, "{request}").expect("write request");
+    }
+    drop(input);
+    let output = child.wait_with_output().expect("fixture output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|line| {
+            line.find("{\"")
+                .and_then(|start| serde_json::from_str(&line[start..]).ok())
+        })
+        .collect();
+    assert_eq!(responses.len(), 2, "{stdout}\n{stderr}");
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[1]["id"], 2);
+    assert!(responses[0]["result"]["serverInfo"].is_object(), "{stdout}");
+    assert!(
+        !responses[1]["result"]["tools"]
+            .as_array()
+            .expect("usable tools")
+            .is_empty()
+    );
+    assert!(stderr.contains("tool-process observation unavailable"));
+    assert!(!home.join("daemon/ccccd.addr.json").exists());
+}
+
+/// An embedded daemon installs a process-wide ownership guard. Run each
+/// fixture in a child so its temporary home cannot poison unrelated tests.
+pub(crate) fn isolate_embedded_daemon_test(qualified_name: &str) -> bool {
+    const MARKER: &str = "CCCC_TEST_MCP_EMBEDDED_DAEMON_CHILD";
+    let name = qualified_name
+        .split_once("::")
+        .map(|(_, name)| name)
+        .expect("qualified test name");
+    if std::env::var(MARKER).as_deref() == Ok(name) {
+        return false;
+    }
+    let temp = tempfile::tempdir().expect("isolated fixture environment");
+    let provider_home = temp.path().join("provider-home");
+    std::fs::create_dir_all(&provider_home).expect("provider home");
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(MARKER, name)
+        .env("HOME", &provider_home)
+        .env("CCCC_HOME", temp.path().join("cccc-home"))
+        .env("CODEX_HOME", temp.path().join("codex"))
+        .env("CLAUDE_CONFIG_DIR", temp.path().join("claude"))
+        .env("GROK_HOME", temp.path().join("grok"))
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_DATA_HOME", temp.path().join("data"))
+        .env_remove("GROK_AUTH_PATH")
+        .env_remove("CCCC_CODEX_AUTH_PATH")
+        .env_remove("CCCC_LAUNCHER_PATH")
+        .output()
+        .expect("run isolated daemon fixture");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success()
+            && stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed;")),
+        "isolated test {name} failed or did not run:\n{stdout}\n{stderr}"
+    );
+    true
+}
+
+#[test]
+fn isolated_daemon_fixture_rejects_a_missing_test() {
+    let error = std::panic::catch_unwind(|| {
+        isolate_embedded_daemon_test("cccc_mcp::a_test_that_does_not_exist")
+    })
+    .expect_err("an empty child run must not pass");
+    let message = error.downcast_ref::<String>().expect("failure message");
+    assert!(message.contains("failed or did not run"));
+}
+
+#[tokio::test]
 async fn secretary_stdio_exposes_only_its_task_tool_and_rejects_target_overrides() {
     const ENV: &str = "CCCC_SECRETARY_MCP_FIXTURE";
     if std::env::var_os(ENV).is_none() {
@@ -21,6 +142,8 @@ async fn secretary_stdio_exposes_only_its_task_tool_and_rejects_target_overrides
     let temp = tempfile::tempdir().expect("temp");
     let home = cccc_core::HomeLayout::from_path(temp.path().join("home")).expect("home");
     home.initialize().expect("init");
+    let initialized = crate::handle_request(&home, &json!({"id":0,"method":"initialize"})).await;
+    assert!(initialized["result"].get("instructions").is_none());
     let tools = crate::handle_request(&home, &json!({"id":1,"method":"tools/list"})).await;
     let list = tools["result"]["tools"].as_array().expect("tools");
     assert_eq!(list.len(), 1);
@@ -126,8 +249,15 @@ async fn initialize_truthfully_disables_tool_list_change_notifications() {
         false
     );
     assert_eq!(
-        response["result"]["_meta"]["cccc/build"],
-        cccc_core::build_info::current()
+        response["result"]["instructions"],
+        crate::CAPABILITY_INSTRUCTIONS
+    );
+    assert!(crate::CAPABILITY_INSTRUCTIONS.chars().count() <= 512);
+    assert!(
+        response["result"]["_meta"]["cccc/build"]
+            .get("source_id")
+            .is_none(),
+        "library initialize must not invent an executable source identity"
     );
 }
 
@@ -204,6 +334,13 @@ async fn protocol_and_tool_execution_errors_use_distinct_envelopes() {
 
 #[tokio::test]
 async fn daemon_error_details_survive_the_native_mcp_boundary() {
+    if crate::lib_tests::isolate_embedded_daemon_test(concat!(
+        module_path!(),
+        "::",
+        "daemon_error_details_survive_the_native_mcp_boundary"
+    )) {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let home = cccc_core::HomeLayout::from_path(temp.path().join("home")).expect("home");
     let store = cccc_core::GroupStore::new(home.clone()).expect("store");
@@ -290,7 +427,108 @@ async fn daemon_error_details_survive_the_native_mcp_boundary() {
 }
 
 #[tokio::test]
+async fn automation_run_now_reaches_the_daemon_with_the_bound_actor() {
+    if crate::lib_tests::isolate_embedded_daemon_test(concat!(
+        module_path!(),
+        "::",
+        "automation_run_now_reaches_the_daemon_with_the_bound_actor"
+    )) {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("isolated automation home");
+    let home = cccc_core::HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let store = cccc_core::GroupStore::new(home.clone()).expect("store");
+    let mut group = store.create("automation MCP", "").expect("group");
+    group.state = cccc_contracts::GroupState::Idle;
+    for id in ["lead", "peer"] {
+        let mut actor = cccc_contracts::Actor::new(id);
+        // The fake native session prevents the fixture from launching a provider.
+        actor.external_session_id = format!("fixture-{id}");
+        cccc_core::actors::add(&mut group, actor).expect("add actor");
+    }
+    group.automation = json!({"version":7,"rules":[{
+        "id":"team","enabled":false,"scope":"group","to":["lead"],
+        "trigger":{"kind":"interval","every_seconds":3600,"max_runs":1},
+        "action":{"kind":"notify","message":"check in"}
+    }]})
+    .as_object()
+    .expect("automation")
+    .clone();
+    store.save(&group).expect("save group");
+
+    let daemon_home = home.clone();
+    let daemon_task = tokio::spawn(async move { cccc_daemon::run(daemon_home).await });
+    let client = cccc_client::DaemonClient::new(home.clone());
+    let mut ready = false;
+    for _ in 0..100 {
+        if client
+            .call(&cccc_contracts::DaemonRequest {
+                v: 1,
+                op: "group_list".into(),
+                args: serde_json::Map::new(),
+            })
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(ready, "isolated daemon did not start");
+
+    let call = |action: &str| {
+        json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"cccc_capability_use","arguments":{
+                "tool_name":"cccc_automation",
+                "tool_arguments":{"action":action,"rule_id":"team","expected_version":7,"by":"user"}
+            }}
+        })
+    };
+    let response =
+        crate::handle_request_for_actor(&home, &call("run_now"), &group.group_id, "lead").await;
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["tool_called"], true, "{response}");
+    assert_eq!(result["tool_result"]["notified"], json!(["lead"]));
+    assert!(result["tool_result"]["run_at"].is_string());
+
+    let status =
+        crate::handle_request_for_actor(&home, &call("state"), &group.group_id, "lead").await;
+    let rules = &status["result"]["structuredContent"]["tool_result"];
+    assert_eq!(rules["version"], 7, "{status}");
+    assert_eq!(rules["status"]["team"]["last_run_kind"], "manual");
+    assert_eq!(rules["status"]["team"]["fired_count"], 0);
+    assert_eq!(rules["ruleset"]["rules"][0]["enabled"], false);
+
+    // A peer cannot turn the nested model-supplied `by` into user authority.
+    let denied =
+        crate::handle_request_for_actor(&home, &call("run_now"), &group.group_id, "peer").await;
+    assert_eq!(denied["result"]["isError"], true, "{denied}");
+    assert_eq!(
+        denied["result"]["structuredContent"]["error"]["code"],
+        "permission_denied"
+    );
+    let events = cccc_core::ledger::read_all(&store.ledger_path(&group.group_id).expect("ledger"))
+        .expect("events");
+    let notifications = events
+        .iter()
+        .filter(|event| event.kind == "system.notify")
+        .collect::<Vec<_>>();
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications[0].data["context"]["run_kind"], "manual");
+    daemon_task.abort();
+}
+
+#[tokio::test]
 async fn daemon_error_details_survive_nested_code_mode_calls() {
+    if crate::lib_tests::isolate_embedded_daemon_test(concat!(
+        module_path!(),
+        "::",
+        "daemon_error_details_survive_nested_code_mode_calls"
+    )) {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let home = cccc_core::HomeLayout::from_path(temp.path().join("home")).expect("home");
     let store = cccc_core::GroupStore::new(home.clone()).expect("store");
@@ -367,6 +605,7 @@ fn unscoped_fallback_includes_the_connect_directory() {
         .collect::<BTreeSet<_>>();
     let expected = [
         "cccc_agent_state",
+        "cccc_backlog",
         "cccc_bootstrap",
         "cccc_capability_search",
         "cccc_capability_use",
@@ -465,6 +704,8 @@ async fn secretary_profile_without_a_grant_never_falls_back_to_user_tools() {
     let temp = tempfile::tempdir().expect("temp");
     let home = cccc_core::HomeLayout::from_path(temp.path()).expect("home");
     home.initialize().expect("init");
+    let initialized = crate::handle_request(&home, &json!({"id":0,"method":"initialize"})).await;
+    assert!(initialized["result"].get("instructions").is_none());
     let tools = crate::handle_request(&home, &json!({"id":1,"method":"tools/list"})).await;
     assert!(
         tools["result"]["tools"]

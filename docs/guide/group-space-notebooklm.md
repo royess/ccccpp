@@ -15,7 +15,7 @@ Actual NotebookLM operations such as query, ingest, source management, artifacts
 Connecting Google in CCCC Web stores the provider credential and activates the
 real NotebookLM path. CCCC does not require an environment toggle.
 
-If you expose Web outside localhost, first create an **Admin Access Token** in **Settings > Web Access** and keep the service behind a network boundary until that token exists.
+If you expose Web outside localhost, first create an **Admin Access Token** in **Settings > This instance > Web Access** and keep the service behind a network boundary until that token exists.
 
 ## 2. Open Notebook Settings
 
@@ -61,7 +61,8 @@ In **Memory Notebook**:
 1. Choose an existing notebook from the selector, or
 2. Click **Create and bind new**.
 
-Use `Memory Notebook` for finalized memory recall.
+Use `Memory Notebook` to query an existing notebook. CCCC no longer creates or
+automatically synchronizes Group memory files to it.
 
 Expected result:
 
@@ -127,8 +128,11 @@ Homes upgraded from Python 0.4.35 may still contain these legacy status files:
 
 The native Rust adapter follows the `notebooklm-py` v0.8.1 protocol baseline for
 the current personal-app host, source requests, artifact status values, and
-audio output format. It supports attached-scope local files, pasted text, Web
-URL, YouTube, and Google Drive Docs/Slides/Sheets ingestion.
+audio output format. How it classifies refused requests and exhausted chat
+quota, which streamed chunk it takes as the chat answer, and how it maps
+artifact status, source types and notebook roles follow `notebooklm-py`
+v0.8.6-8-g9e611cd5 (2026-11-03). It supports attached-scope local files, pasted
+text, Web URL, YouTube, and Google Drive Docs/Slides/Sheets ingestion.
 
 Each explicit ingest is recorded before the provider write. A normal request
 makes one provider attempt and settles the job; failed jobs are retried only by

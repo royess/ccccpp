@@ -1,5 +1,7 @@
-use cccc_contracts::{DaemonRequest, Event};
-use cccc_core::{GroupDoc, HomeLayout, actors, inbox, ledger};
+use cccc_contracts::event::DeliveryEvidence;
+use cccc_contracts::reply_question::{self, Stored};
+use cccc_contracts::{DaemonRequest, Event, GroupState};
+use cccc_core::{GroupDoc, HomeLayout, actors, inbox, ledger, user_requests};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -7,7 +9,115 @@ use crate::dispatch::{OpError, OpResult, object, required_arg, store};
 
 const MAX_STATUS_EVENT_IDS: usize = 1000;
 
-type DeliveryStatuses = HashMap<String, HashMap<String, String>>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Requester {
+    Available,
+    /// Removed, or registered again after asking.
+    Unavailable,
+    /// The ledger cannot prove the registration either way.
+    Unknown,
+    /// Relayed from another Group or instance, or not an Actor here; answer
+    /// through an ordinary reply.
+    Unsupported,
+}
+
+impl Requester {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+            Self::Unknown => "unknown",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// The user's side of one request, read under the caller's Group permit.
+pub(super) struct UserRequest {
+    pub target: Event,
+    /// `None` while open; otherwise `answered` or `cancelled`.
+    pub closed: Option<&'static str>,
+    pub requester: Requester,
+}
+
+/// `Ok(None)` when the event is not a request to the user.
+pub(super) fn user_request(
+    home: &HomeLayout,
+    group_id: &str,
+    event_id: &str,
+) -> Result<Option<UserRequest>, OpError> {
+    let event_ids = [event_id.to_owned()];
+    StatusSnapshot::with(home, group_id, &event_ids, |snapshot| {
+        let target = snapshot
+            .positions
+            .get(event_id)
+            .and_then(|&position| snapshot.events.get(position))
+            .cloned()
+            .ok_or_else(|| {
+                OpError::new("event_not_found", format!("event not found: {event_id}"))
+            })?;
+        let requested =
+            target.data.get("message_mode").and_then(Value::as_str) == Some("request_reply");
+        if !requested || !user_requests::targets_user(&target) {
+            return Ok(None);
+        }
+        let user_reply = snapshot
+            .reply_positions
+            .get(event_id)
+            .and_then(|actors| actors.get("user"))
+            .copied();
+        let cancellation = snapshot.cancellation_positions.get(event_id).copied();
+        let closed = match terminal_outcome(user_reply, cancellation) {
+            (true, _) => Some("answered"),
+            (_, true) => Some("cancelled"),
+            _ => None,
+        };
+        Ok(Some(UserRequest {
+            requester: snapshot.requester(&target),
+            target,
+            closed,
+        }))
+    })?
+}
+
+/// Whether the sender of `event` is still the one that sent it, as this
+/// Group's ledger shows now, for Chet's reply to that sender. An event the
+/// ledger does not hold unchanged is `Unknown`, and so is one an import
+/// copied: whoever sent it did so in the source Group, even where the copy
+/// keeps the same registration.
+pub(super) fn requester_for_event(
+    home: &HomeLayout,
+    group_id: &str,
+    event: &Event,
+) -> Result<Requester, OpError> {
+    let event_ids = [event.id.clone()];
+    StatusSnapshot::with(home, group_id, &event_ids, |snapshot| {
+        let Some(&position) = snapshot.positions.get(&event.id) else {
+            return Requester::Unknown;
+        };
+        if snapshot.events.get(position) != Some(event) {
+            return Requester::Unknown;
+        }
+        let imported_later = snapshot.events[position + 1..].iter().any(|later| {
+            later.kind == "group.create" && later.data.get("imported") == Some(&Value::Bool(true))
+        });
+        if imported_later {
+            return Requester::Unknown;
+        }
+        snapshot.requester(event)
+    })
+}
+
+#[derive(Debug)]
+struct DeliveryStatus {
+    state: String,
+    reason: String,
+    evidence: Option<DeliveryEvidence>,
+    retryable: bool,
+}
+
+/// By source event and recipient: the latest durable delivery record.
+type DeliveryStatuses = HashMap<String, HashMap<String, DeliveryStatus>>;
 type ReplyPositions = HashMap<String, HashMap<String, usize>>;
 type CancellationPositions = HashMap<String, usize>;
 
@@ -181,6 +291,13 @@ impl StatusSnapshot<'_> {
         let replies = self.reply_positions.get(&event.id);
         let cancellation = self.cancellation_positions.get(&event.id).copied();
         let delivery = self.delivery_statuses.get(&event.id);
+        if reply_requested && obligation_recipients.iter().any(|id| id == "user") {
+            let user_reply = replies.and_then(|actors| actors.get("user")).copied();
+            status.insert(
+                "user_request".into(),
+                self.user_request(event, user_reply, cancellation),
+            );
+        }
 
         let obligation_status = obligation_recipients
             .into_iter()
@@ -189,22 +306,61 @@ impl StatusSnapshot<'_> {
                     replies.and_then(|actors| actors.get(&actor_id)).copied(),
                     cancellation,
                 );
-                (
-                    actor_id.clone(),
-                    json!({
-                        "replied": replied,
-                        "reply_requested": reply_requested,
-                        "cancelled": reply_requested && cancelled,
-                        "delivery_state":delivery
-                            .and_then(|states| states.get(&actor_id))
-                            .map(String::as_str)
-                            .unwrap_or(""),
-                    }),
-                )
+                let delivery = delivery.and_then(|states| states.get(&actor_id));
+                let mut status = json!({
+                    "replied": replied,
+                    "reply_requested": reply_requested,
+                    "cancelled": reply_requested && cancelled,
+                    "delivery_state": delivery.map_or("", |record| record.state.as_str()),
+                });
+                if let Some(record) = delivery {
+                    if !record.reason.is_empty() {
+                        status["delivery_reason"] = json!(record.reason);
+                    }
+                    if let Some(evidence) = record.evidence {
+                        status["delivery_evidence"] = json!(evidence);
+                    }
+                }
+                if !(replied || reply_requested && cancelled)
+                    && let Some(reason) = self.waiting_reason(event, &actor_id, delivery)
+                {
+                    status["waiting_reason"] = json!(reason);
+                }
+                (actor_id, status)
             })
             .collect::<Map<_, _>>();
         status.insert("obligation_status".into(), Value::Object(obligation_status));
         Value::Object(status)
+    }
+
+    /// Only report a blocker observed in this snapshot or an explicit receipt
+    /// proving that the attempt stopped before submission.
+    fn waiting_reason(
+        &self,
+        event: &Event,
+        actor_id: &str,
+        delivery: Option<&DeliveryStatus>,
+    ) -> Option<&'static str> {
+        let actor = actors::find(&self.group, actor_id)?;
+        let mail = event.data.get("message_mode").and_then(Value::as_str) == Some("mail");
+        if mail && self.is_read(event, actor_id) {
+            return None;
+        }
+        let not_submitted = match delivery {
+            Some(record) if record.state == "failed" && record.retryable => true,
+            Some(_) => return None,
+            None if mail => return None,
+            None => false,
+        };
+        match self.group.state {
+            GroupState::Paused => Some("group_paused"),
+            GroupState::Stopped => Some("group_stopped"),
+            _ if !actor.enabled => Some("member_disabled"),
+            _ if cccc_core::runtime_switches::pending_for(&self.group, actor).is_some() => {
+                Some("runtime_switch")
+            }
+            _ => not_submitted.then_some("not_submitted"),
+        }
     }
 
     fn actor_recipients(&self, event: &Event) -> Vec<String> {
@@ -225,21 +381,107 @@ impl StatusSnapshot<'_> {
     }
 
     fn obligation_recipients(&self, event: &Event, mut recipients: Vec<String>) -> Vec<String> {
-        let explicitly_targets_user =
-            event
-                .data
-                .get("to")
-                .and_then(Value::as_array)
-                .is_some_and(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .any(|recipient| matches!(recipient, "user" | "@user"))
-                });
-        if event.by != "user" && explicitly_targets_user {
+        if user_requests::targets_user(event) {
             recipients.push("user".into());
         }
+        if addresses_chet(event) {
+            recipients.push(actors::CHET_SERVICE_PRINCIPAL.into());
+        }
         recipients
+    }
+
+    /// What answering this request to the user in place depends on: whether
+    /// its question can be trusted and whether its sender is still the Actor
+    /// that asked.
+    fn user_request(
+        &self,
+        event: &Event,
+        user_reply: Option<usize>,
+        cancellation: Option<usize>,
+    ) -> Value {
+        let question = match reply_question::stored(&event.data) {
+            Stored::None => "none",
+            Stored::Valid(_) => "valid",
+            Stored::Unavailable => "unavailable",
+        };
+        let requester = self.requester(event);
+        let mut status = Map::new();
+        status.insert("question".into(), json!(question));
+        status.insert("requester".into(), json!(requester.as_str()));
+        if requester == Requester::Unsupported {
+            status.insert("reply_route".into(), json!("composer"));
+        }
+        if terminal_outcome(user_reply, cancellation).0
+            && let Some(reply) = user_reply.and_then(|position| self.events.get(position))
+        {
+            status.insert("reply_event_id".into(), json!(reply.id));
+            status.insert("reply_by".into(), json!(reply.by));
+        }
+        Value::Object(status)
+    }
+
+    /// The sender is still the Actor that asked only when the ledger proves
+    /// it: its latest registration precedes the request and records the
+    /// identity the Group holds now. Any missing proof is unknown, never
+    /// assumed (a creation time can be supplied by a caller, and an add can
+    /// stop between saving the Group and appending its event).
+    fn requester(&self, event: &Event) -> Requester {
+        let relayed = event.data.contains_key("connect_message")
+            || event
+                .data
+                .get("src_group_id")
+                .and_then(Value::as_str)
+                .is_some_and(|group| !group.trim().is_empty());
+        if relayed {
+            return Requester::Unsupported;
+        }
+        if event.by == actors::CHET_SERVICE_PRINCIPAL {
+            // Chet is not a Group Actor: it asked only as this Group's own ledger
+            // event with the current generation's host marker. A copied or
+            // re-created Group keeps the event, not that identity.
+            let stored = self
+                .positions
+                .get(&event.id)
+                .and_then(|&position| self.events.get(position));
+            return if stored == Some(event)
+                && actors::has_current_chet_provenance(&self.group, event)
+            {
+                Requester::Available
+            } else {
+                Requester::Unknown
+            };
+        }
+        let registered = self.actor_generations.get(&event.by).copied();
+        let Some(actor) = self.group.actors.iter().find(|actor| actor.id == event.by) else {
+            // Without a relay field, a sender the ledger never registered is
+            // unproven rather than from elsewhere.
+            return if registered.is_some() {
+                Requester::Unavailable
+            } else {
+                Requester::Unknown
+            };
+        };
+        let (Some(registered), Some(&asked)) = (registered, self.positions.get(&event.id)) else {
+            return Requester::Unknown;
+        };
+        if registered > asked {
+            return Requester::Unavailable;
+        }
+        let recorded = self
+            .events
+            .get(registered)
+            .and_then(|add| add.data.get("actor"))
+            .and_then(|actor| serde_json::from_value::<cccc_contracts::Actor>(actor.clone()).ok());
+        match recorded {
+            Some(recorded)
+                if recorded.id == actor.id
+                    && actors::generation_identity(&recorded)
+                        == actors::generation_identity(actor) =>
+            {
+                Requester::Available
+            }
+            _ => Requester::Unknown,
+        }
     }
 
     fn is_read(&self, event: &Event, actor_id: &str) -> bool {
@@ -263,7 +505,7 @@ fn collect_message_outcomes_from(
     events: &[Event],
     start_position: usize,
 ) -> (DeliveryStatuses, ReplyPositions, CancellationPositions) {
-    let mut deliveries = HashMap::<String, HashMap<String, String>>::new();
+    let mut deliveries = DeliveryStatuses::new();
     let mut replies = HashMap::<String, HashMap<String, usize>>::new();
     let mut cancellations = HashMap::<String, usize>::new();
     for (offset, event) in events.iter().enumerate() {
@@ -275,16 +517,20 @@ fn collect_message_outcomes_from(
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
             {
-                let author = super::connect_messages::stored_message(event)
-                    .ok()
-                    .filter(|message| {
-                        event.by == format!("connect:{}", message.source.instance_id)
-                            && message.reply_to.is_some()
-                    })
-                    .map(|message| {
-                        connect_reply_author(&message.source.instance_id, &message.sender)
-                    })
-                    .unwrap_or_else(|| event.by.clone());
+                let author = if user_requests::closes(event).is_some() {
+                    "user".into()
+                } else {
+                    super::connect_messages::stored_message(event)
+                        .ok()
+                        .filter(|message| {
+                            event.by == format!("connect:{}", message.source.instance_id)
+                                && message.reply_to.is_some()
+                        })
+                        .map(|message| {
+                            connect_reply_author(&message.source.instance_id, &message.sender)
+                        })
+                        .unwrap_or_else(|| event.by.clone())
+                };
                 replies
                     .entry(source_event_id.to_owned())
                     .or_default()
@@ -294,12 +540,7 @@ fn collect_message_outcomes_from(
             continue;
         }
         if event.kind == "chat.reply_request.cancelled" {
-            if let Some(source_event_id) = event
-                .data
-                .get("source_event_id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            {
+            if let Some(source_event_id) = user_requests::closes(event) {
                 cancellations
                     .entry(source_event_id.to_owned())
                     .or_insert(position);
@@ -314,10 +555,28 @@ fn collect_message_outcomes_from(
             event.data.get("actor_id").and_then(Value::as_str),
             event.data.get("state").and_then(Value::as_str),
         ) {
+            let record = DeliveryStatus {
+                state: state.to_owned(),
+                reason: event
+                    .data
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                evidence: if state == "accepted" {
+                    event
+                        .data
+                        .get("delivery_evidence")
+                        .and_then(DeliveryEvidence::from_json)
+                } else {
+                    None
+                },
+                retryable: event.data.get("retryable").and_then(Value::as_bool) == Some(true),
+            };
             deliveries
                 .entry(source_event_id.to_owned())
                 .or_default()
-                .insert(actor_id.to_owned(), state.to_owned());
+                .insert(actor_id.to_owned(), record);
         }
     }
     (deliveries, replies, cancellations)
@@ -357,6 +616,21 @@ fn is_cross_group_source(event: &Event) -> bool {
         .is_some_and(|group_id| !group_id.trim().is_empty())
 }
 
+/// Only `@chet` stores the service identity as a recipient, and Chet is
+/// addressed alone. Its reply, or the sender's cancellation, then closes the
+/// request like any recipient's.
+fn addresses_chet(event: &Event) -> bool {
+    event.by != actors::CHET_SERVICE_PRINCIPAL
+        && event
+            .data
+            .get("to")
+            .and_then(Value::as_array)
+            .is_some_and(|to| {
+                to.iter()
+                    .any(|item| item.as_str() == Some(actors::CHET_SERVICE_PRINCIPAL))
+            })
+}
+
 fn connect_reply_author(instance: &str, actor: &cccc_contracts::connect::ConnectActor) -> String {
     format!("connect:{instance}:{}:{}", actor.id, actor.generation)
 }
@@ -372,14 +646,142 @@ mod tests {
             .as_object()
             .cloned()
             .expect("data");
+        let mut failed = Event::new("runtime.delivery", "g_one");
+        failed.data = json!({
+            "source_event_id":"event-1","actor_id":"peer1","state":"failed","reason":"gone"
+        })
+        .as_object()
+        .cloned()
+        .expect("data");
         let mut accepted = Event::new("runtime.delivery", "g_one");
         accepted.data = json!({"source_event_id":"event-1","actor_id":"peer1","state":"accepted"})
             .as_object()
             .cloned()
             .expect("data");
+        let mut written = accepted.clone();
+        written
+            .data
+            .insert("delivery_evidence".into(), json!("terminal_written"));
+        // A later receipt owns the whole outcome. An accepted receipt without
+        // evidence cannot borrow it from an earlier submission.
+        let (statuses, _, _) =
+            collect_message_outcomes(&[claimed.clone(), failed.clone(), written.clone()]);
+        assert_eq!(
+            statuses["event-1"]["peer1"].evidence,
+            Some(DeliveryEvidence::TerminalWritten)
+        );
 
-        let (statuses, _, _) = collect_message_outcomes(&[claimed, accepted]);
-        assert_eq!(statuses["event-1"]["peer1"], "accepted");
+        let (statuses, _, _) = collect_message_outcomes(&[claimed.clone(), failed.clone()]);
+        assert_eq!(statuses["event-1"]["peer1"].state, "failed");
+        assert_eq!(statuses["event-1"]["peer1"].reason, "gone");
+        let (statuses, _, _) = collect_message_outcomes(&[claimed, failed, written, accepted]);
+        assert_eq!(statuses["event-1"]["peer1"].state, "accepted");
+        assert_eq!(statuses["event-1"]["peer1"].reason, "");
+        assert_eq!(statuses["event-1"]["peer1"].evidence, None);
+    }
+
+    #[test]
+    fn waiting_reason_uses_current_blockers_only_for_pending_deliveries() {
+        let temp = tempfile::tempdir().expect("home");
+        let home = HomeLayout::from_path(temp.path()).expect("layout");
+        let store = store(&home).expect("store");
+        let mut group = store.create("waiting", "").expect("group");
+        let mut actor = cccc_contracts::Actor::new("peer");
+        actor.enabled = false;
+        actors::add(&mut group, actor).expect("actor");
+        group.state = GroupState::Paused;
+        store.save(&group).expect("save");
+        let path = store.ledger_path(&group.group_id).expect("ledger");
+        let cases = [
+            ("send", "", None, Some("group_paused")),
+            ("mail", "", None, None),
+            ("send", "claimed", None, None),
+            ("send", "withdrawn", None, None),
+            ("send", "ambiguous", None, None),
+            ("send", "failed", Some(true), Some("group_paused")),
+            ("send", "failed", Some(false), None),
+            ("send", "failed", None, None),
+            ("send", "accepted", None, None),
+            ("mail", "failed", Some(true), Some("group_paused")),
+        ];
+        let mut ids = Vec::new();
+        for (mode, state, retryable, _) in cases {
+            let mut message = Event::new("chat.message", &group.group_id);
+            message.by = "user".into();
+            message.data = json!({"to":["peer"],"message_mode":mode,"text":"hello"})
+                .as_object()
+                .expect("message")
+                .clone();
+            ledger::append(&path, &message).expect("append");
+            ids.push(message.id.clone());
+            if !state.is_empty() {
+                let mut receipt = Event::new("runtime.delivery", &group.group_id);
+                receipt.by = "system".into();
+                receipt.data = json!({
+                    "actor_id":"peer","source_event_id":message.id,"state":state,"transport":"managed_session"
+                })
+                .as_object()
+                .expect("receipt")
+                .clone();
+                if let Some(retryable) = retryable {
+                    receipt.data.insert("retryable".into(), json!(retryable));
+                }
+                if state == "accepted" {
+                    receipt
+                        .data
+                        .insert("delivery_evidence".into(), json!("channel_accepted"));
+                }
+                ledger::append(&path, &receipt).expect("append receipt");
+            }
+        }
+        let ledger_before = std::fs::read(&path).expect("ledger bytes");
+        let statuses = for_events(&home, &group.group_id, &ids).expect("status");
+        for (id, (_, state, _, waiting)) in ids.iter().zip(cases) {
+            let status = &statuses[id]["obligation_status"]["peer"];
+            assert_eq!(status["delivery_state"], state);
+            assert_eq!(status["waiting_reason"].as_str(), waiting);
+            assert_eq!(
+                status["delivery_evidence"].as_str(),
+                (state == "accepted").then_some("channel_accepted")
+            );
+        }
+        group.state = GroupState::Active;
+        store.save(&group).expect("active");
+        let retry = &ids[5];
+        let current =
+            || for_events(&home, &group.group_id, std::slice::from_ref(retry)).expect("status");
+        assert_eq!(
+            current()[retry]["obligation_status"]["peer"]["waiting_reason"],
+            "member_disabled"
+        );
+        group.actors[0].enabled = true;
+        store.save(&group).expect("enable");
+        assert_eq!(
+            current()[retry]["obligation_status"]["peer"]["waiting_reason"],
+            "not_submitted"
+        );
+        assert_eq!(std::fs::read(&path).expect("ledger bytes"), ledger_before);
+
+        let promoted = ids.last().expect("promoted Mail");
+        let statuses = for_events(&home, &group.group_id, std::slice::from_ref(promoted))
+            .expect("before reading Mail");
+        assert_eq!(
+            statuses[promoted]["obligation_status"]["peer"]["waiting_reason"],
+            "not_submitted"
+        );
+        let consumed = inbox::consume_unread(&home, &group, "peer", "peer", 20).expect("read Mail");
+        assert!(
+            consumed
+                .messages
+                .iter()
+                .any(|message| &message.id == promoted)
+        );
+        let statuses = for_events(&home, &group.group_id, std::slice::from_ref(promoted))
+            .expect("after reading Mail");
+        let status = &statuses[promoted]["obligation_status"]["peer"];
+        assert_eq!(statuses[promoted]["read_status"]["peer"], true);
+        assert_eq!(status["delivery_state"], "failed");
+        assert!(status.get("waiting_reason").is_none());
     }
 
     #[test]

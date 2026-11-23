@@ -1,18 +1,28 @@
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 mod actions;
 mod argument_normalization;
+mod backlog_projection;
 mod bootstrap;
 mod code_mode;
+mod codex_image_result;
 mod context_projection;
 mod cross_group;
 mod file_read;
+mod history_projection;
 mod local_patch;
 mod local_sessions;
 mod local_tools;
 mod mapping;
+mod native_session;
+mod owned_registration;
+mod remote_native;
 mod repo;
 mod repo_inspect;
+mod response_projection;
 mod router;
+mod task_summary;
 mod tools;
+mod version_notice;
 
 #[cfg(test)]
 mod lib_tests;
@@ -24,10 +34,14 @@ use cccc_client::DaemonClient;
 use cccc_core::{CORE_TOOL_NAMES, HomeLayout};
 use serde_json::{Map, Value, json};
 use std::fmt;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2024-11-05"];
 const DEFAULT_LEGACY_PROTOCOL_VERSION: &str = SUPPORTED_LEGACY_PROTOCOL_VERSIONS[0];
+
+/// General capability discovery guidance shared by MCP handshake transports.
+pub const CAPABILITY_INSTRUCTIONS: &str = "CCCC also offers optional skills and MCP servers for research with cited sources, current web facts, papers, reading office files, spreadsheets, data checks, contract redlines, public repository questions and code that must match a library's version. When a task would clearly gain from one, or your approach has a concrete gap, browse recommended ones or search by a word with cccc_capability_search; read an entry's limits before enabling it with cccc_capability_use. Keep your own tools when they are enough.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ToolCallError {
@@ -111,13 +125,38 @@ fn valid_error_code(code: &str) -> bool {
 }
 
 pub async fn run_stdio(home: HomeLayout) -> Result<()> {
-    let result = run_stdio_loop(&home).await;
+    run_stdio_with_local_session(home, None, None).await
+}
+
+pub async fn run_stdio_with_local_session(
+    home: HomeLayout,
+    runtime: Option<&str>,
+    host_pid: Option<u32>,
+) -> Result<()> {
+    let result = run_stdio_loop(&home, runtime, host_pid).await;
     shutdown(&home).await;
     result
 }
 
-async fn run_stdio_loop(home: &HomeLayout) -> Result<()> {
-    let client = DaemonClient::new(home.clone());
+async fn run_stdio_loop(
+    home: &HomeLayout,
+    runtime: Option<&str>,
+    host_pid: Option<u32>,
+) -> Result<()> {
+    let client = DaemonClient::new(home.clone()).with_connect_wait(Duration::from_secs(30));
+    let mut native = runtime
+        .filter(|_| !cccc_core::local_sessions::cccc_owned_environment())
+        .map(|runtime| native_session::Context::new(runtime, host_pid))
+        .transpose()?;
+    let notice_runtime = if cccc_core::local_sessions::cccc_owned_environment() {
+        Some("cccc_owned")
+    } else {
+        runtime.filter(|_| native.is_some())
+    };
+    let mut notice = version_notice::VersionNotice::default();
+    let mut codex_client = false;
+    let owned_binding = std::env::var_os(cccc_core::owned_mcp::BINDING_FILE_ENV);
+    let mut registration_attempted = owned_binding.is_none();
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut output = tokio::io::stdout();
     while let Some(line) = input.next_line().await? {
@@ -139,7 +178,33 @@ async fn run_stdio_loop(home: &HomeLayout) -> Result<()> {
         if request.get("id").is_none() {
             continue;
         }
-        let response = handle(home, &client, &request, None).await;
+        if !registration_attempted {
+            if let Err(error) = owned_registration::register(home, owned_binding.as_deref()).await {
+                cccc_runtime::diagnostic(format_args!(
+                    "[cccc] tool-process observation unavailable: {error}"
+                ));
+            }
+            registration_attempted = true;
+        }
+        if request.get("method").and_then(Value::as_str) == Some("initialize") {
+            codex_client = request
+                .pointer("/params/clientInfo/name")
+                .and_then(Value::as_str)
+                == Some(codex_image_result::CODEX_MCP_CLIENT);
+        }
+        let mut response = if let Some(native) = native.as_mut() {
+            native.handle(home, &client, &request).await
+        } else {
+            handle(home, &client, &request, None).await
+        };
+        // Convert first, so the notice is never folded into the metadata it compares.
+        codex_image_result::preserve_images(codex_client, &request, &mut response);
+        notice
+            .annotate(home, notice_runtime, &request, &mut response)
+            .await;
+        if let Some(native) = native.as_mut() {
+            native.annotate_receive(&mut response);
+        }
         write_response(&mut output, &response).await?;
     }
     Ok(())
@@ -151,8 +216,12 @@ pub async fn shutdown(home: &HomeLayout) {
     code_mode::shutdown(home).await;
     match commands.await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("[cccc] local command shutdown failed: {error}"),
-        Err(error) => eprintln!("[cccc] local command cleanup worker failed: {error}"),
+        Ok(Err(error)) => cccc_runtime::diagnostic(format_args!(
+            "[cccc] local command shutdown failed: {error}"
+        )),
+        Err(error) => cccc_runtime::diagnostic(format_args!(
+            "[cccc] local command cleanup worker failed: {error}"
+        )),
     }
 }
 
@@ -175,6 +244,7 @@ pub async fn handle_request_for_actor(
         Some(RequestContext {
             group_id,
             actor_id,
+            native_binding: None,
             binding: None,
         }),
     )
@@ -200,11 +270,16 @@ pub fn web_model_catalog() -> Vec<Value> {
 pub(crate) fn describe_paired_identity(catalog: &mut [Value]) {
     for tool in catalog {
         let actor_is_target = tool["name"] == "cccc_actor";
+        let reads_other_state = tool["name"] == "cccc_agent_state";
         if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
             if let Some(group) = properties.get_mut("group_id") {
                 group["description"] = Value::String("The paired CCCC Group is supplied by the connector. Omit this field; a caller cannot change the Group with this argument.".into());
             }
-            if !actor_is_target && let Some(actor) = properties.get_mut("actor_id") {
+            if reads_other_state {
+                if let Some(actor) = properties.get_mut("actor_id") {
+                    actor["description"] = Value::String("With action=get, the member whose state to read; leave it out to read the paired CCCC Actor's own. update and clear always act on the paired CCCC Actor.".into());
+                }
+            } else if !actor_is_target && let Some(actor) = properties.get_mut("actor_id") {
                 actor["description"] = Value::String("The paired CCCC Actor is supplied by the connector. Omit this field; a caller cannot change its identity with this argument.".into());
             }
         }
@@ -231,7 +306,30 @@ pub async fn handle_request_for_binding(
         Some(RequestContext {
             group_id: binding["group_id"].as_str().unwrap_or_default(),
             actor_id: binding["actor_id"].as_str().unwrap_or_default(),
+            native_binding: None,
             binding: Some(binding),
+        }),
+    )
+    .await
+}
+
+/// Called only after a session-node gateway has authenticated the remote key
+/// and captured a current native membership. Every operation revalidates it.
+pub async fn handle_request_for_native_binding(
+    home: &HomeLayout,
+    request: &Value,
+    binding: &cccc_contracts::local_session::LocalSessionBinding,
+) -> Value {
+    let client = DaemonClient::new(home.clone()).without_voice_origin();
+    handle(
+        home,
+        &client,
+        request,
+        Some(RequestContext {
+            group_id: &binding.group_id,
+            actor_id: &binding.actor_id,
+            binding: None,
+            native_binding: Some(binding),
         }),
     )
     .await
@@ -242,6 +340,7 @@ pub(crate) struct RequestContext<'a> {
     group_id: &'a str,
     actor_id: &'a str,
     binding: Option<&'a Value>,
+    native_binding: Option<&'a cccc_contracts::local_session::LocalSessionBinding>,
 }
 
 async fn handle(
@@ -256,12 +355,18 @@ async fn handle(
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let result = match method {
-        "initialize" => json!({
-            "protocolVersion": negotiated_protocol_version(request),
-            "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "cccc-mcp", "version": env!("CARGO_PKG_VERSION")},
-            "_meta": {"cccc/build": cccc_core::build_info::current()},
-        }),
+        "initialize" => {
+            let mut result = json!({
+                "protocolVersion": negotiated_protocol_version(request),
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "cccc-mcp", "version": env!("CARGO_PKG_VERSION")},
+                "_meta": {"cccc/build": cccc_core::build_info::current()},
+            });
+            if !secretary_task_mode() {
+                result["instructions"] = json!(CAPABILITY_INSTRUCTIONS);
+            }
+            result
+        }
         "ping" => json!({}),
         "tools/list" => {
             json!({"tools": visible_tools_with_context(home, client, context).await})
@@ -285,6 +390,9 @@ async fn handle(
                 }
             };
             if !tools::contains(name)
+                // External calls are authorized against the daemon's complete
+                // enabled collection, not the budgeted discovery projection.
+                && !name.starts_with("cccc_ext_")
                 && !visible_tools_with_context(home, client, context)
                     .await
                     .iter()
@@ -347,6 +455,7 @@ pub(crate) async fn visible_tools_for_actor(
         Some(RequestContext {
             group_id,
             actor_id,
+            native_binding: None,
             binding: None,
         }),
     )
@@ -404,7 +513,9 @@ async fn visible_tools_with_context(
             .filter(|tool| tool["name"] == "cccc_voice_secretary_task")
             .collect();
     }
-    catalog.retain(|tool| tool["name"] != "cccc_voice_secretary_task");
+    catalog.retain(|tool| {
+        tool["name"] != "cccc_voice_secretary_task" && tool["name"] != "cccc_session"
+    });
     if context.is_none()
         && std::env::var("CCCC_MCP_TOOL_PROFILE")
             .ok()
@@ -414,15 +525,12 @@ async fn visible_tools_with_context(
         return catalog;
     }
     let group_id = context.map(|value| value.group_id.to_owned()).or_else(|| {
-        std::env::var("CCCC_GROUP_ID")
-            .ok()
+        cccc_core::home::context_var("CCCC_GROUP_ID")
             .filter(|value| !value.trim().is_empty())
             .or_else(|| cccc_core::active::get(home).ok().flatten())
     });
     let actor_id = context.map(|value| value.actor_id.to_owned()).or_else(|| {
-        std::env::var("CCCC_ACTOR_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
+        cccc_core::home::context_var("CCCC_ACTOR_ID").filter(|value| !value.trim().is_empty())
     });
     let (Some(group_id), Some(actor_id)) = (group_id, actor_id) else {
         return core_tools(catalog);
@@ -547,3 +655,8 @@ async fn write_response(output: &mut tokio::io::Stdout, response: &Value) -> Res
 mod connect_tests;
 #[cfg(test)]
 mod cross_group_file_tests;
+#[cfg(test)]
+mod file_send_tests;
+
+#[cfg(test)]
+cccc_daemon::session_owner_test_entry!();

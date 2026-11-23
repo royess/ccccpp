@@ -110,6 +110,7 @@ impl Fixture {
                 port: listener.local_addr().expect("listener address").port(),
                 pid: std::process::id(),
                 version: "test".into(),
+                source_id: String::new(),
                 ts: "test".into(),
             })
             .expect("initialize persistence fixture"),
@@ -185,8 +186,7 @@ impl Fixture {
             home,
             browser_surfaces: Arc::new(crate::browser_surface::BrowserSurfaces::default()),
             connect_frames: Arc::new(crate::connect_frames::ConnectFrames::default()),
-            connect_http: crate::connect_frames::http_client()
-                .build()
+            connect_http: crate::connect_frames::HttpClients::new()
                 .map_err(|error| error.to_string()),
             codex_voice: Arc::new(crate::codex_voice::CodexVoiceSessions::default()),
             notebooklm_auth: Arc::new(crate::notebooklm_auth::AuthFlowManager::default()),
@@ -199,6 +199,7 @@ impl Fixture {
             runtime_proof_key: "test".into(),
             web_mode: crate::WebMode::Normal,
             exhibit_allow_terminal: false,
+            push: Default::default(),
         };
         Self {
             _temp: temp,

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 #[cfg(test)]
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::path::Path;
 
 use crate::actors;
 use crate::automation_render::notify_events;
@@ -12,9 +13,60 @@ use crate::automation_schedule::is_due;
 use crate::{GroupDoc, GroupStore, HomeLayout, inbox, ledger};
 
 mod state;
-use state::RuntimeState;
+use state::{RunRecord, RuntimeState};
 
-pub const STANDUP_SNIPPET: &str = "{{interval_minutes}} minutes have passed. Stand-up checkpoint (foreman only).\n\nUse MCP chat for any visible update. Keep this short.";
+/// The built-in stand-up text. It names no interval, since a rule may also run
+/// on a schedule, where `{{interval_minutes}}` is 0.
+pub const STANDUP_SNIPPET: &str = "Stand-up for the foreman: a short look at how the team works \
+against the user's current goals, not just at task status. Act on what your authority covers and \
+do not ask members for status reports. If the user asked to hear about this check, report \
+briefly even when nothing needs action; otherwise end without a message when nothing needs \
+anyone.\n\
+\n\
+What you need may already be in view. If not: cccc_task(action=\"list\") lists open tasks in \
+pages, with owner, waiting_on and updated_at where set; cccc_message_history(mode=\"all\", \
+limit=10) shows recent messages you can see, and adding sender=\"user\" shows only the user's. \
+Neither shows everything, so do not claim you saw everything.\n\
+\n\
+1. Direction: does the open work still serve the user's current goals and outstanding requests, \
+including their latest corrections, in the order they care about? The brief may be out of date; \
+go by the user's own words, and check with the user when unsure rather than dropping work they \
+approved. Look for work that is off course or done for its own sake, and for work that is \
+blocked, waiting, unowned or not moving. An old updated_at alone does not prove work stopped: \
+find out why before you unblock or reassign it, and never close a task for waiting or age alone.\n\
+2. Friction: where did members wait on each other, redo or duplicate work, hand off unclearly or \
+misread each other, and what caused it? Is anyone overloaded or left without work, and do the \
+members, their setup and the team's size still fit the work? Judge from the work itself, not \
+from an idle state, a message count or an old timestamp.\n\
+3. The user's worries: what has the user had to say twice, or kept coming back to, and did a \
+later case of the same kind go better? A worry may have no task yet. If a change has an open \
+optimization task and work it applies to came up, read the task by task_id and add the \
+result to its notes, keeping the existing notes and passing the if_task_rev you read. No later \
+case, or the user saying nothing, does not prove it improved.\n\
+4. A better way: if a practical change to how the team works would clearly pay off, propose it \
+with its evidence. Do not invent a problem or a proposal.\n\
+\n\
+Fix causes within your authority, tell the user about routine changes, and message only a member \
+who has to act. Bring the user at most one decision, on a question card, such as a standing rule \
+or a member change, and do not repeat what is already in front of them unless it changed. A \
+change the user adopts, or one within your authority that is worth checking later, becomes an \
+optimization task with its evidence, when it applies, what to look at next time and how to undo \
+it; a one-off fix needs none. For a message addressed only to you, share only what the user \
+authorized and the team's work needs, in your own words, and honor any confidentiality limits. \
+Do not include its ID unless the user specifically agreed.\n\
+\n\
+When a problem needs a deeper look across rounds, add a line starting with \"Review:\" to the \
+notes of a related open optimization task, keeping the existing notes and passing the \
+if_task_rev you read; if there is none, create one planned optimization task whose title starts \
+with \"Review:\", whose notes start by saying it authorizes no change, and which holds only facts \
+the Group can see or the user allowed you to share. When the work already sits in another task \
+or handoff, point to it instead of copying it. Something merely noticed needs no task. You may \
+propose a scoped team review, but do not run the review \
+skill from here. A Group that creates few tasks may wait long for the review's task reminder: only \
+with current, reliable information that the skill is available to you, and when a review would \
+clearly pay off, your one decision may be whether to run it now; when unsure, do not ask. Do not \
+check capability state just to decide this, and do not ask when the user has already asked for a \
+review.";
 
 #[derive(Debug, Clone)]
 pub enum ScheduledAction {
@@ -39,6 +91,10 @@ pub enum ScheduledAction {
 pub struct TickResult {
     pub notifications: Vec<Event>,
     pub actions: Vec<ScheduledAction>,
+    pub completed_rules: Vec<(String, String)>,
+    /// A later rule append or state write failed after earlier notices were
+    /// committed. Those notices must still be handed to the delivery path.
+    pub rule_failure: Option<io::Error>,
     /// Failure while discovering or appending Mail/reply notices. Retained
     /// alongside committed notifications and prepared rule actions so callers
     /// can still apply those results. Unwritten notices remain due for a later pass.
@@ -59,6 +115,10 @@ pub fn tick_scheduled(home: &HomeLayout, include_unread: bool) -> io::Result<Tic
         };
         result.notifications.extend(group_result.notifications);
         result.actions.extend(group_result.actions);
+        result.completed_rules.extend(group_result.completed_rules);
+        if result.rule_failure.is_none() {
+            result.rule_failure = group_result.rule_failure;
+        }
         if result.unread_failure.is_none() {
             result.unread_failure = group_result.unread_failure;
         }
@@ -94,6 +154,84 @@ pub fn mark_rule_fired(
     let mut state = state::load(&store, group_id)?;
     state.last_rule.insert(rule_id.to_owned(), fired_at);
     state::save(&store, group_id, &state)
+}
+
+/// A manual run's committed notifications, retained even if a later append or
+/// state write failed. Callers must deliver committed events before reporting
+/// the error; a committed notice cannot be undone.
+pub struct RuleNotificationResult {
+    pub notifications: Vec<Event>,
+    pub failure: Option<io::Error>,
+}
+
+pub fn notify_rule_now(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    rule_id: &str,
+    rule: &Map<String, Value>,
+) -> io::Result<RuleNotificationResult> {
+    notify_rule_now_with(home, group, rule_id, rule, &mut ledger::append)
+}
+
+fn notify_rule_now_with(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    rule_id: &str,
+    rule: &Map<String, Value>,
+    append: &mut impl FnMut(&Path, &Event) -> io::Result<()>,
+) -> io::Result<RuleNotificationResult> {
+    let store = GroupStore::new(home.clone())?;
+    let mut state = state::load(&store, &group.group_id)?;
+    let now = Utc::now();
+    let events = notify_events(
+        group,
+        rule_id,
+        rule,
+        rule.get("action").and_then(Value::as_object),
+        &now.to_rfc3339(),
+        "manual",
+    );
+    let path = store.ledger_path(&group.group_id)?;
+    let mut result = append_rule_notifications(&path, events, append);
+    if let Some(first) = result.notifications.first() {
+        let at = DateTime::parse_from_rfc3339(&first.ts)
+            .map(|timestamp| timestamp.timestamp())
+            .unwrap_or_else(|_| now.timestamp());
+        state.last_run.insert(
+            rule_id.to_owned(),
+            RunRecord {
+                at,
+                kind: "manual".into(),
+            },
+        );
+        if let Err(error) = state::save(&store, &group.group_id, &state) {
+            let message = match result.failure.take() {
+                Some(earlier) => format!("{earlier}; failed to record last run: {error}"),
+                None => format!("failed to record last run: {error}"),
+            };
+            result.failure = Some(io::Error::other(message));
+        }
+    }
+    Ok(result)
+}
+
+fn append_rule_notifications(
+    path: &Path,
+    events: Vec<Event>,
+    append: &mut impl FnMut(&Path, &Event) -> io::Result<()>,
+) -> RuleNotificationResult {
+    let mut result = RuleNotificationResult {
+        notifications: Vec::new(),
+        failure: None,
+    };
+    for event in events {
+        if let Err(error) = append(path, &event) {
+            result.failure = Some(error);
+            break;
+        }
+        result.notifications.push(event);
+    }
+    result
 }
 
 pub fn next_rule_fire_at(
@@ -134,6 +272,13 @@ pub fn reset_rule_timers_on_resume(home: &HomeLayout, group_id: &str) -> io::Res
             .and_then(|trigger| trigger.get("kind"))
             .and_then(Value::as_str)
             .unwrap_or("");
+        if trigger
+            .and_then(|t| t.get("max_runs"))
+            .and_then(Value::as_u64)
+            .is_some_and(|limit| state.fired_count.get(id).copied().unwrap_or(0) >= limit)
+        {
+            continue;
+        }
         let should_reset = match kind {
             "interval" | "cron" => true,
             "at" => trigger
@@ -244,8 +389,10 @@ fn tick_group_inner(
     tick_rules(&store, &group, &mut state, &mut result)?;
     // Save before issuing unread notices: a notice written to the ledger counts
     // as issued, so no error may follow it and drop the result carrying it.
-    if state != previous {
-        state::save(&store, group_id, &state)?;
+    if state != previous
+        && let Err(error) = state::save(&store, group_id, &state)
+    {
+        retain_committed_after_state_failure(&mut result, error)?;
     }
     if include_unread && matches!(group.state, GroupState::Active | GroupState::Idle) {
         tick_unread(
@@ -261,11 +408,39 @@ fn tick_group_inner(
     Ok(result)
 }
 
+fn retain_committed_after_state_failure(
+    result: &mut TickResult,
+    error: io::Error,
+) -> io::Result<()> {
+    if result.notifications.is_empty() {
+        return Err(error);
+    }
+    // Actions have not been executed yet. Without saved rule state, leave them
+    // for the next tick instead of making a lifecycle change that may repeat.
+    result.actions.clear();
+    result.completed_rules.clear();
+    result.rule_failure = Some(match result.rule_failure.take() {
+        Some(previous) => io::Error::other(format!("{previous}; rule state save failed: {error}")),
+        None => error,
+    });
+    Ok(())
+}
+
 fn tick_rules(
     store: &GroupStore,
     group: &GroupDoc,
     state: &mut RuntimeState,
     result: &mut TickResult,
+) -> io::Result<()> {
+    tick_rules_with(store, group, state, result, &mut ledger::append)
+}
+
+fn tick_rules_with(
+    store: &GroupStore,
+    group: &GroupDoc,
+    state: &mut RuntimeState,
+    result: &mut TickResult,
+    append: &mut impl FnMut(&Path, &Event) -> io::Result<()>,
 ) -> io::Result<()> {
     let Some(rules) = group.automation.get("rules").and_then(Value::as_array) else {
         return Ok(());
@@ -288,6 +463,15 @@ fn tick_rules(
             .and_then(|trigger| trigger.get("kind"))
             .and_then(Value::as_str)
             .unwrap_or("interval");
+        let max_runs = trigger
+            .and_then(|t| t.get("max_runs"))
+            .and_then(Value::as_u64);
+        if max_runs.is_some_and(|limit| state.fired_count.get(id).copied().unwrap_or(0) >= limit) {
+            result
+                .completed_rules
+                .push((group.group_id.clone(), id.into()));
+            continue;
+        }
         if trigger_kind == "interval" && last_fired.is_none() {
             state.last_rule.insert(id.into(), now.timestamp());
             continue;
@@ -302,14 +486,33 @@ fn tick_rules(
             .unwrap_or("notify");
         let one_time = trigger_kind == "at";
         let mut completed = false;
+        let mut stop_after_rule = false;
         match kind {
             "notify" => {
                 let scheduled_at = scheduled_at(trigger, last_fired, now);
-                let events = notify_events(group, id, rule, action, &scheduled_at);
-                for event in events {
-                    ledger::append(&store.ledger_path(&group.group_id)?, &event)?;
-                    result.notifications.push(event);
-                    completed = true;
+                let events = notify_events(group, id, rule, action, &scheduled_at, "scheduled");
+                let outcome =
+                    append_rule_notifications(&store.ledger_path(&group.group_id)?, events, append);
+                completed = !outcome.notifications.is_empty();
+                if let Some(first) = outcome.notifications.first() {
+                    let at = DateTime::parse_from_rfc3339(&first.ts)
+                        .map(|timestamp| timestamp.timestamp())
+                        .unwrap_or_else(|_| now.timestamp());
+                    state.last_run.insert(
+                        id.into(),
+                        RunRecord {
+                            at,
+                            kind: "scheduled".into(),
+                        },
+                    );
+                }
+                result.notifications.extend(outcome.notifications);
+                if let Some(error) = outcome.failure {
+                    if result.notifications.is_empty() && result.actions.is_empty() {
+                        return Err(error);
+                    }
+                    result.rule_failure = Some(error);
+                    stop_after_rule = true;
                 }
             }
             "group_state" => {
@@ -354,6 +557,20 @@ fn tick_rules(
         }
         if completed {
             state.last_rule.insert(id.into(), now.timestamp());
+            if matches!(trigger_kind, "interval" | "cron")
+                && let Some(limit) = max_runs
+            {
+                let count = state.fired_count.entry(id.into()).or_default();
+                *count = count.saturating_add(1);
+                if *count >= limit {
+                    result
+                        .completed_rules
+                        .push((group.group_id.clone(), id.into()));
+                }
+            }
+        }
+        if stop_after_rule {
+            break;
         }
     }
     Ok(())
@@ -545,6 +762,9 @@ impl MailDelays<'_> {
 }
 
 #[cfg(test)]
+type ReferenceMailClaims = HashMap<(String, String), Vec<(String, i64, Vec<String>)>>;
+
+#[cfg(test)]
 fn unread_notices(
     group: &GroupDoc,
     eligible: &[&cccc_contracts::Actor],
@@ -557,6 +777,7 @@ fn unread_notices(
     let mut notices = Vec::new();
     let generations = inbox::actor_generation_positions(events);
     let now = Utc::now().timestamp();
+    let mail_repeat = delivery_timing_value(group, "mail_notice_repeat_seconds", 0);
     let resume_at = events.iter().rev().find_map(|event| {
         let resumed = event.kind == "group.start"
             || (event.kind == "group.set_state"
@@ -574,7 +795,7 @@ fn unread_notices(
     let mut actor_resumes = HashMap::<String, i64>::new();
     // Each Mail notice, keyed by its own event id: a withdrawn notice was never
     // sent and must not stop the next one.
-    let mut mail_claims = HashMap::<(String, String), Vec<(String, Vec<String>)>>::new();
+    let mut mail_claims = ReferenceMailClaims::new();
     let mut reply_claims = HashSet::<(String, String, String)>::new();
     for (position, event) in events.iter().enumerate() {
         match event.kind.as_str() {
@@ -650,7 +871,7 @@ fn unread_notices(
                     mail_claims
                         .entry((actor_id.into(), created_at.into()))
                         .or_default()
-                        .push((event.id.clone(), source_ids));
+                        .push((event.id.clone(), timestamp(&event.ts, now), source_ids));
                 } else {
                     reply_claims.extend(
                         source_ids
@@ -761,12 +982,19 @@ fn unread_notices(
                 .into_iter()
                 .flatten()
                 .rev()
-                .filter(|(notice_id, _)| {
-                    deliveries
+                .filter(|(notice_id, claimed_at, _)| {
+                    match deliveries
                         .get(&(notice_id.clone(), actor.id.clone()))
-                        .is_none_or(|(state, _, _)| state != "withdrawn")
+                        .map(|(state, _, _)| state.as_str())
+                    {
+                        Some("withdrawn") => false,
+                        Some("accepted" | "ambiguous") => {
+                            mail_repeat <= 0 || now - claimed_at < mail_repeat
+                        }
+                        _ => true,
+                    }
                 })
-                .any(|(_, claimed)| {
+                .any(|(_, _, claimed)| {
                     let claimed = claimed
                         .iter()
                         .filter(|source| positions.contains_key(*source))
@@ -828,7 +1056,7 @@ fn unread_notices(
     notices
 }
 
-fn delivery_timing_value(group: &GroupDoc, key: &str, default: i64) -> i64 {
+pub(crate) fn delivery_timing_value(group: &GroupDoc, key: &str, default: i64) -> i64 {
     group
         .extra
         .get("delivery")
@@ -879,6 +1107,160 @@ pub(crate) fn notice_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text asks the stand-up to hand a deeper look to the team review
+    /// rather than run it, and not to probe capability state to decide.
+    #[test]
+    fn the_standup_leaves_the_review_to_the_user_and_its_reminder() {
+        for promise in [
+            "share only what the user authorized and the team's work needs",
+            "honor any confidentiality limits",
+            "Do not include its ID unless the user specifically agreed.",
+            "facts the Group can see or the user allowed you to share",
+            "a one-off fix needs none",
+            "add a line starting with \"Review:\"",
+            "whose title starts with \"Review:\"",
+            "start by saying it authorizes no change",
+            "point to it instead of copying it",
+            "when unsure, do not ask",
+            "Something merely noticed needs no task.",
+            "do not run the review skill from here",
+            "Do not check capability state just to decide this",
+        ] {
+            assert!(STANDUP_SNIPPET.contains(promise), "{promise}");
+        }
+    }
+
+    fn two_recipient_rule() -> (tempfile::TempDir, HomeLayout, GroupStore, GroupDoc, Value) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = HomeLayout::from_path(temp.path()).expect("home");
+        let store = GroupStore::new(home.clone()).expect("store");
+        let group = store.create("manual test", "").expect("group");
+        let rule = json!({
+            "id":"reminder", "enabled":true, "to":["first", "second"],
+            "trigger":{"kind":"interval", "every_seconds":60, "max_runs":2},
+            "action":{"kind":"notify", "message":"check in"}
+        });
+        store
+            .mutate(&group.group_id, |group| {
+                actors::add(group, cccc_contracts::Actor::new("first"))?;
+                actors::add(group, cccc_contracts::Actor::new("second"))?;
+                group
+                    .automation
+                    .insert("rules".into(), json!([rule.clone()]));
+                Ok(())
+            })
+            .expect("configure");
+        let group = store.load(&group.group_id).expect("load group");
+        (temp, home, store, group, rule)
+    }
+
+    #[test]
+    fn manual_partial_append_keeps_committed_notice_and_records_the_run() {
+        let (_temp, home, store, group, rule) = two_recipient_rule();
+        let mut writes = 0;
+        let result = notify_rule_now_with(
+            &home,
+            &group,
+            "reminder",
+            rule.as_object().expect("rule"),
+            &mut |path, event| {
+                writes += 1;
+                if writes == 2 {
+                    Err(io::Error::other("disk full"))
+                } else {
+                    ledger::append(path, event)
+                }
+            },
+        )
+        .expect("committed results");
+        assert_eq!(result.notifications.len(), 1);
+        assert!(result.failure.is_some());
+        assert_eq!(
+            result.notifications[0].data["context"]["run_kind"],
+            "manual"
+        );
+        let saved = state::load(&store, &group.group_id).expect("saved state");
+        assert_eq!(saved.last_run["reminder"].kind, "manual");
+        assert!(!saved.last_rule.contains_key("reminder"));
+        assert!(!saved.fired_count.contains_key("reminder"));
+        let ledger =
+            ledger::read_all(&store.ledger_path(&group.group_id).expect("ledger")).expect("events");
+        assert!(
+            ledger
+                .iter()
+                .any(|event| event.id == result.notifications[0].id)
+        );
+    }
+
+    #[test]
+    fn scheduled_partial_append_keeps_committed_notice_and_advances_once() {
+        let (_temp, _home, store, group, _rule) = two_recipient_rule();
+        let mut state = RuntimeState::default();
+        state
+            .last_rule
+            .insert("reminder".into(), Utc::now().timestamp() - 120);
+        let mut result = TickResult::default();
+        let mut writes = 0;
+        tick_rules_with(
+            &store,
+            &group,
+            &mut state,
+            &mut result,
+            &mut |path, event| {
+                writes += 1;
+                if writes == 2 {
+                    Err(io::Error::other("disk full"))
+                } else {
+                    ledger::append(path, event)
+                }
+            },
+        )
+        .expect("committed result");
+        assert_eq!(result.notifications.len(), 1);
+        assert!(result.rule_failure.is_some());
+        assert_eq!(
+            result.notifications[0].data["context"]["run_kind"],
+            "scheduled"
+        );
+        assert_eq!(state.last_run["reminder"].kind, "scheduled");
+        assert_eq!(state.fired_count["reminder"], 1);
+        state::save(&store, &group.group_id, &state).expect("save state");
+        assert_eq!(
+            state::load(&store, &group.group_id)
+                .expect("reload")
+                .last_run["reminder"]
+                .kind,
+            "scheduled"
+        );
+    }
+
+    #[test]
+    fn state_write_failure_retains_notices_but_defers_control_actions() {
+        let mut result = TickResult::default();
+        result
+            .notifications
+            .push(Event::new("system.notify", "g_test"));
+        result.actions.push(ScheduledAction::GroupState {
+            group_id: "g_test".into(),
+            state: "stopped".into(),
+            rule_id: "stop".into(),
+            fired_at: 1,
+            one_time: true,
+        });
+        result
+            .completed_rules
+            .push(("g_test".into(), "limited".into()));
+        result.rule_failure = Some(io::Error::other("notification append failed"));
+        retain_committed_after_state_failure(&mut result, io::Error::other("state write failed"))
+            .expect("retain committed notice");
+        assert_eq!(result.notifications.len(), 1);
+        assert!(result.actions.is_empty());
+        assert!(result.completed_rules.is_empty());
+        let error = result.rule_failure.expect("reported failure").to_string();
+        assert!(error.contains("notification append failed"));
+        assert!(error.contains("state write failed"));
+    }
 
     /// Private replay evidence is supplied by the operator, never checked in.
     /// Run alone so the decode counter has no concurrent test producers.
@@ -1257,3 +1639,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "automation/mail_notice_repeat_tests.rs"]
+mod mail_notice_repeat_tests;

@@ -61,12 +61,17 @@ pub(super) fn spawn(
 }
 
 pub(super) fn stop_after_provider_exit(session: &Session) {
-    record_provider_exit_if_first(
-        session.stop_after_process_exit(),
-        &session.home,
-        &session.group_id,
-        &session.actor_id,
-    );
+    let first = session.stop_after_process_exit();
+    if first
+        && crate::session_owner::retain_provider_exit(
+            &session.group_id,
+            &session.actor_id,
+            session.managed.generation(),
+        )
+    {
+        return;
+    }
+    record_provider_exit_if_first(first, &session.home, &session.group_id, &session.actor_id);
 }
 
 #[cfg(test)]
@@ -94,6 +99,7 @@ pub(crate) async fn verify_claude_reader_release(
         home,
         group_id: group.group_id.clone(),
         actor_id: "claude-reader".into(),
+        workspace: Default::default(),
         managed: Arc::clone(&managed),
         has_terminal: AtomicBool::new(false),
         viewer: Mutex::new(None),
@@ -108,6 +114,7 @@ pub(crate) async fn verify_claude_reader_release(
         stop_lock: Mutex::new(()),
         startup_prompt: Mutex::new(None),
         active_turn: Mutex::new(None),
+        journal_private: Vec::new(),
     });
     let weak = Arc::downgrade(&session);
     let receiver = managed.subscribe();

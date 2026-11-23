@@ -6,9 +6,12 @@ export type TextScale = 70 | 90 | 100 | 125;
 
 export type GroupRuntimeStatus = {
   lifecycle_state: "active" | "idle" | "paused" | "stopped" | string;
-  runtime_running: boolean;
-  running_actor_count: number;
-  has_running_foreman: boolean;
+  /** False when the daemon could not observe some managed member. The observation fields
+   * below are then omitted: whether anything runs is not known. */
+  available?: boolean;
+  runtime_running?: boolean;
+  running_actor_count?: number;
+  has_running_foreman?: boolean;
 };
 
 export type GroupMeta = {
@@ -68,6 +71,8 @@ export type WorkspaceFile = {
 
 export type GroupDoc = {
   generation?: string;
+  /** Names the generation of a Group created before generations were stored. */
+  created_at?: string;
   group_id: string;
   title?: string;
   topic?: string;
@@ -76,6 +81,7 @@ export type GroupDoc = {
   running?: boolean;
   state?: "active" | "idle" | "paused" | "stopped";
   runtime_status?: GroupRuntimeStatus;
+  runtime_switches?: Array<{ actor_id?: string; actor_generation?: string; pending?: boolean }>;
 };
 
 // Server-backed attachment metadata carried by canonical ledger events.
@@ -215,12 +221,21 @@ export type ConnectMessageRouting = {
   reply_to?: { event_id: string; delivery_id: string } | null;
 };
 
+export type UserReplyRequestStatus = {
+  question: "valid" | "none" | "unavailable";
+  requester: "available" | "unavailable" | "unknown" | "unsupported";
+  reply_event_id?: string;
+  reply_by?: "user" | "svc:chet";
+  reply_route?: "composer";
+};
+
 export type ChatMessageData = {
   connect_message?: ConnectMessageRouting;
   text?: string;
   insight?: string;
   to?: string[];
   message_mode?: MessageMode;
+  question?: unknown;
   sender_title?: string;
   sender_runtime?: string;
   sender_avatar_path?: string;
@@ -255,11 +270,23 @@ export type ChatMessageData = {
   attachments?: MessageAttachment[];
 };
 
+export type DeliveryEvidence = "terminal_written" | "channel_accepted";
+
+export type DeliveryWaitingReason =
+  | "group_paused"
+  | "group_stopped"
+  | "member_disabled"
+  | "runtime_switch"
+  | "not_submitted";
+
 export type ObligationStatus = {
   replied: boolean;
   reply_requested: boolean;
   cancelled: boolean;
   delivery_state: "" | "claimed" | "accepted" | "failed" | "ambiguous" | string;
+  delivery_reason?: string;
+  delivery_evidence?: DeliveryEvidence | string;
+  waiting_reason?: DeliveryWaitingReason | string;
 };
 
 // Mail read receipt payload
@@ -279,11 +306,13 @@ export type LedgerEvent = {
   ts?: string;
   kind?: string;
   group_id?: string;
+  scope_key?: string;
   by?: string;
   data?: LedgerEventData;
   _streaming?: boolean;
   _read_status?: Record<string, boolean>;
   _obligation_status?: Record<string, ObligationStatus>;
+  _user_request?: UserReplyRequestStatus;
   _retired_bridge?: boolean;
   _connect_delivery?: ConnectDeliveryStatus;
   _connect_cancellation?: ConnectDeliveryStatus;
@@ -304,6 +333,7 @@ export type HeadlessStreamEvent = {
 export type LedgerEventStatusPayload = {
   read_status?: Record<string, boolean>;
   obligation_status?: Record<string, ObligationStatus>;
+  user_request?: UserReplyRequestStatus;
   retired_bridge?: boolean;
   connect_delivery?: ConnectDeliveryStatus;
   connect_cancellation?: ConnectDeliveryStatus;
@@ -321,24 +351,32 @@ export type WebModelDeliveryStatusPayload = {
 export type RuntimeMode = "default" | "acp";
 
 export type Actor = {
+  /** User-owned native runtime; CCCC manages collaboration access only. */
+  external_session_id?: string;
   id: string;
   generation?: string;
+  created_at?: string;
   role?: string;
   internal_kind?: string | null;
   title?: string;
+  model_label?: string;
+  avatar_asset_path?: string;
   avatar_url?: string | null;
   has_custom_avatar?: boolean;
   enabled?: boolean;
   running?: boolean; // Actual process running status
-  idle_seconds?: number | null; // Seconds since last PTY output (null if not running/headless)
+  idle_seconds?: number | null; // Legacy idle duration, independent of terminal output activity.
   effective_working_state?: "stopped" | "idle" | "working" | "waiting" | "stuck" | string;
   effective_working_reason?: string;
   effective_working_updated_at?: string | null;
   effective_active_task_id?: string | null;
+  /** Set when the daemon could not observe this agent ("unknown" working state, no `running`). */
+  runtime_observation_error?: string;
   command?: string[];
   env?: Record<string, string>;
   capability_autoload?: string[];
   capability_hidden?: string[];
+  default_scope_key?: string;
   runner?: string;
   runner_effective?: string;
   runtime?: string;
@@ -349,6 +387,18 @@ export type Actor = {
   runtime_session_status?: string | null;
   runtime_session_resume_eligible?: boolean | null;
   runtime_session_last_resume_error?: string | null;
+  runtime_session_replaced_at?: string | null;
+  runtime_session_replaced_reasons?: string[] | null;
+  /** The member's terminal is waiting for the user before managed runtime admission: Claude's
+   *  confirmation or Hermes's first setup. */
+  runtime_confirmation_required?: boolean;
+  /** That confirmation or setup ended before admission, or an ordinary terminal closed before
+   *  its startup input: automatic retries are paused in the current daemon process, and an
+   *  explicit retry can clear it. Absent when the daemon cannot observe it. */
+  runtime_confirmation_paused?: boolean;
+  /** An ordinary terminal's first automatic input waits for its chat input region; present
+   *  only while it waits. `generation` names that terminal process for an explicit release. */
+  runtime_startup_input?: { generation: string } | null;
   submit?: "enter" | "newline" | "none";
   profile_id?: string;
   profile_scope?: "global" | "user";
@@ -417,9 +467,81 @@ export type CapabilityReadinessPreview = {
   policy_mode?: string;
 };
 
+/** One area a release recommendation is listed under, and why. */
+export type CapabilityRecommendationEntry = {
+  domain_id: string;
+  role: "primary" | "alternative";
+  reason?: string;
+};
+
+/** One observation of how far a recommendation was checked, on which build. */
+export type CapabilityVerification = {
+  level: "listed" | "install_checked" | "tool_call_checked" | "task_checked";
+  outcome: "passed" | "failed";
+  build?: string;
+  path?: string;
+  result?: string;
+  observed_at?: string;
+};
+
+export type CapabilitySupport = {
+  auth?: "none" | "bearer" | "api_key" | "oauth" | "account";
+  prerequisites?: string[];
+  limitations?: string[];
+  form?: string;
+  runs_on?: string;
+};
+
+/** Whether one member can use a capability, as the daemon projects it. */
+export type CapabilityForYou = {
+  availability: "compatible" | "needs_setup" | "unknown" | "unsupported";
+  enabled: boolean;
+  blocked: boolean;
+  reason_codes: string[];
+  /** The member setting a token is read from, when one is missing. */
+  credential_env?: string;
+  /** Where that setting lives: the member's own private environment or its linked Profile. */
+  credential_source?: "actor" | "profile";
+  /** Enabled with a token, but not yet checked with the current token and recipe. */
+  activation_pending?: boolean;
+};
+
+/** Whether the one global installation of an MCP can be replaced by the current recipe. */
+export type CapabilityUpdateInfo = {
+  available: boolean;
+  scope: "global";
+  enabled_group_count: number;
+  recipe_fingerprint: string | null;
+  installed_recipe_fingerprint: string | null;
+  reason: "not_installed" | "recipe_unknown" | "recipe_changed" | "current";
+  unavailable_reason?: "delivery_form_not_supported" | "credential_route_not_supported" | null;
+};
+
+export type CapabilityBindingScopeName = "session" | "actor" | "group";
+
+export type CapabilityMemberProjection = CapabilityForYou & {
+  actor_id: string;
+  enabled_scope: CapabilityBindingScopeName | null;
+  enabled_scopes: CapabilityBindingScopeName[];
+  last_call: { at: string; ok: boolean } | null;
+};
+
+export type CapabilityDomain = { domain_id: string; name: string };
+
 export type CapabilityOverviewItem = {
   capability_id: string;
   kind?: string;
+  content_origin?: "release_recommendation" | "builtin" | "user_catalog";
+  read_only?: boolean;
+  recommendation?: CapabilityRecommendationEntry[];
+  requirements_summary?: string;
+  verification?: CapabilityVerification[];
+  support?: CapabilitySupport;
+  for_you?: CapabilityForYou;
+  group_enabled?: boolean;
+  members?: CapabilityMemberProjection[];
+  blocked_group?: boolean;
+  update?: CapabilityUpdateInfo;
   name?: string;
   description_short?: string;
   use_when?: string[];
@@ -435,6 +557,7 @@ export type CapabilityOverviewItem = {
   trust_tier?: string;
   license?: string;
   sync_state?: string;
+  legacy_search_unverified?: boolean;
   updated_at_source?: string;
   last_synced_at?: string;
   policy_level?: string;
@@ -457,28 +580,7 @@ export type CapabilityOverviewItem = {
   tool_names?: string[];
 };
 
-export type CapabilitySourceState = {
-  source_id: string;
-  enabled: boolean;
-  source_level?: string;
-  rationale?: string;
-  sync_state?: string;
-  last_synced_at?: string;
-  staleness_seconds?: number;
-  record_count?: number;
-  error?: string;
-};
-
-export type CapabilitySourceInstance = {
-  source_instance_key: string;
-  source_id: string;
-  label?: string;
-  source_uri?: string;
-  record_count?: number;
-  capability_ids?: string[];
-  last_synced_at?: string;
-  sync_state?: string;
-};
+export type CapabilitySourceState = { source_id: string; record_count?: number };
 
 export type CapabilityBlockEntry = {
   capability_id: string;
@@ -610,6 +712,7 @@ export type RuntimeInfo = {
   display_name: string;
   recommended_command?: string;
   available: boolean;
+  path?: string | null;
   mode_availability?: Partial<Record<RuntimeMode, boolean>>;
 };
 
@@ -617,10 +720,11 @@ export type ReplyTarget = {
   eventId: string;
   by: string;
   text: string;
+  /** A reply to a message Chet wrote goes back to Chet, which has no Mail. */
+  toChet?: boolean;
   connectInstanceId?: string;
   remoteDstGroupId?: string;
   remoteDstTo?: string[];
-  remoteReplyToEventId?: string;
 } | null;
 
 export type TaskStep = {
@@ -640,6 +744,8 @@ export type TaskChecklistItem = { id: string; text: string; status?: ChecklistSt
 
 export type Task = {
   id: string;
+  /** Daemon-owned revision used to protect edits against concurrent changes. */
+  rev?: number;
   title?: string | null;
   outcome?: string | null;
   parent_id?: string | null;
@@ -648,6 +754,8 @@ export type Task = {
   assignee?: string | null;
   priority?: string | null;
   blocked_by?: string[];
+  /** Read-only dependencies not yet completed, including missing task IDs. */
+  open_blocked_by?: string[];
   waiting_on?: TaskWaitingOn | null;
   handoff_to?: string | null;
   task_type?: string | null;
@@ -659,6 +767,57 @@ export type Task = {
   current_step?: string | null;
   progress?: number | null;
   children?: Task[];
+  /** The backlog entry this task came from. */
+  source?: BacklogSource | null;
+};
+
+/** A task's link to an entry in the project's backlog file. */
+export type BacklogSource = { scope_key: string; path: string; entry_id: string };
+
+export type BacklogProblem = { code: string; line: number; message: string };
+
+export type BacklogTaskLink = {
+  id: string;
+  title: string;
+  status: string;
+  assignee?: string | null;
+};
+
+export type BacklogEntry = {
+  /** Null until a write adds one; such an entry is addressed by its heading line. */
+  id: string | null;
+  title: string;
+  line: number;
+  /** The exact text after the heading line, as the file holds it. */
+  body: string;
+  problems: BacklogProblem[];
+  tasks: BacklogTaskLink[];
+};
+
+export type BacklogSection = {
+  /** Empty for the text before the first section heading. */
+  name: string;
+  line: number;
+  closed: boolean;
+  entries: BacklogEntry[];
+};
+
+export type BacklogSnapshot = {
+  configured: boolean;
+  scope_key: string;
+  scope_url: string;
+  path: string;
+  exists: boolean;
+  sha256: string;
+  git: { repository: boolean; tracked: boolean; ignored: boolean } | null;
+  problems: BacklogProblem[];
+  sections: BacklogSection[];
+};
+
+export type BacklogWriteResult = BacklogSnapshot & {
+  entry_id?: string;
+  task_id?: string;
+  reused?: boolean;
 };
 
 export type CoordinationBrief = {
@@ -669,13 +828,6 @@ export type CoordinationBrief = {
   project_brief_stale?: boolean;
   updated_by?: string | null;
   updated_at?: string | null;
-};
-
-export type CoordinationNote = {
-  at?: string | null;
-  by?: string | null;
-  summary?: string | null;
-  task_id?: string | null;
 };
 
 export type GroupTasksSummary = {
@@ -732,6 +884,8 @@ export type PresentationBrowserSurfaceState = {
   error?: { code?: string | null; message?: string | null } | null;
   strategy?: string | null;
   url?: string | null;
+  /** Address used to create this shared session; `url` changes as someone navigates it. */
+  initial_url?: string | null;
   width?: number;
   height?: number;
   started_at?: string | null;
@@ -768,12 +922,7 @@ export type ContextDetailLevel = "overview" | "summary" | "full";
 export type GroupContext = {
   version?: string;
   tasks_version?: string;
-  coordination?: {
-    brief?: CoordinationBrief | null;
-    tasks?: Task[];
-    recent_decisions?: CoordinationNote[];
-    recent_handoffs?: CoordinationNote[];
-  };
+  coordination?: { brief?: CoordinationBrief | null; tasks?: Task[] };
   agent_states?: AgentState[];
   actors_runtime?: ActorRuntimeState[];
   attention?: ContextAttention | null;
@@ -791,19 +940,11 @@ export type AgentsMdInfo = {
 
 export type GroupSettings = {
   default_send_to: "foreman" | "broadcast";
-  actor_idle_timeout_seconds: number;
-  keepalive_delay_seconds: number;
-  keepalive_max_per_actor: number;
-  silence_timeout_seconds: number;
-  help_nudge_interval_seconds: number;
-  help_nudge_min_messages: number;
   mail_notice_after_seconds: number;
   mail_notice_idle_after_seconds: number;
   reply_notice_after_seconds: number;
 
   terminal_transcript_visibility: "off" | "foreman" | "all";
-  terminal_transcript_notify_tail: boolean;
-  terminal_transcript_notify_lines: number;
 };
 
 export type BuiltinAssistantPolicy = {
@@ -1000,6 +1141,7 @@ export type AssistantVoiceDocument = {
   workspace_path?: string;
   content?: string;
   content_sha256?: string;
+  content_target_id?: string;
   content_chars?: number;
   revision_count?: number;
   source_segment_count?: number;
@@ -1424,9 +1566,18 @@ export type GroupSpaceSyncResult = {
   errors?: Array<Record<string, unknown>>;
 };
 
-export type AutomationRuleTriggerInterval = { kind: "interval"; every_seconds: number };
+export type AutomationRuleTriggerInterval = {
+  kind: "interval";
+  every_seconds: number;
+  max_runs?: number;
+};
 
-export type AutomationRuleTriggerCron = { kind: "cron"; cron: string; timezone?: string };
+export type AutomationRuleTriggerCron = {
+  kind: "cron";
+  cron: string;
+  timezone?: string;
+  max_runs?: number;
+};
 
 export type AutomationRuleTriggerAt = { kind: "at"; at: string };
 
@@ -1465,13 +1616,22 @@ export type AutomationSnippetCatalog = {
 };
 
 export type AutomationRuleStatus = {
+  /** The scheduler's clock base, written on resume too; not evidence of a run. */
   last_fired_at?: string;
   last_error_at?: string;
   last_error?: string;
-  next_fire_at?: string;
+  next_fire_at?: string | null;
+  fired_count?: number;
   completed?: boolean;
   completed_at?: string;
+  /** When a notification of this rule last reached the ledger; null when unknown. */
+  last_run_at?: string | null;
+  last_run_kind?: "scheduled" | "manual" | null;
+  /** Why the rule will not fire now, from the daemon's own Group state. */
+  suppressed_reason?: "group_paused" | "group_stopped" | "idle_standup" | null;
 };
+
+export type AutomationRunResult = { rule_id: string; run_at: string; notified: string[] };
 
 export type GroupAutomation = {
   ruleset: AutomationRuleSet;
@@ -1612,7 +1772,7 @@ export const RUNTIME_INFO: Record<string, { label: string; desc: string }> = {
   codex: { label: "Codex CLI", desc: "" },
   deepseek: {
     label: "DeepSeek Harness",
-    desc: "Experimental ACP runtime; CCCC installs its pinned composition on first start",
+    desc: "Experimental ACP runtime. Install with cccc setup --runtime deepseek.",
   },
   copilot: { label: "GitHub Copilot CLI", desc: "Uses Copilot's native terminal with CCCC MCP" },
   cursor: {
@@ -1647,311 +1807,8 @@ export const RUNTIME_INFO: Record<string, { label: string; desc: string }> = {
   custom: { label: "Custom", desc: "Manual MCP installation needed" },
 };
 
-// Runtime colors for visual distinction
-// Dark theme: semi-transparent dark backgrounds with bright text
-// Light theme: semi-transparent light backgrounds with darker text
-export const RUNTIME_COLORS: Record<
-  string,
-  {
-    // Dark theme
-    bg: string;
-    text: string;
-    border: string;
-    dot: string;
-    // Light theme
-    bgLight: string;
-    textLight: string;
-    borderLight: string;
-    dotLight: string;
-  }
-> = {
-  pi: {
-    bg: "bg-slate-900/40",
-    text: "text-slate-200",
-    border: "border-slate-500/60",
-    dot: "bg-slate-300",
-    bgLight: "bg-slate-100",
-    textLight: "text-slate-800",
-    borderLight: "border-slate-300",
-    dotLight: "bg-slate-600",
-  },
-  amp: {
-    bg: "bg-rose-900/30",
-    text: "text-rose-300",
-    border: "border-rose-600/50",
-    dot: "bg-rose-400",
-    bgLight: "bg-rose-50",
-    textLight: "text-rose-700",
-    borderLight: "border-rose-300",
-    dotLight: "bg-rose-500",
-  },
-  auggie: {
-    bg: "bg-teal-900/30",
-    text: "text-teal-300",
-    border: "border-teal-600/50",
-    dot: "bg-teal-400",
-    bgLight: "bg-teal-50",
-    textLight: "text-teal-700",
-    borderLight: "border-teal-300",
-    dotLight: "bg-teal-500",
-  },
-  claude: {
-    bg: "bg-orange-900/30",
-    text: "text-orange-300",
-    border: "border-orange-600/50",
-    dot: "bg-orange-400",
-    bgLight: "bg-orange-50",
-    textLight: "text-orange-700",
-    borderLight: "border-orange-300",
-    dotLight: "bg-orange-500",
-  },
-  cline: {
-    bg: "bg-gray-900/40",
-    text: "text-gray-200",
-    border: "border-gray-500/60",
-    dot: "bg-gray-300",
-    bgLight: "bg-gray-100",
-    textLight: "text-gray-800",
-    borderLight: "border-gray-300",
-    dotLight: "bg-gray-600",
-  },
-  codex: {
-    bg: "bg-emerald-900/30",
-    text: "text-emerald-300",
-    border: "border-emerald-600/50",
-    dot: "bg-emerald-400",
-    bgLight: "bg-emerald-50",
-    textLight: "text-emerald-700",
-    borderLight: "border-emerald-300",
-    dotLight: "bg-emerald-500",
-  },
-  copilot: {
-    bg: "bg-slate-900/40",
-    text: "text-slate-200",
-    border: "border-slate-500/60",
-    dot: "bg-slate-300",
-    bgLight: "bg-slate-100",
-    textLight: "text-slate-800",
-    borderLight: "border-slate-300",
-    dotLight: "bg-slate-600",
-  },
-  cursor: {
-    bg: "bg-zinc-900/40",
-    text: "text-zinc-200",
-    border: "border-zinc-500/60",
-    dot: "bg-zinc-300",
-    bgLight: "bg-zinc-100",
-    textLight: "text-zinc-800",
-    borderLight: "border-zinc-300",
-    dotLight: "bg-zinc-600",
-  },
-  devin: {
-    bg: "bg-sky-900/30",
-    text: "text-sky-300",
-    border: "border-sky-600/50",
-    dot: "bg-sky-400",
-    bgLight: "bg-sky-50",
-    textLight: "text-sky-700",
-    borderLight: "border-sky-300",
-    dotLight: "bg-sky-500",
-  },
-  kiro: {
-    bg: "bg-purple-900/30",
-    text: "text-purple-300",
-    border: "border-purple-600/50",
-    dot: "bg-purple-400",
-    bgLight: "bg-purple-50",
-    textLight: "text-purple-700",
-    borderLight: "border-purple-300",
-    dotLight: "bg-purple-500",
-  },
-  kilo: {
-    bg: "bg-lime-900/30",
-    text: "text-lime-300",
-    border: "border-lime-600/50",
-    dot: "bg-lime-400",
-    bgLight: "bg-lime-50",
-    textLight: "text-lime-800",
-    borderLight: "border-lime-300",
-    dotLight: "bg-lime-500",
-  },
-  antigravity: {
-    bg: "bg-blue-900/30",
-    text: "text-blue-300",
-    border: "border-blue-600/50",
-    dot: "bg-blue-400",
-    bgLight: "bg-blue-50",
-    textLight: "text-blue-700",
-    borderLight: "border-blue-300",
-    dotLight: "bg-blue-500",
-  },
-  droid: {
-    bg: "bg-violet-900/30",
-    text: "text-violet-300",
-    border: "border-violet-600/50",
-    dot: "bg-violet-400",
-    bgLight: "bg-violet-50",
-    textLight: "text-violet-700",
-    borderLight: "border-violet-300",
-    dotLight: "bg-violet-500",
-  },
-  grok: {
-    bg: "bg-neutral-900/40",
-    text: "text-neutral-200",
-    border: "border-neutral-500/60",
-    dot: "bg-neutral-300",
-    bgLight: "bg-neutral-100",
-    textLight: "text-neutral-800",
-    borderLight: "border-neutral-300",
-    dotLight: "bg-neutral-600",
-  },
-  hermes: {
-    bg: "bg-cyan-900/30",
-    text: "text-cyan-300",
-    border: "border-cyan-600/50",
-    dot: "bg-cyan-400",
-    bgLight: "bg-cyan-50",
-    textLight: "text-cyan-700",
-    borderLight: "border-cyan-300",
-    dotLight: "bg-cyan-500",
-  },
-  kimi: {
-    bg: "bg-lime-900/30",
-    text: "text-lime-300",
-    border: "border-lime-600/50",
-    dot: "bg-lime-400",
-    bgLight: "bg-lime-50",
-    textLight: "text-lime-700",
-    borderLight: "border-lime-300",
-    dotLight: "bg-lime-500",
-  },
-  opencode: {
-    bg: "bg-stone-900/40",
-    text: "text-stone-200",
-    border: "border-stone-500/60",
-    dot: "bg-stone-300",
-    bgLight: "bg-stone-100",
-    textLight: "text-stone-800",
-    borderLight: "border-stone-300",
-    dotLight: "bg-stone-600",
-  },
-  web_model: {
-    bg: "bg-indigo-900/30",
-    text: "text-indigo-300",
-    border: "border-indigo-600/50",
-    dot: "bg-indigo-400",
-    bgLight: "bg-indigo-50",
-    textLight: "text-indigo-700",
-    borderLight: "border-indigo-300",
-    dotLight: "bg-indigo-500",
-  },
-  chatgpt_dots: {
-    bg: "bg-indigo-900/30",
-    text: "text-indigo-300",
-    border: "border-indigo-600/50",
-    dot: "bg-indigo-400",
-    bgLight: "bg-indigo-50",
-    textLight: "text-indigo-700",
-    borderLight: "border-indigo-300",
-    dotLight: "bg-indigo-500",
-  },
-  grok_web_model: {
-    bg: "bg-indigo-900/30",
-    text: "text-indigo-300",
-    border: "border-indigo-600/50",
-    dot: "bg-indigo-400",
-    bgLight: "bg-indigo-50",
-    textLight: "text-indigo-700",
-    borderLight: "border-indigo-300",
-    dotLight: "bg-indigo-500",
-  },
-  custom: {
-    bg: "bg-zinc-800/50",
-    text: "text-zinc-300",
-    border: "border-zinc-500/50",
-    dot: "bg-zinc-400",
-    bgLight: "bg-zinc-100",
-    textLight: "text-zinc-700",
-    borderLight: "border-zinc-300",
-    dotLight: "bg-zinc-500",
-  },
-  user: {
-    bg: "bg-sky-900/30",
-    text: "text-sky-300",
-    border: "border-sky-600/50",
-    dot: "bg-sky-400",
-    bgLight: "bg-sky-50",
-    textLight: "text-sky-700",
-    borderLight: "border-sky-300",
-    dotLight: "bg-sky-500",
-  },
-};
-
-// Helper to get runtime color, with fallback
-export function getRuntimeColor(runtime?: string, isDark: boolean = true) {
-  const colors = RUNTIME_COLORS[runtime || "codex"] || RUNTIME_COLORS.codex;
-  if (isDark) {
-    return { bg: colors.bg, text: colors.text, border: colors.border, dot: colors.dot };
-  }
-  return {
-    bg: colors.bgLight,
-    text: colors.textLight,
-    border: colors.borderLight,
-    dot: colors.dotLight,
-  };
-}
-
-const ACTOR_ACCENTS = [
-  // Dark theme accents are intentionally soft (low-saturation ring + readable name color).
-  {
-    ring: "ring-sky-400/35",
-    text: "text-sky-300",
-    ringLight: "ring-sky-300",
-    textLight: "text-sky-700",
-  },
-  {
-    ring: "ring-indigo-400/35",
-    text: "text-indigo-300",
-    ringLight: "ring-indigo-300",
-    textLight: "text-indigo-700",
-  },
-  {
-    ring: "ring-violet-400/35",
-    text: "text-violet-300",
-    ringLight: "ring-violet-300",
-    textLight: "text-violet-700",
-  },
-  {
-    ring: "ring-fuchsia-400/35",
-    text: "text-fuchsia-300",
-    ringLight: "ring-fuchsia-300",
-    textLight: "text-fuchsia-700",
-  },
-  {
-    ring: "ring-cyan-400/35",
-    text: "text-cyan-300",
-    ringLight: "ring-cyan-300",
-    textLight: "text-cyan-700",
-  },
-  {
-    ring: "ring-teal-400/35",
-    text: "text-teal-300",
-    ringLight: "ring-teal-300",
-    textLight: "text-teal-700",
-  },
-  {
-    ring: "ring-emerald-400/35",
-    text: "text-emerald-300",
-    ringLight: "ring-emerald-300",
-    textLight: "text-emerald-700",
-  },
-  {
-    ring: "ring-amber-400/35",
-    text: "text-amber-300",
-    ringLight: "ring-amber-300",
-    textLight: "text-amber-700",
-  },
-];
+/** Number of accent slots; an actor keeps its slot, and the LCD accent it maps to. */
+const ACTOR_ACCENT_COUNT = 8;
 
 function _fnv1a32(input: string): number {
   // Deterministic, fast, and stable across JS engines.
@@ -1963,12 +1820,10 @@ function _fnv1a32(input: string): number {
   return hash >>> 0;
 }
 
-export function getActorAccentColor(actorId?: string, isDark: boolean = true) {
+/** Stable per-actor slot in the accent palette. */
+export function getActorAccentIndex(actorId?: string): number {
   const id = String(actorId || "").trim();
-  const idx = id ? _fnv1a32(id) % ACTOR_ACCENTS.length : 0;
-  const a = ACTOR_ACCENTS[idx] || ACTOR_ACCENTS[0];
-  if (isDark) return { ring: a.ring, text: a.text };
-  return { ring: a.ringLight, text: a.textLight };
+  return id ? _fnv1a32(id) % ACTOR_ACCENT_COUNT : 0;
 }
 
 export function supportsAcpMode(runtime?: string | null): boolean {
@@ -1983,4 +1838,35 @@ export function supportsAcpMode(runtime?: string | null): boolean {
     "hermes",
     "droid",
   ].includes(runtime || "");
+}
+
+export interface LocalSessionSource {
+  source_id: string;
+  runtime: "codex" | "claude" | "pi" | "opencode";
+  native_session_id: string;
+  cwd: string;
+  title: string;
+  origin?: string | null;
+  connected: boolean;
+}
+
+export interface LocalSessionRecovery {
+  group_id: string;
+  actor_id: string;
+  source_id: string;
+  /** Explicit qualification result; recovery data is revalidated independently. */
+  refresh_status?: "checked" | "unavailable" | "not_checked";
+  recovery: {
+    state:
+      | "connected"
+      | "disconnected"
+      | "host_exited"
+      | "session_ended"
+      | "integration_disabled"
+      | "unknown";
+    cwd: string | null;
+    shell: "posix" | "powershell";
+    /** Server-quoted command for the declared shell; manual use only. */
+    command: string;
+  };
 }

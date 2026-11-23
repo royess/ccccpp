@@ -2,19 +2,84 @@ use super::operation::{
     Operation,
     Policy::{Read, Write},
 };
-use cccc_contracts::{DaemonRequest, Event, RunnerKind, utc_now};
+use cccc_contracts::{Actor, DaemonRequest, Event, RunnerKind, utc_now};
 use cccc_core::integration_state;
 use cccc_core::{GroupDoc, GroupStore, HomeLayout, inbox, ledger};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::dispatch::{OpError, OpResult, first_non_blank_arg, object, required_arg, string_arg};
 
 const KEY: &str = "runtime_states";
 const DELIVERY_PREFERENCES_KEY: &str = "web_model_delivery_preferences";
 const MAX_TURN_EVENTS: usize = 20;
+
+type TurnNoticeKey = (PathBuf, String, String);
+type TurnNotice = (String, super::instruction_files::Pending);
+
+fn turn_notices() -> &'static Mutex<HashMap<TurnNoticeKey, TurnNotice>> {
+    static NOTICES: OnceLock<Mutex<HashMap<TurnNoticeKey, TurnNotice>>> = OnceLock::new();
+    NOTICES.get_or_init(Mutex::default)
+}
+
+fn turn_notice_key(home: &HomeLayout, group_id: &str, actor_id: &str) -> TurnNoticeKey {
+    (home.root().to_path_buf(), group_id.into(), actor_id.into())
+}
+
+fn web_instruction_session(root: &Path) -> String {
+    format!("web:{}", root.display())
+}
+
+/// Start monitoring when a structured actor starts; repeated starts of the
+/// same actor and workspace retain the existing observation.
+pub(super) fn record_web_instruction_baseline(home: &HomeLayout, group: &GroupDoc, actor: &Actor) {
+    let Some(scope) = super::actor_runtime::effective_scope(group, Some(actor)) else {
+        return;
+    };
+    let Some(snapshot) = super::instruction_files::Snapshot::read(&scope.path) else {
+        return;
+    };
+    super::instruction_files::record(
+        home,
+        &group.group_id,
+        actor,
+        &web_instruction_session(&scope.path),
+        snapshot,
+    );
+}
+
+fn take_turn_notice(
+    home: &HomeLayout,
+    group_id: &str,
+    actor_id: &str,
+    turn_id: &str,
+) -> Option<super::instruction_files::Pending> {
+    let mut notices = turn_notices().lock().ok()?;
+    let key = turn_notice_key(home, group_id, actor_id);
+    if notices.get(&key).is_some_and(|(turn, _)| turn == turn_id) {
+        notices.remove(&key).map(|(_, notice)| notice)
+    } else {
+        None
+    }
+}
+
+/// Dots and Grok finish their private claim and create an execution token
+/// after `wait_next_turn`. The notice is committed only if that outer claim
+/// succeeds and can return the payload to the model.
+pub(super) fn confirm_pulled_instruction_notice(
+    home: &HomeLayout,
+    group_id: &str,
+    actor_id: &str,
+    turn_id: &str,
+) {
+    if let Some(notice) = take_turn_notice(home, group_id, actor_id, turn_id) {
+        notice.delivered();
+    }
+}
 
 pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
     Some(match request.op.as_str() {
@@ -302,37 +367,11 @@ pub(super) fn wait_next_turn(home: &HomeLayout, request: &DaemonRequest) -> OpRe
             group.state,
             cccc_contracts::GroupState::Paused | cccc_contracts::GroupState::Stopped
         )
+        || !pull_admitted(&group, actor)
     {
         return object(
             json!({"status":"stopped","turn":null,"instructions":"This CCCC structured actor is stopped."}),
         );
-    }
-    let active_state = actor_state(home, &group.group_id, &actor_id)?;
-    // Status heartbeats do not relinquish a turn. Only its completion clears
-    // this identity; the browser may still be submitting its claimed payload.
-    if active_state["active_turn_id"]
-        .as_str()
-        .is_some_and(|value| !value.is_empty())
-    {
-        return object(json!({
-            "status":"turn_in_progress",
-            "turn":null,
-            "active_turn_id":active_state["active_turn_id"],
-            "event_ids":active_state["active_event_ids"],
-            "instructions":"Finish the active turn with cccc_runtime_complete_turn before requesting more work."
-        }));
-    }
-    let limit = request
-        .args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(20)
-        .clamp(1, 20) as usize;
-    if request.args.contains_key("kind_filter") {
-        return Err(OpError::new(
-            "unsupported_field",
-            "runtime delivery does not support Inbox kind filters",
-        ));
     }
     let transport = match string_arg(request, "transport") {
         None => "web_model_pull".to_owned(),
@@ -347,8 +386,54 @@ pub(super) fn wait_next_turn(home: &HomeLayout, request: &DaemonRequest) -> OpRe
             }
         },
     };
-    let mut messages = Vec::new();
-    for event in crate::ops::runtime_delivery::pending_sources(home, &group, actor, limit)? {
+    let active_state = actor_state(home, &group.group_id, &actor_id)?;
+    let active_turn = active_state["active_turn_id"].as_str().unwrap_or_default();
+    // A browser that left this batch staged takes the same batch back: new work
+    // would not match the draft already in its composer.
+    let resumed = if transport == "web_model_browser"
+        && !active_turn.is_empty()
+        && string_arg(request, "resume_turn_id").as_deref() == Some(active_turn)
+    {
+        staged_batch(home, &group, &actor_id, &active_state)?
+    } else {
+        None
+    };
+    // Status heartbeats do not relinquish a turn. Only its completion clears
+    // this identity; the browser may still be submitting its claimed payload.
+    if resumed.is_none() && !active_turn.is_empty() {
+        let mut result = json!({
+            "status":"turn_in_progress",
+            "turn":null,
+            "active_turn_id":active_state["active_turn_id"],
+            "event_ids":active_state["active_event_ids"],
+            "instructions":"Finish the active turn with cccc_runtime_complete_turn before requesting more work."
+        });
+        if transport == "web_model_browser"
+            && browser_turn_needs_review(home, &group, &actor_id, &active_state)?
+        {
+            result["browser_recovery_required"] = json!(true);
+        }
+        return object(result);
+    }
+    let limit = request
+        .args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .clamp(1, 20) as usize;
+    if request.args.contains_key("kind_filter") {
+        return Err(OpError::new(
+            "unsupported_field",
+            "runtime delivery does not support Inbox kind filters",
+        ));
+    }
+    let candidates = if resumed.is_some() {
+        Vec::new()
+    } else {
+        crate::ops::runtime_delivery::pending_sources(home, &group, actor, limit)?
+    };
+    let mut messages = resumed.unwrap_or_default();
+    for event in candidates {
         let claimed = crate::ops::runtime_delivery::latest_state(
             home,
             &group.group_id,
@@ -396,13 +481,34 @@ pub(super) fn wait_next_turn(home: &HomeLayout, request: &DaemonRequest) -> OpRe
         }
     }
     if messages.is_empty() {
-        set_runtime_status(home, &group, &actor_id, "waiting", "", "", &[])?;
+        // An idle browser asks again every few seconds; rewriting the same
+        // waiting state would rewrite group.yaml each time. The state read
+        // above is still current: this request holds the Group's write permit
+        // and claiming changes only delivery records.
+        let unchanged = transport == "web_model_browser" && idle_state_recorded(&active_state);
+        if !unchanged {
+            set_runtime_status(home, &group, &actor_id, "waiting", "", "", &[])?;
+        }
         return object(json!({"status":"idle","turn":null,"suggested_retry_after_ms":5000}));
     }
     let event_ids: Vec<_> = messages.iter().map(|event| event.id.clone()).collect();
     let latest = messages.last().expect("messages is not empty");
     let turn_id = turn_id(&group.group_id, &actor_id, &event_ids);
-    let coalesced_text = coalesced_text(home, &group, &messages, &actor_id);
+    let mut coalesced_text = coalesced_text(home, &group, &messages, &actor_id);
+    let instruction_notice =
+        super::actor_runtime::effective_scope(&group, Some(actor)).and_then(|scope| {
+            super::instruction_files::check(
+                home,
+                &group.group_id,
+                actor,
+                &web_instruction_session(&scope.path),
+                &scope.path,
+            )
+        });
+    if let Some(notice) = &instruction_notice {
+        coalesced_text.push_str("\n\n");
+        coalesced_text.push_str(&notice.delivery_line());
+    }
     let web_model_mode = delivery_preference(&group, &actor_id)["mode"].clone();
     let turn = json!({
         "turn_id":turn_id,
@@ -414,7 +520,7 @@ pub(super) fn wait_next_turn(home: &HomeLayout, request: &DaemonRequest) -> OpRe
         "latest_ts":latest.ts,
         "messages":messages,
         "coalesced_text":coalesced_text,
-        "system_prompt":cccc_core::system_prompt::render_session(home, &group, actor),
+        "system_prompt":super::actor_runtime::session_prompt(home, &group, actor),
         "delivery":{"mode":"runtime_delivery","transport":transport,"max_events":limit,"web_model_mode":web_model_mode},
         "instructions":"Process this coalesced CCCC turn and call cccc_runtime_complete_turn when finished."
     });
@@ -436,8 +542,20 @@ pub(super) fn wait_next_turn(home: &HomeLayout, request: &DaemonRequest) -> OpRe
                 &actor.created_at,
                 event_id,
                 &transport,
-                crate::ops::runtime_delivery::DeliveryOutcome::Accepted,
+                crate::ops::runtime_delivery::DeliveryOutcome::Accepted(Some(
+                    cccc_contracts::event::DeliveryEvidence::ChannelAccepted,
+                )),
             )?;
+        }
+    }
+    if let Some(notice) = instruction_notice {
+        if transport == "web_model_pull" && request.op == "runtime_wait_next_turn" {
+            notice.delivered();
+        } else if let Ok(mut notices) = turn_notices().lock() {
+            notices.insert(
+                turn_notice_key(home, &group.group_id, &actor_id),
+                (turn_id, notice),
+            );
         }
     }
     object(json!({"status":"work_available","turn":turn}))
@@ -552,7 +670,7 @@ fn recover_turn(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         "latest_ts":latest.ts,
         "messages":messages,
         "coalesced_text":coalesced,
-        "system_prompt":cccc_core::system_prompt::render_session(home, &group, actor),
+        "system_prompt":super::actor_runtime::session_prompt(home, &group, actor),
         "delivery":{"mode":"recovery_no_delivery_mutation","web_model_mode":web_model_mode}
     });
     object(json!({"status":"recovered","turn":turn}))
@@ -807,7 +925,9 @@ fn record_browser_delivery(home: &HomeLayout, request: &DaemonRequest) -> OpResu
     let runtime_outcome = match browser_delivery["state"].as_str().unwrap_or_default() {
         "submitted" | "bound" => Some((
             "accepted",
-            crate::ops::runtime_delivery::DeliveryOutcome::Accepted,
+            crate::ops::runtime_delivery::DeliveryOutcome::Accepted(Some(
+                cccc_contracts::event::DeliveryEvidence::ChannelAccepted,
+            )),
         )),
         "ambiguous" => Some((
             "ambiguous",
@@ -828,10 +948,11 @@ fn record_browser_delivery(home: &HomeLayout, request: &DaemonRequest) -> OpResu
                 &actor_id,
                 source_event_id,
             )?;
-            if latest
-                .as_ref()
-                .is_some_and(|(state, _)| state == runtime_state)
-            {
+            // Work settled as uncertain stays out of the queue, whatever a late
+            // report of the same attempt says.
+            if latest.as_ref().is_some_and(|(state, _)| {
+                state == runtime_state || (state == "ambiguous" && runtime_state == "failed")
+            }) {
                 continue;
             }
             crate::ops::runtime_delivery::append_state(
@@ -843,6 +964,17 @@ fn record_browser_delivery(home: &HomeLayout, request: &DaemonRequest) -> OpResu
                 "web_model_browser",
                 outcome,
             )?;
+        }
+        if let Some(notice) = take_turn_notice(home, &group.group_id, &actor_id, &turn_id)
+            && runtime_state == "accepted"
+        {
+            notice.delivered();
+        }
+        // A failed batch is over: holding its turn would stop everything behind it.
+        if runtime_state == "failed"
+            && actor_state(home, &group.group_id, &actor_id)?["active_turn_id"] == turn_id.as_str()
+        {
+            set_runtime_status(home, &group, &actor_id, "waiting", "", "", &[])?;
         }
     }
     object(json!({"event":event}))
@@ -955,6 +1087,29 @@ pub(super) fn actor_state(
         .unwrap_or(Value::Null))
 }
 
+/// Elapsed time since the matching private execution was claimed. Canonical
+/// ownership remains authoritative; a missing or mismatched projection does
+/// not establish when the current turn began.
+pub(super) fn active_turn_elapsed_seconds(
+    runtime: &Value,
+    execution: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u64> {
+    let turn_id = runtime["active_turn_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())?;
+    if execution["turn_id"].as_str() != Some(turn_id)
+        || !matches!(execution["state"].as_str(), Some("active" | "interrupted"))
+    {
+        return None;
+    }
+    let claimed = chrono::DateTime::parse_from_rfc3339(execution["claimed_at"].as_str()?).ok()?;
+    now.signed_duration_since(claimed)
+        .to_std()
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
 fn update_actor_state<T>(
     home: &HomeLayout,
     group_id: &str,
@@ -1013,6 +1168,147 @@ fn set_runtime_status(
     })
 }
 
+/// Whether the stored state already holds what an idle poll would write.
+fn idle_state_recorded(state: &Value) -> bool {
+    state["status"] == "waiting"
+        && state["active_turn_id"] == ""
+        && state["latest_event_id"] == ""
+        && state["active_event_ids"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        && state["updated_at"]
+            .as_str()
+            .is_some_and(|at| !at.is_empty())
+}
+
+/// The batch a browser left staged, as it was claimed: the limit of this request
+/// and later Mail state must not change it. Anything that no longer matches
+/// leaves the turn as it is.
+fn staged_batch(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor_id: &str,
+    state: &Value,
+) -> Result<Option<Vec<Event>>, OpError> {
+    let event_ids = state["active_event_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    for event_id in &event_ids {
+        let claim =
+            crate::ops::runtime_delivery::latest_state(home, &group.group_id, actor_id, event_id)?;
+        if !claim.is_some_and(|(state, transport)| {
+            state == "claimed" && transport == "web_model_browser"
+        }) {
+            return Ok(None);
+        }
+    }
+    let store = GroupStore::new(home.clone()).map_err(OpError::io)?;
+    let ledger_path = store.ledger_path(&group.group_id).map_err(OpError::io)?;
+    let batch = ledger::inspect(&ledger_path, |events, _| {
+        event_ids
+            .iter()
+            .map(|id| events.iter().find(|event| event.id == *id).cloned())
+            .collect::<Option<Vec<_>>>()
+    })
+    .map_err(OpError::io)?;
+    Ok(batch.filter(|events| !events.is_empty()))
+}
+
+/// A restart can settle browser claims without releasing their active turn.
+/// Report only batches with exclusively terminal browser evidence: a pull
+/// owner or a browser still holding its claim must finish its own turn.
+fn browser_turn_needs_review(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor_id: &str,
+    state: &Value,
+) -> Result<bool, OpError> {
+    let Some(event_ids) = state["active_event_ids"]
+        .as_array()
+        .filter(|ids| !ids.is_empty())
+    else {
+        return Ok(false);
+    };
+    let actor_ids = [actor_id.to_owned()];
+    for event_id in event_ids {
+        let Some(event_id) = event_id.as_str().filter(|id| !id.is_empty()) else {
+            return Ok(false);
+        };
+        let state = inbox::delivery_states(home, group, &actor_ids, event_id)
+            .map_err(OpError::io)?
+            .remove(actor_id);
+        if !state.is_some_and(|(state, transport)| {
+            transport == "web_model_browser" && matches!(state.as_str(), "ambiguous" | "failed")
+        }) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Pull takes work only from an Actor nothing else serves. A push owner running
+/// from before a saved change keeps the work, and a pending switch holds it.
+pub(super) fn pull_admitted(group: &GroupDoc, actor: &Actor) -> bool {
+    cccc_core::runtime_switches::pending_for(group, actor).is_none()
+        && super::actor_runtime::delivery_owner(&group.group_id, &actor.id)
+            .is_ok_and(|owner| owner.is_none())
+}
+
+/// Before a switch commits, close the turn its old owner held. Work that never
+/// left CCCC goes back to the queue. Work that may be with the old owner stays
+/// out of it, for the new owner to review: a browser writes its fence before it
+/// submits, and a pull turn was handed over when claimed. The ledger goes first.
+pub(super) fn settle_active_turn(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    actor: &Actor,
+) -> Result<(), OpError> {
+    let state = actor_state(home, &group.group_id, &actor.id)?;
+    let active_turn = state["active_turn_id"].as_str().unwrap_or_default();
+    if active_turn.is_empty() {
+        return Ok(());
+    }
+    let store = GroupStore::new(home.clone()).map_err(OpError::io)?;
+    let targets =
+        integration_state::group_get(&store, &group.group_id, "web_model_browser_targets")
+            .map_err(OpError::io)?;
+    let fenced = targets[&actor.id]["last_delivery_turn_id"].as_str() == Some(active_turn);
+    let event_ids = state["active_event_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    for event_id in event_ids {
+        let Some((delivery, transport)) =
+            crate::ops::runtime_delivery::latest_state(home, &group.group_id, &actor.id, event_id)?
+        else {
+            continue;
+        };
+        let outcome = match delivery.as_str() {
+            "claimed" if !fenced => crate::ops::runtime_delivery::DeliveryOutcome::Unsubmitted(
+                "the member's runtime was switched before this was submitted",
+            ),
+            "claimed" | "accepted" => crate::ops::runtime_delivery::DeliveryOutcome::Ambiguous(
+                "the member's runtime was switched while this was with its previous owner",
+            ),
+            _ => continue,
+        };
+        crate::ops::runtime_delivery::append_state(
+            home,
+            &group.group_id,
+            &actor.id,
+            &actor.created_at,
+            event_id,
+            &transport,
+            outcome,
+        )?;
+    }
+    set_runtime_status(home, group, &actor.id, "waiting", "", "", &[])
+}
+
 fn turn_event_targets_actor(group: &GroupDoc, event: &Event, actor_id: &str) -> bool {
     if event.kind == "system.notify"
         && matches!(
@@ -1041,4 +1337,42 @@ fn coalesced_text(
 ) -> String {
     super::actor_delivery_render::render_batch_with_mail_context(home, group, actor_id, messages)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod active_turn_elapsed_tests {
+    use super::*;
+
+    #[test]
+    fn elapsed_requires_matching_active_execution_and_a_valid_past_claim_time() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-29T06:00:00Z")
+            .expect("fixture time")
+            .to_utc();
+        let runtime = json!({"active_turn_id":"turn-a", "updated_at":"2026-10-29T05:59:59Z"});
+        let execution =
+            json!({"turn_id":"turn-a", "state":"active", "claimed_at":"2026-10-29T03:00:00Z"});
+        assert_eq!(
+            active_turn_elapsed_seconds(&runtime, &execution, now),
+            Some(10_800)
+        );
+        let mut interrupted = execution.clone();
+        interrupted["state"] = json!("interrupted");
+        assert_eq!(
+            active_turn_elapsed_seconds(&runtime, &interrupted, now),
+            Some(10_800)
+        );
+        for invalid in [
+            json!({"turn_id":"turn-b", "state":"active", "claimed_at":"2026-10-29T03:00:00Z"}),
+            json!({"turn_id":"turn-a", "state":"completed", "claimed_at":"2026-10-29T03:00:00Z"}),
+            json!({"turn_id":"turn-a", "state":"active"}),
+            json!({"turn_id":"turn-a", "state":"active", "claimed_at":"invalid"}),
+            json!({"turn_id":"turn-a", "state":"active", "claimed_at":"2026-10-29T06:00:00.001Z"}),
+        ] {
+            assert_eq!(active_turn_elapsed_seconds(&runtime, &invalid, now), None);
+        }
+        assert_eq!(
+            active_turn_elapsed_seconds(&json!({"active_turn_id":""}), &execution, now),
+            None
+        );
+    }
 }

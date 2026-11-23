@@ -9,6 +9,11 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import {
+  frameAccessPaused,
+  subscribeFrameAccess,
+  useFrameAccessPaused,
+} from "../../features/connect/frameAccess";
 import type { ApiResponse } from "../../services/api";
 import type { PresentationBrowserSurfaceState } from "../../types";
 import { classNames } from "../../utils/classNames";
@@ -50,7 +55,14 @@ export type ProjectedBrowserFrame = {
 type ProjectedBrowserSurfacePanelProps = {
   isDark: boolean;
   refreshNonce: number;
+  /** Hidden viewers disconnect their observer without closing the shared browser session. */
+  visible?: boolean;
   reuseActiveSession?: boolean;
+  /** Refuse to display a shared session opened for another published address. */
+  expectedInitialUrl?: string;
+  onContentChanged?: () => void;
+  /** One explicit user action may replace the shared session; automatic retries may not. */
+  replaceOnStart?: boolean;
   sessionIdentity?: string;
   defaultViewerMode?: ProjectedBrowserViewerMode;
   chromeMode?: "standalone" | "embedded";
@@ -60,6 +72,7 @@ type ProjectedBrowserSurfacePanelProps = {
   startSession?: (size: {
     width: number;
     height: number;
+    replaceExisting?: boolean;
   }) => Promise<ApiResponse<{ browser_surface: PresentationBrowserSurfaceState }>>;
   webSocketUrl: string;
   fallbackUrl?: string;
@@ -109,6 +122,7 @@ type BrowserEventPayload =
       height?: number;
       captured_at?: string | null;
       url?: string | null;
+      initial_url?: string | null;
       mime?: string | null;
     }
   | { t: "command_result"; id?: string | null; ok?: boolean; message?: string | null }
@@ -145,6 +159,7 @@ function normalizeState(
       : null,
     strategy: String(raw?.strategy || "").trim(),
     url: String(raw?.url || "").trim(),
+    initial_url: String(raw?.initial_url || "").trim(),
     width: Number.isFinite(Number(raw?.width)) ? Number(raw?.width) : 0,
     height: Number.isFinite(Number(raw?.height)) ? Number(raw?.height) : 0,
     started_at: String(raw?.started_at || "").trim(),
@@ -198,7 +213,11 @@ function ProjectedBrowserExpandIcon({ expanded }: { expanded: boolean }) {
 export function ProjectedBrowserSurfacePanel({
   isDark,
   refreshNonce,
+  visible = true,
   reuseActiveSession = true,
+  expectedInitialUrl,
+  onContentChanged,
+  replaceOnStart = false,
   sessionIdentity = "",
   defaultViewerMode = "page",
   chromeMode = "standalone",
@@ -215,19 +234,41 @@ export function ProjectedBrowserSurfacePanel({
   const imageRef = useRef<HTMLImageElement | null>(null);
   const inputRelayRef = useRef<HTMLTextAreaElement | null>(null);
   const vncTargetRef = useRef<HTMLDivElement | null>(null);
+  const framePaused = useFrameAccessPaused();
+  const pausedForRecovery = useRef(false);
   const rfbRef = useRef<RfbInstance | null>(null);
   const frameRef = useRef<ProjectedBrowserFrame | null>(null);
   const renderedFrameRef = useRef<ProjectedBrowserFrame | null>(null);
   const frameRenderTokenRef = useRef(0);
   const lastFrameCallbackAtRef = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
+  useEffect(
+    () =>
+      subscribeFrameAccess(() => {
+        if (!frameAccessPaused()) return;
+        pausedForRecovery.current = true;
+        wsRef.current?.close();
+        rfbRef.current?.disconnect();
+        rfbRef.current = null;
+      }),
+    [],
+  );
   const loadSessionRef = useRef(loadSession);
   const startSessionRef = useRef(startSession);
+  const onContentChangedRef = useRef(onContentChanged);
+  onContentChangedRef.current = onContentChanged;
+  const replaceOnStartRef = useRef(replaceOnStart);
   const resizeTimerRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const runIdRef = useRef(0);
   const activeLifecycleKeyRef = useRef("");
+  const currentLifecycleKeyRef = useRef("");
+  const hiddenRef = useRef(false);
+  const pendingStartRef = useRef<{
+    key: string;
+    promise: ReturnType<NonNullable<ProjectedBrowserSurfacePanelProps["startSession"]>>;
+  } | null>(null);
   const lastRefreshNonceRef = useRef(refreshNonce);
   const pendingRefreshIdRef = useRef("");
   const refreshFeedbackTimerRef = useRef<number | null>(null);
@@ -345,6 +386,7 @@ export function ProjectedBrowserSurfacePanel({
   };
 
   const [runNonce, setRunNonce] = useState(0);
+  currentLifecycleKeyRef.current = `${sessionIdentity}\u0000${webSocketUrl}\u0000${runNonce}`;
   const [sessionState, setSessionState] = useState<PresentationBrowserSurfaceState>(() =>
     normalizeState({ active: true, state: "starting", message: texts.starting }),
   );
@@ -418,6 +460,7 @@ export function ProjectedBrowserSurfacePanel({
   }, [isExpanded]);
 
   const sendCommand = (payload: Record<string, unknown>): boolean => {
+    if (frameAccessPaused()) return false;
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     ws.send(JSON.stringify(payload));
@@ -435,15 +478,20 @@ export function ProjectedBrowserSurfacePanel({
   };
 
   useEffect(() => {
+    if (framePaused) return;
+    if (!visible) {
+      hiddenRef.current = true;
+      return;
+    }
+    const resumedFromHidden = hiddenRef.current;
+    hiddenRef.current = false;
+    const explicitReplacement = replaceOnStartRef.current;
+    replaceOnStartRef.current = false;
     const lifecycleKey = `${sessionIdentity}\u0000${webSocketUrl}\u0000${runNonce}`;
-    const reuseCurrentSession = shouldReuseProjectedBrowserSession(
-      reuseActiveSession,
-      activeLifecycleKeyRef.current,
-      lifecycleKey,
-    );
     const runId = runIdRef.current + 1;
     runIdRef.current = runId;
     let disposed = false;
+    let contentChanged = false;
 
     const cleanupTransport = () => {
       const ws = wsRef.current;
@@ -463,12 +511,29 @@ export function ProjectedBrowserSurfacePanel({
       }
     };
 
+    const mismatched = (value: { initial_url?: string | null }) =>
+      !!expectedInitialUrl && !!value.initial_url && value.initial_url !== expectedInitialUrl;
+    const reportContentChanged = () => {
+      contentChanged = true;
+      cleanupTransport();
+      rfbRef.current?.disconnect();
+      rfbRef.current = null;
+      frameRef.current = null;
+      renderedFrameRef.current = null;
+      frameRenderTokenRef.current += 1;
+      setRenderedFrame(null);
+      onFrameUpdate?.(null);
+      onContentChangedRef.current?.();
+    };
+
     const attachSocket = () => {
+      if (disposed || frameAccessPaused()) return;
       const socketViewerMode = projectedBrowserSocketViewerMode(viewerMode, vncFailed);
       const ws = new WebSocket(urlWithViewerParam(webSocketUrl, "viewer_mode", socketViewerMode));
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (disposed || contentChanged || runIdRef.current !== runId) return;
         setPanelError("");
         const pendingId = pendingRefreshIdRef.current;
         if (!pendingId) return;
@@ -478,9 +543,13 @@ export function ProjectedBrowserSurfacePanel({
       };
 
       ws.onmessage = (event) => {
-        if (disposed || runIdRef.current !== runId) return;
+        if (disposed || contentChanged || runIdRef.current !== runId) return;
         try {
           const payload = JSON.parse(String(event.data || "")) as BrowserEventPayload;
+          if ((payload.t === "state" || payload.t === "frame") && mismatched(payload)) {
+            reportContentChanged();
+            return;
+          }
           if (payload.t === "state") {
             setSessionState(normalizeState(payload));
             if (payload.state === "failed") {
@@ -509,6 +578,7 @@ export function ProjectedBrowserSurfacePanel({
             decoded.onload = () => {
               if (
                 disposed ||
+                contentChanged ||
                 runIdRef.current !== runId ||
                 frameRenderTokenRef.current !== renderToken
               ) {
@@ -555,17 +625,21 @@ export function ProjectedBrowserSurfacePanel({
       };
 
       ws.onerror = () => {
-        if (disposed || runIdRef.current !== runId) return;
+        if (disposed || contentChanged || frameAccessPaused() || runIdRef.current !== runId) return;
         setPanelError(texts.connectionFailed);
       };
 
       ws.onclose = () => {
-        if (disposed || runIdRef.current !== runId) return;
+        if (disposed || contentChanged || frameAccessPaused() || runIdRef.current !== runId) return;
         wsRef.current = null;
         void (async () => {
           const info = await loadSessionRef.current();
           if (disposed || runIdRef.current !== runId) return;
           if (info.ok) {
+            if (mismatched(info.result.browser_surface)) {
+              reportContentChanged();
+              return;
+            }
             const resolution = resolveBrowserObserverDisconnect({
               surface: info.result.browser_surface,
               reconnectAttempts: reconnectAttemptsRef.current,
@@ -626,9 +700,77 @@ export function ProjectedBrowserSurfacePanel({
       const height = Math.max(640, Math.round(container?.clientHeight || 800));
       const existing = await loadSessionRef.current();
       if (disposed) return;
+      if (!explicitReplacement && existing.ok && mismatched(existing.result.browser_surface)) {
+        reportContentChanged();
+        return;
+      }
+
+      // A start can still be in flight when the user hides and immediately returns to a tab.
+      // Join it instead of sending a second start, which would replace the shared session.
+      const pending = pendingStartRef.current;
+      if (pending?.key === lifecycleKey) {
+        const started = await pending.promise;
+        if (disposed) return;
+        if (started.ok) {
+          if (mismatched(started.result.browser_surface)) {
+            reportContentChanged();
+            return;
+          }
+          activeLifecycleKeyRef.current = lifecycleKey;
+          setSessionState(normalizeState(started.result.browser_surface));
+          if (started.result.browser_surface.active) attachSocket();
+        } else {
+          if (expectedInitialUrl && started.error.code === "presentation_browser_content_changed") {
+            reportContentChanged();
+            return;
+          }
+          const message = `${started.error.code}: ${started.error.message}`;
+          setPanelError(message);
+          setSessionState(
+            normalizeState({ active: false, state: "failed", message, error: started.error }),
+          );
+        }
+        return;
+      }
+
+      // In reuse mode a failed status read gives us no authority to replace the shared page.
+      if (!existing.ok && expectedInitialUrl && !explicitReplacement) {
+        const message = `${existing.error.code}: ${existing.error.message}`;
+        setPanelError(message);
+        setSessionState(
+          normalizeState({ active: false, state: "failed", message, error: existing.error }),
+        );
+        return;
+      }
+
+      if (pausedForRecovery.current) {
+        pausedForRecovery.current = false;
+        if (existing.ok) {
+          setSessionState(normalizeState(existing.result.browser_surface));
+          if (existing.result.browser_surface.active) attachSocket();
+        } else setPanelError(`${existing.error.code}: ${existing.error.message}`);
+        return;
+      }
+
+      // Returning to a hidden tab observes the existing session. If another person closed it,
+      // do not silently start a replacement or take control of their shared slot.
+      if (resumedFromHidden && activeLifecycleKeyRef.current === lifecycleKey) {
+        if (existing.ok) {
+          setSessionState(normalizeState(existing.result.browser_surface));
+          if (existing.result.browser_surface.active) attachSocket();
+        } else {
+          setPanelError(`${existing.error.code}: ${existing.error.message}`);
+        }
+        return;
+      }
 
       if (
-        reuseCurrentSession &&
+        !explicitReplacement &&
+        shouldReuseProjectedBrowserSession(
+          reuseActiveSession,
+          activeLifecycleKeyRef.current,
+          lifecycleKey,
+        ) &&
         existing.ok &&
         existing.result.browser_surface.active &&
         ["starting", "ready"].includes(String(existing.result.browser_surface.state || "").trim())
@@ -657,11 +799,29 @@ export function ProjectedBrowserSurfacePanel({
         return;
       }
 
-      const started = await startSessionRef.current({ width, height });
+      const promise = startSessionRef.current({
+        width,
+        height,
+        ...(explicitReplacement ? { replaceExisting: true } : {}),
+      });
+      pendingStartRef.current = { key: lifecycleKey, promise };
+      let started: Awaited<typeof promise>;
+      try {
+        started = await promise;
+      } finally {
+        if (pendingStartRef.current?.promise === promise) pendingStartRef.current = null;
+      }
+      if (started.ok && currentLifecycleKeyRef.current === lifecycleKey) {
+        activeLifecycleKeyRef.current = lifecycleKey;
+      }
       if (disposed) {
         return;
       }
       if (!started.ok) {
+        if (expectedInitialUrl && started.error.code === "presentation_browser_content_changed") {
+          reportContentChanged();
+          return;
+        }
         const message = `${started.error.code}: ${started.error.message}`;
         setPanelError(message);
         setSessionState(
@@ -675,18 +835,38 @@ export function ProjectedBrowserSurfacePanel({
         return;
       }
 
+      if (mismatched(started.result.browser_surface)) {
+        reportContentChanged();
+        return;
+      }
+
       activeLifecycleKeyRef.current = lifecycleKey;
       setSessionState(normalizeState(started.result.browser_surface));
       if (started.result.browser_surface.active) attachSocket();
     };
 
-    void open();
+    void open().catch((error: unknown) => {
+      if (disposed || runIdRef.current !== runId) return;
+      const message =
+        error instanceof Error ? error.message : String(error || texts.connectionFailed);
+      setPanelError(message);
+      setSessionState(
+        normalizeState({
+          active: false,
+          state: "failed",
+          message,
+          error: { code: "browser_surface_request_failed", message },
+        }),
+      );
+    });
 
     return () => {
       disposed = true;
       cleanupTransport();
     };
   }, [
+    framePaused,
+    expectedInitialUrl,
     onFrameUpdate,
     runNonce,
     texts.closed,
@@ -695,6 +875,7 @@ export function ProjectedBrowserSurfacePanel({
     texts.refreshFailed,
     reuseActiveSession,
     sessionIdentity,
+    visible,
     vncFailed,
     viewerMode,
     webSocketUrl,
@@ -726,7 +907,7 @@ export function ProjectedBrowserSurfacePanel({
   );
 
   useEffect(() => {
-    if (!vncAvailable || sessionState.state !== "ready") {
+    if (!visible || framePaused || !vncAvailable || sessionState.state !== "ready") {
       if (rfbRef.current) {
         rfbRef.current.disconnect();
         rfbRef.current = null;
@@ -741,7 +922,7 @@ export function ProjectedBrowserSurfacePanel({
     void (async () => {
       try {
         const mod = await import("@novnc/novnc");
-        if (cancelled || rfbRef.current) return;
+        if (cancelled || frameAccessPaused() || rfbRef.current) return;
         const RFB = mod.default as RfbConstructor;
         target.replaceChildren();
         const rfb = new RFB(target, urlWithViewerParam(webSocketUrl, "mode", "vnc"), {});
@@ -754,7 +935,7 @@ export function ProjectedBrowserSurfacePanel({
           if (!cancelled) setVncConnected(true);
         });
         rfb.addEventListener("disconnect", () => {
-          if (!cancelled) {
+          if (!cancelled && !frameAccessPaused()) {
             setVncConnected(false);
             setVncFailed(true);
           }
@@ -777,17 +958,19 @@ export function ProjectedBrowserSurfacePanel({
       target.replaceChildren();
       setVncConnected(false);
     };
-  }, [isExpanded, sessionState.state, vncAvailable, webSocketUrl]);
+  }, [framePaused, isExpanded, sessionState.state, visible, vncAvailable, webSocketUrl]);
 
   useEffect(() => {
     const container = containerRef.current;
-    if (!container || typeof ResizeObserver === "undefined") return;
+    if (!visible || !container || typeof ResizeObserver === "undefined") return;
 
     const sendResize = () => {
       if (vncAvailable) return;
-      const width = Math.max(640, Math.round(container.clientWidth || 0));
-      const height = Math.max(480, Math.round(container.clientHeight || 0));
-      if (!width || !height) return;
+      const actualWidth = Math.round(container.clientWidth || 0);
+      const actualHeight = Math.round(container.clientHeight || 0);
+      if (!actualWidth || !actualHeight) return;
+      const width = Math.max(640, actualWidth);
+      const height = Math.max(480, actualHeight);
       sendCommand({ t: "resize", width, height });
     };
 
@@ -813,7 +996,7 @@ export function ProjectedBrowserSurfacePanel({
         resizeTimerRef.current = null;
       }
     };
-  }, [isExpanded, vncAvailable]);
+  }, [isExpanded, visible, vncAvailable]);
 
   const handleBack = () => {
     setPanelError("");
@@ -1021,14 +1204,9 @@ export function ProjectedBrowserSurfacePanel({
     "relative flex flex-col overflow-hidden outline-none",
     chromeMode === "embedded"
       ? "rounded-none"
-      : classNames(
-          "rounded-3xl border",
-          isDark
-            ? "border-white/10 bg-slate-950/80"
-            : "border-black/10 bg-[linear-gradient(180deg,#ffffff_0%,#f6f8fb_100%)]",
-        ),
+      : "border border-[var(--lcd-rule)] bg-[var(--lcd-bg)]",
     isExpanded
-      ? "h-full w-full shadow-2xl sm:h-[min(92dvh,980px)] sm:w-[min(96vw,1600px)]"
+      ? "h-full w-full sm:h-[min(92dvh,980px)] sm:w-[min(96vw,1600px)]"
       : viewportClassName || "flex-1 min-h-0",
   );
 
@@ -1078,6 +1256,7 @@ export function ProjectedBrowserSurfacePanel({
                   : "border-black/10 bg-white/75 text-gray-700",
               ),
         )}
+        data-browser-bar
       >
         <span
           className={classNames(
@@ -1094,6 +1273,13 @@ export function ProjectedBrowserSurfacePanel({
                   ? "bg-white/[0.08] text-white"
                   : "bg-[rgb(245,245,245)] text-[rgb(35,36,37)]",
           )}
+          data-status-tone={
+            sessionState.state === "ready"
+              ? "ok"
+              : sessionState.state === "failed"
+                ? "error"
+                : "neutral"
+          }
         >
           {sessionState.state === "ready"
             ? texts.ready
@@ -1110,6 +1296,7 @@ export function ProjectedBrowserSurfacePanel({
             "inline-flex shrink-0 items-center rounded-full p-0.5",
             isDark ? "bg-white/[0.06]" : "bg-black/[0.045]",
           )}
+          data-browser-view-switch
         >
           {(["page", "browser"] as const).map((mode) => {
             const selected = effectiveViewerMode === mode;
@@ -1155,6 +1342,7 @@ export function ProjectedBrowserSurfacePanel({
                   : "bg-cyan-50 text-cyan-700",
             )}
             role="status"
+            data-status-tone={refreshFeedback === "failed" ? "error" : "info"}
           >
             {refreshFeedbackLabel}
           </span>
@@ -1163,6 +1351,7 @@ export function ProjectedBrowserSurfacePanel({
           <button
             type="button"
             onClick={() => setIsExpanded((value) => !value)}
+            data-lcd-key
             className={classNames(
               "inline-flex h-9 w-9 items-center justify-center rounded-full transition-colors",
               isDark
@@ -1178,6 +1367,7 @@ export function ProjectedBrowserSurfacePanel({
         <button
           type="button"
           onClick={handleBack}
+          data-lcd-key
           className={classNames(
             "rounded-full px-3 py-1 font-medium transition-colors",
             isDark
@@ -1191,6 +1381,7 @@ export function ProjectedBrowserSurfacePanel({
           <button
             type="button"
             onClick={handleReconnect}
+            data-lcd-key
             className={classNames(
               "rounded-full px-3 py-1 font-medium transition-colors",
               isDark
@@ -1208,11 +1399,13 @@ export function ProjectedBrowserSurfacePanel({
           "relative flex min-h-0 flex-1 items-center justify-center overflow-hidden",
           chromeMode === "embedded" ? "bg-white" : "p-4",
         )}
+        data-browser-canvas
       >
         {vncAvailable ? (
           <div className="relative h-full w-full">
             <div
               ref={vncTargetRef}
+              data-browser-canvas
               className={classNames(
                 "h-full w-full overflow-hidden",
                 chromeMode === "embedded"
@@ -1226,6 +1419,7 @@ export function ProjectedBrowserSurfacePanel({
                   "pointer-events-none absolute inset-0 flex items-center justify-center text-sm",
                   isDark ? "text-slate-400" : "text-gray-500",
                 )}
+                data-browser-placeholder
               >
                 {sessionState.message || texts.waiting}
               </div>
@@ -1255,6 +1449,7 @@ export function ProjectedBrowserSurfacePanel({
               "flex h-full min-h-[320px] w-full items-center justify-center rounded-2xl border border-dashed text-sm",
               isDark ? "border-white/10 text-slate-400" : "border-black/10 text-gray-500",
             )}
+            data-browser-placeholder
           >
             {sessionState.message ||
               (sessionState.state === "starting" ? texts.starting : texts.waiting)}
@@ -1269,6 +1464,8 @@ export function ProjectedBrowserSurfacePanel({
                 ? "border-rose-500/20 bg-rose-500/10 text-rose-100"
                 : "border-rose-200 bg-white/90 text-rose-700",
             )}
+            data-status-tone="error"
+            data-browser-error
           >
             {panelError}
           </div>
@@ -1277,7 +1474,7 @@ export function ProjectedBrowserSurfacePanel({
     </div>
   );
 
-  if (isExpanded && typeof document !== "undefined") {
+  if (isExpanded && visible && typeof document !== "undefined") {
     return createPortal(
       <div className="fixed inset-0 z-[1000] animate-fade-in">
         <div

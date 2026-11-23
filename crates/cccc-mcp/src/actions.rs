@@ -4,6 +4,7 @@ pub fn group(value: &str) -> Option<&'static str> {
         "list" => "groups",
         "info" | "get" | "show" => "group_show",
         "resolve" => "group_resolve",
+        "activity" => "group_activity",
         "update" => "group_update",
         "delete" => "group_delete",
         "reset" => "group_reset",
@@ -38,32 +39,27 @@ pub fn actor_notes(value: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
-pub fn memory(value: &str) -> Option<&'static str> {
-    Some(match value {
-        "layout_get" => "memory_reme_layout_get",
-        "search" => "memory_reme_search",
-        "get" | "read" => "memory_reme_get",
-        "write" => "memory_reme_write",
-        "profile" => "memory_profile_get",
-        "health" => "memory_health",
-        _ => return None,
-    })
-}
-pub fn memory_admin(value: &str) -> Option<&'static str> {
-    Some(match value {
-        "index_sync" | "index" | "sync" => "memory_reme_index_sync",
-        "context_check" => "memory_reme_context_check",
-        "compact" => "memory_reme_compact",
-        "daily_flush" | "flush" => "memory_reme_daily_flush",
-        _ => return None,
-    })
-}
 pub fn automation(value: &str) -> Option<&'static str> {
     Some(match value {
         "get" | "state" => "group_automation_state",
         "update" => "group_automation_update",
         "manage" => "group_automation_manage",
+        "run_now" => "group_automation_run_now",
         "reset" => "group_automation_reset_baseline",
+        _ => return None,
+    })
+}
+pub fn backlog(value: &str) -> Option<&'static str> {
+    Some(match value {
+        "get" => "backlog_get",
+        "use" => "backlog_use",
+        "create" => "backlog_create",
+        "exclude" => "backlog_exclude",
+        "add" => "backlog_add",
+        "edit" => "backlog_edit",
+        "move" => "backlog_move",
+        "close" => "backlog_close",
+        "promote" => "backlog_promote",
         _ => return None,
     })
 }
@@ -123,6 +119,14 @@ pub fn debug(value: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automation_run_now_routes_to_the_daemon_operation() {
+        assert_eq!(
+            super::automation("run_now"),
+            Some("group_automation_run_now")
+        );
+    }
+
     #[test]
     fn notify_accepts_only_the_current_send_action() {
         assert_eq!(super::notify("send"), Some("system_notify"));

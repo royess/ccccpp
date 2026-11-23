@@ -8,12 +8,47 @@ const TASK_STATUSES: &[&str] = &["planned", "active", "done", "archived"];
 const TASK_TYPES: &[&str] = &["free", "standard", "optimization"];
 const WAITING_ON: &[&str] = &["none", "user", "actor", "external"];
 
-pub(super) fn create(doc: &mut ContextDoc, op: &Map<String, Value>, by: &str) -> io::Result<()> {
-    let title = required(op, "title")?.trim().to_owned();
-    let parent = nullable_id(op, "parent_id")?;
-    if let Some(id) = parent.as_deref() {
-        find(doc, id)?;
+/// The task a `task.create` names: the one it created, or the one the same
+/// caller already created under the same `client_request_id` (`replayed`).
+pub(super) struct CreatedTask {
+    pub(super) task_id: String,
+    pub(super) replayed: bool,
+}
+
+pub(super) fn create(
+    doc: &mut ContextDoc,
+    op: &Map<String, Value>,
+    by: &str,
+) -> io::Result<CreatedTask> {
+    let client_request_id = nullable_id(op, "client_request_id")?;
+    if let Some(task_id) = client_request_id
+        .as_deref()
+        .and_then(|request_id| requested_task(doc, request_id, by))
+    {
+        return Ok(CreatedTask {
+            task_id,
+            replayed: true,
+        });
     }
+    let title = required(op, "title")?.trim().to_owned();
+    validate_source(op)?;
+    let parent = match (
+        nullable_id(op, "parent_id")?,
+        nullable_id(op, "parent_ref")?,
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(io::Error::other(
+                "task.create takes parent_id or parent_ref, not both",
+            ));
+        }
+        (Some(id), None) => {
+            find(doc, &id)?;
+            Some(id)
+        }
+        (None, Some(reference)) => Some(referenced_task(doc, &reference, by)?),
+        (None, None) => None,
+    };
+    let blocked_by = blocked_by_with_refs(doc, op, by)?;
     let status = enum_value(op, "status", TASK_STATUSES)?.unwrap_or("planned");
     let task_type = enum_value(op, "task_type", TASK_TYPES)?.unwrap_or(if parent.is_none() {
         "standard"
@@ -21,23 +56,39 @@ pub(super) fn create(doc: &mut ContextDoc, op: &Map<String, Value>, by: &str) ->
         "free"
     });
     let waiting_on = enum_value(op, "waiting_on", WAITING_ON)?;
-    let mut task = op
-        .iter()
-        .filter(|(key, _)| key.as_str() != "op")
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<Map<_, _>>();
+    let mut task = op.clone();
+    for key in [
+        "op",
+        "if_task_rev",
+        "rev",
+        "parent_ref",
+        "blocked_by_refs",
+        "ever_executed",
+        "open_blocked_by",
+    ] {
+        task.remove(key);
+    }
     let number = doc
         .task_id_high_water
         .max(maximum_task_number(&doc.tasks))
         .checked_add(1)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "task number exhausted"))?;
-    task.insert("id".into(), Value::String(format!("T{number:03}")));
+    let task_id = format!("T{number:03}");
+    task.insert("id".into(), Value::String(task_id.clone()));
     task.insert("title".into(), Value::String(title));
     task.insert("status".into(), Value::String(status.into()));
+    mark_executed(&mut task);
     task.insert("task_type".into(), Value::String(task_type.into()));
     match parent {
         Some(parent_id) => task.insert("parent_id".into(), Value::String(parent_id)),
         None => task.remove("parent_id"),
+    };
+    if let Some(value) = blocked_by {
+        task.insert("blocked_by".into(), value);
+    }
+    match client_request_id {
+        Some(request_id) => task.insert("client_request_id".into(), Value::String(request_id)),
+        None => task.remove("client_request_id"),
     };
     if let Some(value) = waiting_on {
         task.insert("waiting_on".into(), Value::String(value.into()));
@@ -47,10 +98,70 @@ pub(super) fn create(doc: &mut ContextDoc, op: &Map<String, Value>, by: &str) ->
     task.insert("updated_at".into(), Value::String(utc_now()));
     doc.tasks.push(task);
     doc.task_id_high_water = number;
-    Ok(())
+    Ok(CreatedTask {
+        task_id,
+        replayed: false,
+    })
+}
+
+/// The task `by` created under `client_request_id`, if any.
+fn requested_task(doc: &ContextDoc, request_id: &str, by: &str) -> Option<String> {
+    if request_id.is_empty() {
+        return None;
+    }
+    doc.tasks
+        .iter()
+        .find(|task| {
+            task.get("client_request_id").and_then(Value::as_str) == Some(request_id)
+                && task.get("created_by").and_then(Value::as_str) == Some(by)
+        })
+        .and_then(|task| task.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+/// A `parent_ref` or `blocked_by_refs` entry: the `client_request_id` of a task
+/// the same caller created, earlier in this batch or before it.
+fn referenced_task(doc: &ContextDoc, reference: &str, by: &str) -> io::Result<String> {
+    requested_task(doc, reference, by).ok_or_else(|| {
+        io::Error::other(format!(
+            "task ref {reference} names no task created by {by}"
+        ))
+    })
+}
+
+/// `blocked_by` with each `blocked_by_refs` entry resolved and appended.
+fn blocked_by_with_refs(
+    doc: &ContextDoc,
+    op: &Map<String, Value>,
+    by: &str,
+) -> io::Result<Option<Value>> {
+    let Some(references) = op.get("blocked_by_refs") else {
+        return Ok(None);
+    };
+    let references = references
+        .as_array()
+        .filter(|items| items.iter().all(Value::is_string))
+        .ok_or_else(|| io::Error::other("blocked_by_refs must be an array of strings"))?;
+    let mut blocked_by = match op.get("blocked_by") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items.clone(),
+        Some(_) => {
+            return Err(io::Error::other(
+                "blocked_by must be an array when blocked_by_refs is given",
+            ));
+        }
+    };
+    for reference in references.iter().filter_map(Value::as_str) {
+        let task_id = Value::String(referenced_task(doc, reference.trim(), by)?);
+        if !blocked_by.contains(&task_id) {
+            blocked_by.push(task_id);
+        }
+    }
+    Ok(Some(Value::Array(blocked_by)))
 }
 
 pub(super) fn update(doc: &mut ContextDoc, op: &Map<String, Value>) -> io::Result<()> {
+    validate_source(op)?;
     let task_id = required(op, "task_id")?.trim().to_owned();
     find(doc, &task_id)?;
     let title = op
@@ -82,6 +193,7 @@ pub(super) fn update(doc: &mut ContextDoc, op: &Map<String, Value>) -> io::Resul
         "task_type",
         "notes",
         "checklist",
+        "source",
     ];
     for key in allowed {
         if let Some(value) = op.get(key) {
@@ -110,7 +222,7 @@ pub(super) fn update(doc: &mut ContextDoc, op: &Map<String, Value>) -> io::Resul
 pub(super) fn move_task(doc: &mut ContextDoc, op: &Map<String, Value>) -> io::Result<()> {
     let unexpected = op
         .keys()
-        .filter(|key| !matches!(key.as_str(), "op" | "task_id" | "status"))
+        .filter(|key| !matches!(key.as_str(), "op" | "task_id" | "status" | "if_task_rev"))
         .cloned()
         .collect::<Vec<_>>();
     if !unexpected.is_empty() {
@@ -123,12 +235,14 @@ pub(super) fn move_task(doc: &mut ContextDoc, op: &Map<String, Value>) -> io::Re
     let status = enum_value(op, "status", TASK_STATUSES)?
         .ok_or_else(|| io::Error::other("status is required"))?;
     let task = find_mut(doc, task_id)?;
+    mark_executed(task);
     let previous = task
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("planned")
         .to_owned();
     if previous == status {
+        mark_executed(task);
         return Ok(());
     }
     if status == "archived" {
@@ -137,6 +251,7 @@ pub(super) fn move_task(doc: &mut ContextDoc, op: &Map<String, Value>) -> io::Re
         task.remove("archived_from");
     }
     task.insert("status".into(), Value::String(status.into()));
+    mark_executed(task);
     task.insert("updated_at".into(), Value::String(utc_now()));
     Ok(())
 }
@@ -152,6 +267,7 @@ pub(super) fn restore(doc: &mut ContextDoc, op: &Map<String, Value>) -> io::Resu
         .filter(|status| TASK_STATUSES.contains(&status.as_str()) && status != "archived")
         .unwrap_or_else(|| "planned".into());
     task.insert("status".into(), Value::String(restored));
+    mark_executed(task);
     task.insert("updated_at".into(), Value::String(utc_now()));
     Ok(())
 }
@@ -164,7 +280,7 @@ pub(super) fn delete(doc: &mut ContextDoc, op: &Map<String, Value>) -> io::Resul
         task.get("id")
             .and_then(Value::as_str)
             .is_some_and(|task_id| removing.iter().any(|candidate| candidate == task_id))
-            && !is_unexecuted(task)
+            && !task_is_unexecuted(task)
     }) {
         let task_id = task.get("id").and_then(Value::as_str).unwrap_or(id);
         return Err(io::Error::other(format!(
@@ -189,7 +305,11 @@ pub(super) fn maximum_task_number(tasks: &[Map<String, Value>]) -> u64 {
         .unwrap_or(0)
 }
 
-fn is_unexecuted(task: &Map<String, Value>) -> bool {
+/// Whether deleting this task can preserve all known execution history.
+pub fn task_is_unexecuted(task: &Map<String, Value>) -> bool {
+    if task.get("ever_executed").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
     match task
         .get("status")
         .and_then(Value::as_str)
@@ -202,6 +322,31 @@ fn is_unexecuted(task: &Map<String, Value>) -> bool {
             .is_none_or(|status| status.is_empty() || status == "planned"),
         _ => false,
     }
+}
+
+fn mark_executed(task: &mut Map<String, Value>) {
+    if matches!(
+        task.get("status").and_then(Value::as_str),
+        Some("active" | "done")
+    ) || (task.get("status").and_then(Value::as_str) == Some("archived")
+        && matches!(
+            task.get("archived_from").and_then(Value::as_str),
+            Some("active" | "done")
+        ))
+    {
+        task.insert("ever_executed".into(), Value::Bool(true));
+    }
+}
+
+fn validate_source(op: &Map<String, Value>) -> io::Result<()> {
+    if let Some(value) = op.get("source").filter(|value| !value.is_null()) {
+        let source: cccc_contracts::backlog::BacklogSource = serde_json::from_value(value.clone())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        source
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    }
+    Ok(())
 }
 
 fn creates_parent_cycle(doc: &ContextDoc, task_id: &str, parent_id: &str) -> bool {
@@ -393,5 +538,93 @@ mod tests {
         )
         .expect("delete planned subtree");
         assert!(disposable.tasks.is_empty());
+    }
+
+    #[test]
+    fn execution_history_cannot_be_cleared_by_returning_to_planned_or_client_fields() {
+        for initial in ["planned", "active", "done"] {
+            let mut doc = ContextDoc::default();
+            create(
+                &mut doc,
+                &operation(json!({"title":"work", "status":initial, "ever_executed":false})),
+                "user",
+            )
+            .expect("valid test fixture");
+            if initial == "planned" {
+                assert!(doc.tasks[0].get("ever_executed").is_none());
+                move_task(
+                    &mut doc,
+                    &operation(json!({"task_id":"T001", "status":"active"})),
+                )
+                .expect("valid test fixture");
+            }
+            move_task(
+                &mut doc,
+                &operation(json!({"task_id":"T001", "status":"planned"})),
+            )
+            .expect("valid test fixture");
+            update(
+                &mut doc,
+                &operation(json!({"task_id":"T001", "ever_executed":false})),
+            )
+            .expect("valid test fixture");
+            assert_eq!(doc.tasks[0]["ever_executed"], true);
+            assert!(delete(&mut doc, &operation(json!({"task_id":"T001"}))).is_err());
+        }
+        let mut legacy = ContextDoc::default();
+        create(
+            &mut legacy,
+            &operation(json!({"title":"old archived"})),
+            "user",
+        )
+        .expect("valid test fixture");
+        legacy.tasks[0].insert("status".into(), json!("archived"));
+        legacy.tasks[0].insert("archived_from".into(), json!("done"));
+        restore(&mut legacy, &operation(json!({"task_id":"T001"}))).expect("valid test fixture");
+        move_task(
+            &mut legacy,
+            &operation(json!({"task_id":"T001", "status":"planned"})),
+        )
+        .expect("valid test fixture");
+        assert!(delete(&mut legacy, &operation(json!({"task_id":"T001"}))).is_err());
+    }
+
+    #[test]
+    fn source_is_structured_optional_and_does_not_change_task_identity() {
+        let source =
+            json!({"scope_key":"s_project", "path":"docs/BACKLOG.md", "entry_id":"abcdef123456"});
+        let mut doc = ContextDoc::default();
+        create(
+            &mut doc,
+            &operation(json!({"title":"work", "source":source})),
+            "user",
+        )
+        .expect("valid test fixture");
+        update(
+            &mut doc,
+            &operation(json!({"task_id":"T001", "title":"renamed"})),
+        )
+        .expect("valid test fixture");
+        assert_eq!(doc.tasks[0]["source"], source);
+        for bad in [
+            json!({}),
+            json!({"scope_key":"s", "path":"../secret", "entry_id":"abcdef123456"}),
+            json!({"scope_key":"s", "path":"BACKLOG.md", "entry_id":"not-an-id"}),
+        ] {
+            assert!(
+                update(
+                    &mut doc,
+                    &operation(json!({"task_id":"T001", "source":bad}))
+                )
+                .is_err()
+            );
+        }
+        update(
+            &mut doc,
+            &operation(json!({"task_id":"T001", "source":null})),
+        )
+        .expect("valid test fixture");
+        assert!(doc.tasks[0]["source"].is_null());
+        assert_eq!(doc.tasks[0]["id"], "T001");
     }
 }

@@ -2,6 +2,7 @@ use super::operation::{
     Operation,
     Policy::{Read, Write},
 };
+use cccc_contracts::message_args::{self, MessageWrite};
 use cccc_contracts::{DaemonRequest, Event};
 use cccc_core::{GroupDoc, HomeLayout};
 use serde_json::{Map, Value, json};
@@ -12,33 +13,59 @@ use crate::ops::{actor_delivery, messaging_inbox};
 mod cancellation;
 pub(crate) mod cross_group_attachments;
 mod cross_group_preflight;
-mod delegation;
 pub(super) mod files;
 pub(crate) mod install_command;
 mod message_validation;
 mod message_wake;
+pub(crate) mod reply_questions;
 mod slash_skill;
 mod stream;
 mod tracked_send;
 
+pub(super) fn send_local_session(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
+    send(home, request, "chat.message")
+}
+
 pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
     Some(match request.op.as_str() {
-        "send" | "message_send" => {
-            Operation::new(Write, |home, request| send(home, request, "chat.message"))
-        }
-        "send_files" => Operation::new(Write, send_files),
-        "send_cross_group" => Operation::new(Write, send_cross_group),
-        "tracked_send" => Operation::new(Write, tracked_send::handle),
-        "slash_skill_dispatch" => Operation::new(Write, slash_skill_dispatch),
-        "reply" => Operation::new(Write, reply),
-        "message_upload_preflight" => Operation::new(Read, message_upload_preflight),
+        "send" | "message_send" => Operation::new(Write, |home, request| {
+            accept_arguments(request, MessageWrite::Send)?;
+            send(home, request, "chat.message")
+        }),
+        "send_files" => Operation::new(Write, |home, request| {
+            accept_arguments(request, MessageWrite::SendFiles)?;
+            send_files(home, request)
+        }),
+        "send_cross_group" => Operation::new(Write, |home, request| {
+            accept_arguments(request, MessageWrite::SendCrossGroup)?;
+            send_cross_group(home, request)
+        }),
+        "tracked_send" => Operation::new(Write, |home, request| {
+            accept_arguments(request, MessageWrite::TrackedSend)?;
+            tracked_send::handle(home, request)
+        }),
+        "slash_skill_dispatch" => Operation::new(Write, |home, request| {
+            accept_arguments(request, MessageWrite::SlashSkillDispatch)?;
+            slash_skill_dispatch(home, request)
+        }),
+        "reply" => Operation::new(Write, |home, request| {
+            accept_arguments(request, MessageWrite::Reply)?;
+            reply(home, request)
+        }),
+        "message_upload_preflight" => Operation::new(Read, |home, request| {
+            accept_upload_arguments(request)?;
+            message_upload_preflight(home, request)
+        }),
         "reply_request_cancel" => Operation::new(Write, reply_request_cancel),
+        "reply_request_answer" => Operation::new(Write, super::reply_requests::answer),
+        "user_reply_requests" => Operation::new(Read, super::reply_requests::page),
+        "user_reply_requests_summary" => Operation::new(Read, super::reply_requests::summary),
         "message_deliver" => Operation::new(Write, message_deliver),
         "stream_emit" => Operation::new(Write, stream::emit),
-        "relay_user_delegation" => Operation::new(Write, delegation::relay),
-        "system_notify" => {
-            Operation::new(Write, |home, request| send(home, request, "system.notify"))
-        }
+        "system_notify" => Operation::new(Write, |home, request| {
+            accept_arguments(request, MessageWrite::SystemNotify)?;
+            send(home, request, "system.notify")
+        }),
         "event_append" => Operation::new(Write, append_raw),
         "ledger_tail" => Operation::new(Read, super::messaging_query::tail),
         "ledger_search" => Operation::new(Read, super::messaging_query::search),
@@ -47,12 +74,14 @@ pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
         "message_read_status" => Operation::new(Read, super::messaging_status::read_status),
         "inbox_peek" => Operation::new(Write, messaging_inbox::peek),
         "inbox_read" => Operation::new(Write, messaging_inbox::read),
+        "inbox_summary" => Operation::new(Read, messaging_inbox::summary),
         "message_history" => Operation::new(Read, messaging_inbox::history),
         _ => return None,
     })
 }
 
 fn send_files(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
+    reject_chet_provenance(&request.args)?;
     let group = load(home, request)?;
     let paths = request
         .args
@@ -70,17 +99,19 @@ fn send_files(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
             "send_files owns attachments; do not provide attachment records",
         ));
     }
+    // A question is sent with `send`; refusing it here keeps this path's
+    // promise that a retry or a failed check reads and stores no file.
+    reply_questions::reject_fields(&request.args, "send_files")?;
     if string_arg(request, "dst_group_id").is_some_and(|value| !value.trim().is_empty()) {
         return cross_group_preflight::send_files(home, request, &group, paths);
     }
-    let by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    let authority_by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    let by = effective_message_author(home, request, &authority_by)?;
     if let Some(event) =
         super::message_idempotency::find(home, &group.group_id, "chat.message", &by, &request.args)
     {
         return duplicate_send(event);
     }
-
-    let files = files::read(&group, paths, u64::MAX)?;
 
     let mut preflight: Map<String, Value> = request
         .args
@@ -88,8 +119,10 @@ fn send_files(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         .filter(|(key, _)| !matches!(key.as_str(), "group_id" | "by" | "paths"))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
+    message_validation::normalize_destination(&mut preflight)?;
     super::messaging_recipients::normalize_chat_preflight(&group, &by, &mut preflight, false)?;
 
+    let files = files::read(&group, &authority_by, paths, u64::MAX)?;
     let mut forwarded = request.clone();
     files.apply(home, &group, &mut forwarded.args)?;
     send(home, &forwarded, "chat.message")
@@ -104,6 +137,8 @@ fn send_cross_group_with_reply(
     request: &DaemonRequest,
     source_reply_to: Option<&str>,
 ) -> OpResult {
+    reject_chet_provenance(&request.args)?;
+    reply_questions::reject_fields(&request.args, "a cross-group message")?;
     let source = load(home, request)?;
     let destination_id = required_arg(request, "dst_group_id")?;
     let by = string_arg(request, "by")
@@ -161,6 +196,7 @@ fn send_cross_group_with_reply(
             "duplicate":true
         }));
     }
+    reject_chet_cross_group(home, request, &by)?;
 
     let destination_by = format!("{}::{}", source.group_id, by);
     let mut delivery_data: Map<String, Value> = existing_source.as_ref().map_or_else(
@@ -196,6 +232,13 @@ fn send_cross_group_with_reply(
         }
     }
     delivery_data.remove("transport");
+    // Captured port authority was checked before dispatch; it is never stored
+    // with the source record or the copy.
+    delivery_data.remove("_cccc_native_binding");
+    delivery_data.remove("_cccc_web_binding");
+    // A source event copied for relay is not an attestation about the
+    // destination Group, even when the source was authored by Chet.
+    delivery_data.remove(cccc_contracts::chet::GROUP_AUTHOR_GENERATION_FIELD);
     if let Some(origin) = request.args.get(cccc_core::voice_notifications::ORIGIN_ARG) {
         delivery_data.insert(
             cccc_core::voice_notifications::ORIGIN_ARG.into(),
@@ -234,11 +277,10 @@ fn send_cross_group_with_reply(
         source_data.insert("dst_to".into(), destination_recipients);
         source_data.insert("dst_message_mode".into(), destination_message_mode);
         source_data.insert("dst_group_id".into(), json!(destination.group_id));
-        if let Some(local_parent) = source_reply_to {
-            if let Some(remote_parent) = source_data.insert("reply_to".into(), json!(local_parent))
-            {
-                source_data.insert("dst_reply_to".into(), remote_parent);
-            }
+        if let Some(local_parent) = source_reply_to
+            && let Some(remote_parent) = source_data.insert("reply_to".into(), json!(local_parent))
+        {
+            source_data.insert("dst_reply_to".into(), remote_parent);
         }
         append(home, &source.group_id, "chat.message", &by, source_data)?
     };
@@ -266,7 +308,147 @@ fn send_cross_group_with_reply(
 }
 
 pub(super) fn send(home: &HomeLayout, request: &DaemonRequest, kind: &str) -> OpResult {
-    send_with_audience_policy(home, request, kind, false)
+    send_with_audience_policy(home, request, kind, false, None, false)
+}
+
+/// Derive the on-ledger author before idempotency checks or wake-up. The
+/// caller's existing user authority still governs scopes and target wake-up.
+pub(super) fn effective_message_author(
+    home: &HomeLayout,
+    request: &DaemonRequest,
+    authority_by: &str,
+) -> Result<String, OpError> {
+    let Some(origin) = request.args.get(cccc_core::voice_notifications::ORIGIN_ARG) else {
+        return if authority_by == cccc_core::actors::CHET_SERVICE_PRINCIPAL {
+            Err(OpError::new("permission_denied", "Chet origin is required"))
+        } else {
+            Ok(authority_by.into())
+        };
+    };
+    let token = origin
+        .as_str()
+        .ok_or_else(|| OpError::new("invalid_voice_origin", "invalid Voice origin"))?;
+    cccc_core::voice_notifications::require_active_origin(home, token).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidInput {
+            OpError::new("invalid_voice_origin", "Voice origin is no longer active")
+        } else {
+            OpError::io(error)
+        }
+    })?;
+    if authority_by == "user" {
+        return Ok(cccc_core::actors::CHET_SERVICE_PRINCIPAL.into());
+    }
+    Err(OpError::new(
+        "invalid_voice_origin",
+        "Voice origin requires a user caller",
+    ))
+}
+
+fn reject_chet_cross_group(
+    home: &HomeLayout,
+    request: &DaemonRequest,
+    authority_by: &str,
+) -> Result<(), OpError> {
+    if request
+        .args
+        .contains_key(cccc_core::voice_notifications::ORIGIN_ARG)
+        && effective_message_author(home, request, authority_by)?
+            == cccc_core::actors::CHET_SERVICE_PRINCIPAL
+    {
+        return Err(OpError::new(
+            "chet_cross_group_unsupported",
+            "Chet cannot relay across Groups; send to the target Group directly with its group_id",
+        ));
+    }
+    Ok(())
+}
+
+/// Chet may address other members while discussing a message, but it must not
+/// deliver an automatic reply to a different registration of the source
+/// sender merely because that registration reused the same Actor ID.
+fn verify_chet_reply_recipient(
+    home: &HomeLayout,
+    group: &GroupDoc,
+    data: &Map<String, Value>,
+) -> Result<(), OpError> {
+    let Some(reply_to) = data
+        .get("reply_to")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let target = find_event(home, &group.group_id, reply_to)?;
+    let sender = target.by.as_str();
+    if target.kind != "chat.message"
+        || matches!(
+            sender,
+            "user" | "system" | cccc_core::actors::CHET_SERVICE_PRINCIPAL
+        )
+        || sender.contains("::")
+        || sender.starts_with("connect:")
+    {
+        return Ok(());
+    }
+    let reaches_sender = recipient_tokens(data)
+        .iter()
+        .any(|recipient| match recipient.as_str() {
+            "@all" => true,
+            "@peers" => {
+                cccc_core::actors::effective_role(group, sender)
+                    == Some(cccc_contracts::ActorRole::Peer)
+            }
+            "@foreman" => {
+                cccc_core::actors::effective_role(group, sender)
+                    == Some(cccc_contracts::ActorRole::Foreman)
+            }
+            value => value == sender,
+        });
+    if !reaches_sender {
+        return Ok(());
+    }
+    match super::messaging_status::requester_for_event(home, &group.group_id, &target)? {
+        super::messaging_status::Requester::Available => Ok(()),
+        super::messaging_status::Requester::Unavailable => Err(OpError::new(
+            "requester_unavailable",
+            "The member that sent this message was removed or replaced; ask the user to relay your reply in the Group.",
+        )),
+        super::messaging_status::Requester::Unknown
+        | super::messaging_status::Requester::Unsupported => Err(OpError::new(
+            "requester_unknown",
+            "Cannot confirm the original member's identity; ask the user to relay your reply in the Group.",
+        )),
+    }
+}
+
+/// The user's in-place answer, as `reply_request_answer` checked it.
+pub(super) enum InPlace {
+    /// The user's own words to a request without a readable question.
+    Text,
+    /// A structured answer, which travels outside the arguments so no other
+    /// caller can supply one.
+    Structured(Value),
+}
+
+/// Unlike an ordinary message to an Actor, an answer leaves the Group's state
+/// and its Actors' enabled flags as they are: answering never resumes a paused
+/// or stopped Group, or re-enables an Actor. The answer is delivered as any
+/// message is, once the user does that.
+pub(super) fn send_answer(
+    home: &HomeLayout,
+    request: &DaemonRequest,
+    answer: InPlace,
+    service_reply: bool,
+) -> OpResult {
+    send_with_audience_policy(
+        home,
+        request,
+        "chat.message",
+        false,
+        Some(answer),
+        service_reply,
+    )
 }
 
 fn send_with_audience_policy(
@@ -274,37 +456,105 @@ fn send_with_audience_policy(
     request: &DaemonRequest,
     kind: &str,
     allow_sender_only_audience: bool,
+    in_place: Option<InPlace>,
+    service_reply: bool,
 ) -> OpResult {
+    reject_chet_provenance(&request.args)?;
     let mut group = load(home, request)?;
-    let by = string_arg(request, "by").unwrap_or_else(|| "user".into());
-    if let Some(event) =
-        super::message_idempotency::find(home, &group.group_id, kind, &by, &request.args)
+    let authority_by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    let by = effective_message_author(home, request, &authority_by)?;
+    // A question checks its client_id against the whole normalized request,
+    // below; the key-only lookup would replay an unrelated message.
+    let asks_question = kind == "chat.message"
+        && request
+            .args
+            .get("question")
+            .is_some_and(|value| !value.is_null());
+    if !asks_question
+        && let Some(event) =
+            super::message_idempotency::find(home, &group.group_id, kind, &by, &request.args)
     {
         return duplicate_send(event);
     }
+    // Captured port authority is checked before dispatch and is never event
+    // content, for notifications as for chat.
     let mut data: Map<String, Value> = request
         .args
         .iter()
-        .filter(|(key, _)| !matches!(key.as_str(), "group_id" | "by"))
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "group_id" | "by" | "_cccc_native_binding" | "_cccc_web_binding"
+            )
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
+    match data.remove("answer") {
+        None | Some(Value::Null) => {}
+        Some(_) => {
+            return Err(OpError::new(
+                "invalid_args",
+                "answers are written only by reply_request_answer",
+            ));
+        }
+    }
     if kind == "chat.message" {
-        message_validation::normalize(home, &group, &mut data)?;
-        super::messaging_recipients::normalize_chat_data(
+        let asks = reply_questions::prepare(&mut data)?;
+        message_validation::normalize(home, &group, &authority_by, &mut data)?;
+        super::messaging_recipients::normalize_chat_data_for_service_reply(
             &group,
             &by,
             &mut data,
             allow_sender_only_audience,
+            service_reply,
         )?;
-        if data.get("message_mode").and_then(Value::as_str) != Some("mail") {
-            group = message_wake::wake_message_targets(home, group, &by, &data)?;
+        if asks {
+            reply_questions::require_user_request(&by, &data)?;
+            if let Some(event) = reply_questions::replay(home, &group.group_id, &by, &data)? {
+                return duplicate_send(event);
+            }
         }
-    } else if kind == "system.notify" {
+        if let Some(InPlace::Structured(answer)) = &in_place {
+            data.insert("answer".into(), answer.clone());
+        }
+        if by == cccc_core::actors::CHET_SERVICE_PRINCIPAL {
+            verify_chet_reply_recipient(home, &group, &data)?;
+        }
+        if in_place.is_none() && data.get("message_mode").and_then(Value::as_str) != Some("mail") {
+            group = message_wake::wake_message_targets(home, group, &authority_by, &data)?;
+        }
+    } else if data.get("question").is_some_and(|value| !value.is_null()) {
+        return Err(OpError::new(
+            "invalid_question",
+            "only chat messages can carry a question",
+        ));
+    }
+    if kind == "system.notify" {
         if data.contains_key("requires_ack") {
             return Err(OpError::new(
                 "unsupported_notify_field",
                 "system notifications do not support generic acknowledgement",
             ));
+        }
+        // Routing ignores a target or recipient list it cannot read, and a
+        // notification without either is a broadcast; refuse those instead.
+        for key in ["target_actor_id", "actor_id"] {
+            if !matches!(data.get(key), None | Some(Value::Null | Value::String(_))) {
+                return Err(OpError::new(
+                    "invalid_args",
+                    format!("{key} must be an Actor ID"),
+                ));
+            }
+        }
+        match data.get("to") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(items)) if items.iter().all(Value::is_string) => {}
+            Some(_) => {
+                return Err(OpError::new(
+                    "invalid_args",
+                    "to must be a list of Actor IDs or selectors",
+                ));
+            }
         }
         match data.get("im_visibility") {
             None | Some(Value::Null) => {
@@ -319,13 +569,29 @@ fn send_with_audience_policy(
             }
         }
     }
-    let event = append(home, &group.group_id, kind, &by, data)?;
+    let scope_key = message_scope(kind, &data);
+    let chet_answer = in_place.is_some() && by == cccc_core::actors::CHET_SERVICE_PRINCIPAL;
+    let event = append_in_scope(
+        home,
+        &group.group_id,
+        kind,
+        &by,
+        data,
+        scope_key,
+        chet_answer,
+    )?;
+    let mut advisories = Vec::new();
+    let mut send_advisories = Vec::new();
     if kind == "chat.message"
         && event.data.get("message_mode").and_then(Value::as_str) == Some("mail")
     {
         super::automation_runtime::notify_idle_mail_recipients(home, &group, &event);
+        advisories = super::mail_advisory::advisories(home, &group, &event);
     } else {
         let _ = actor_delivery::dispatch(home, &group, &event);
+        if kind == "chat.message" && authority_by != "user" {
+            send_advisories = super::mail_advisory::send_advisories(&group, &event);
+        }
     }
     if kind == "chat.message" {
         let message_mode = event
@@ -333,7 +599,16 @@ fn send_with_audience_policy(
             .get("message_mode")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        object(json!({"event": event, "message_mode": message_mode}))
+        let mut result = json!({"event": event, "message_mode": message_mode});
+        if !advisories.is_empty() {
+            result["mail_recipient_advisories"] = json!(advisories);
+            result["mail_advisory"] = json!(super::mail_advisory::NOTE);
+        }
+        if !send_advisories.is_empty() {
+            result["send_recipient_advisories"] = json!(send_advisories);
+            result["send_advisory"] = json!(super::mail_advisory::SEND_NOTE);
+        }
+        object(result)
     } else {
         object(json!({"event": event}))
     }
@@ -349,6 +624,7 @@ fn duplicate_send(event: Event) -> OpResult {
 }
 
 fn message_upload_preflight(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
+    reject_chet_provenance(&request.args)?;
     match required_arg(request, "operation")?.as_str() {
         "send" => preflight_upload_send(home, request),
         "reply" => preflight_upload_reply(home, request),
@@ -362,14 +638,15 @@ fn message_upload_preflight(home: &HomeLayout, request: &DaemonRequest) -> OpRes
 
 fn preflight_upload_send(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let group = load(home, request)?;
-    let by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    let authority_by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    let by = effective_message_author(home, request, &authority_by)?;
     if let Some(event) =
         super::message_idempotency::find(home, &group.group_id, "chat.message", &by, &request.args)
     {
         return preflight_duplicate(event);
     }
     let mut data = upload_preflight_data(request);
-    message_validation::normalize(home, &group, &mut data)?;
+    message_validation::normalize(home, &group, &authority_by, &mut data)?;
     super::messaging_recipients::normalize_chat_preflight(&group, &by, &mut data, false)?;
     validate_upload_content(request, &data)?;
     object(json!({"ready":true}))
@@ -395,9 +672,12 @@ fn preflight_upload_reply(home: &HomeLayout, request: &DaemonRequest) -> OpResul
             "reply message_mode must be send or mail",
         ));
     }
+    let resolved = super::event_prefix::with_full_reply_target(home, request)?;
+    let request = resolved.as_ref().unwrap_or(request);
     let reply_to = required_arg(request, "reply_to")?;
     let group = load(home, request)?;
-    let by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    let authority_by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    let by = effective_message_author(home, request, &authority_by)?;
     if let Some(event) =
         super::message_idempotency::find(home, &group.group_id, "chat.message", &by, &request.args)
     {
@@ -411,6 +691,7 @@ fn preflight_upload_reply(home: &HomeLayout, request: &DaemonRequest) -> OpResul
         return super::connect_outbound::reply(home, request, &group, &target, &message_mode, true);
     }
     reject_retired_reply(home, &target)?;
+    let service_reply = is_default_service_reply(home, request, &group, &by, &target)?;
     let mut forwarded = request.clone();
     forwarded
         .args
@@ -433,7 +714,7 @@ fn preflight_upload_reply(home: &HomeLayout, request: &DaemonRequest) -> OpResul
         forwarded.args.remove(key);
     }
     super::message_metadata::add_reply_snapshot(&target, &mut forwarded.args);
-    if recipient_tokens(&forwarded.args).is_empty() {
+    if recipient_tokens(&forwarded.args).is_empty() && !service_reply {
         forwarded.args.insert(
             "to".into(),
             json!(default_reply_recipients(&group, &by, &target)),
@@ -454,8 +735,14 @@ fn preflight_upload_reply(home: &HomeLayout, request: &DaemonRequest) -> OpResul
         return cross_group_preflight::upload(home, &cross_group);
     }
     let mut data = upload_preflight_data(&forwarded);
-    message_validation::normalize(home, &group, &mut data)?;
-    super::messaging_recipients::normalize_chat_preflight(&group, &by, &mut data, false)?;
+    message_validation::normalize(home, &group, &authority_by, &mut data)?;
+    super::messaging_recipients::normalize_chat_preflight_for_service_reply(
+        &group,
+        &by,
+        &mut data,
+        false,
+        service_reply,
+    )?;
     validate_upload_content(request, &data)?;
     object(json!({"ready":true}))
 }
@@ -509,6 +796,7 @@ fn slash_skill_dispatch(home: &HomeLayout, request: &DaemonRequest) -> OpResult 
 }
 
 fn reply(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
+    reject_chet_provenance(&request.args)?;
     if ["priority", "reply_required", "requires_ack"]
         .iter()
         .any(|key| request.args.contains_key(*key))
@@ -528,9 +816,24 @@ fn reply(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
             "reply message_mode must be send or mail",
         ));
     }
+    // Idempotency, routing and both ledgers compare and record full IDs only.
+    let resolved = super::event_prefix::with_full_reply_target(home, request)?;
+    let request = resolved.as_ref().unwrap_or(request);
+    reply_questions::reject_question(&request.args, "a reply")?;
+    if request
+        .args
+        .get("answer")
+        .is_some_and(|answer| !answer.is_null())
+    {
+        if message_mode != "send" {
+            return Err(OpError::new("invalid_message_mode", "an answer uses send"));
+        }
+        return super::reply_requests::answer_as_chet(home, request);
+    }
     let reply_to = required_arg(request, "reply_to")?;
     let group = load(home, request)?;
-    let by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    let authority_by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    let by = effective_message_author(home, request, &authority_by)?;
     if let Some(event) =
         super::message_idempotency::find(home, &group.group_id, "chat.message", &by, &request.args)
         && event.data.contains_key("dst_group_id")
@@ -554,6 +857,7 @@ fn reply(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         );
     }
     reject_retired_reply(home, &target)?;
+    let service_reply = is_default_service_reply(home, request, &group, &by, &target)?;
     let mut forwarded = request.clone();
     forwarded
         .args
@@ -576,7 +880,7 @@ fn reply(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         forwarded.args.remove(key);
     }
     super::message_metadata::add_reply_snapshot(&target, &mut forwarded.args);
-    if recipient_tokens(&forwarded.args).is_empty() {
+    if recipient_tokens(&forwarded.args).is_empty() && !service_reply {
         forwarded.args.insert(
             "to".into(),
             json!(default_reply_recipients(&group, &by, &target)),
@@ -589,7 +893,44 @@ fn reply(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     if !routed.is_empty() {
         return reply_cross_group(home, &forwarded, &group, &target, &routed);
     }
-    send(home, &forwarded, "chat.message")
+    send_with_audience_policy(home, &forwarded, "chat.message", false, None, service_reply)
+}
+
+fn is_default_service_reply(
+    home: &HomeLayout,
+    request: &DaemonRequest,
+    group: &GroupDoc,
+    by: &str,
+    target: &Event,
+) -> Result<bool, OpError> {
+    let recipients = recipient_tokens(&request.args);
+    let im = request.args.get("transport").and_then(Value::as_str) == Some("im");
+    if im && recipients.iter().any(|to| to.eq_ignore_ascii_case("@chet")) {
+        return Err(OpError::new(
+            "chet_im_unsupported",
+            "Chet is not available through IM; use the Chet panel",
+        ));
+    }
+    if !recipients.is_empty()
+        || target.by != cccc_core::actors::CHET_SERVICE_PRINCIPAL
+        || by == cccc_core::actors::CHET_SERVICE_PRINCIPAL
+    {
+        return Ok(false);
+    }
+    let uses_request_thread = follows_chet_answer(group, by, target);
+    if im && !uses_request_thread {
+        return Err(OpError::new(
+            "chet_im_unsupported",
+            "Chet is not available through IM; use the Chet panel",
+        ));
+    }
+    if !cccc_core::actors::is_chet_message(home, group, target).map_err(OpError::io)? {
+        return Err(OpError::new(
+            "invalid_recipient",
+            "Cannot verify this Chet message's origin in this Group; use @chet to start a new message",
+        ));
+    }
+    Ok(!uses_request_thread)
 }
 
 fn routed_reply_recipients(args: &Map<String, Value>) -> Vec<(String, String)> {
@@ -613,7 +954,11 @@ pub(crate) fn reply_crosses_groups(home: &HomeLayout, request: &DaemonRequest) -
     let Some(reply_to) = request.args.get("reply_to").and_then(Value::as_str) else {
         return false;
     };
-    let Ok(event) = find_event(home, group_id, reply_to) else {
+    // Choose the permit from the same parent the handler will resolve.
+    let full = super::event_prefix::full_reply_target(home, request)
+        .ok()
+        .flatten();
+    let Ok(event) = find_event(home, group_id, full.as_deref().unwrap_or(reply_to)) else {
         return false;
     };
     if event.data.contains_key("connect_message") {
@@ -725,7 +1070,7 @@ fn reply_cross_group(
     Ok(result)
 }
 
-fn reject_retired_reply(home: &HomeLayout, target: &Event) -> Result<(), OpError> {
+pub(super) fn reject_retired_reply(home: &HomeLayout, target: &Event) -> Result<(), OpError> {
     use cccc_core::group_bridge_retirement::{is_retired_message, is_retired_receipt};
     let path = store(home)?
         .ledger_path(&target.group_id)
@@ -899,12 +1244,12 @@ fn message_deliver(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let delivery_claims = requested
         .iter()
         .map(|actor| {
-            (
-                actor,
-                actor_delivery::delivery_transport(home, &group, actor),
-            )
+            actor_delivery::delivery_transport(home, &group, actor)
+                .map(|transport| (actor, transport))
+                .map_err(OpError::io)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
+    let targets = actor_delivery::reserve_explicit_deliveries(&group, &source, &delivery_claims)?;
     let (claimed, states) = crate::ops::runtime_delivery::claim_deliveries(
         home,
         &group,
@@ -965,7 +1310,7 @@ fn message_deliver(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
             return Err(settlement_error.unwrap_or(error));
         }
     };
-    actor_delivery::dispatch_preclaimed(home, &group, &source, &requested);
+    actor_delivery::dispatch_preclaimed(home, &group, &source, targets);
     object(json!({
         "event": source,
         "actor_ids": actor_ids,
@@ -986,6 +1331,13 @@ fn recipient_tokens(args: &Map<String, Value>) -> Vec<String> {
 }
 
 fn default_reply_recipients(group: &GroupDoc, by: &str, target: &Event) -> Vec<String> {
+    if follows_chet_answer(group, by, target) {
+        return if by == "user" {
+            recipient_tokens(&target.data)
+        } else {
+            vec!["user".into()]
+        };
+    }
     let original_by = target.by.trim();
     if !original_by.is_empty() && original_by != by {
         return vec![if original_by == "@user" {
@@ -1001,12 +1353,34 @@ fn default_reply_recipients(group: &GroupDoc, by: &str, target: &Event) -> Vec<S
     vec![super::messaging_recipients::default_recipient(group).into()]
 }
 
+fn follows_chet_answer(group: &GroupDoc, by: &str, target: &Event) -> bool {
+    cccc_core::user_requests::is_chet_answer(target)
+        && (by == "user" || cccc_core::actors::find(group, by).is_some())
+}
+
 fn append_raw(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let raw = request
         .args
         .get("event")
         .ok_or_else(|| OpError::new("invalid_args", "event is required"))?;
     let event: Event = serde_json::from_value(raw.clone()).map_err(OpError::invalid)?;
+    reject_chet_provenance(&event.data)?;
+    if event.by == cccc_core::actors::CHET_SERVICE_PRINCIPAL {
+        return Err(OpError::new(
+            "invalid_args",
+            "Chet events are authored by the host",
+        ));
+    }
+    if event.kind == "chat.message"
+        && recipient_tokens(&event.data)
+            .iter()
+            .any(|recipient| recipient == cccc_core::actors::CHET_SERVICE_PRINCIPAL)
+    {
+        return Err(OpError::new(
+            "invalid_args",
+            "Messages to Chet must use send or reply",
+        ));
+    }
     let path = store(home)?
         .ledger_path(&event.group_id)
         .map_err(OpError::io)?;
@@ -1017,16 +1391,43 @@ fn append_raw(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     object(json!({"event": event}))
 }
 
+/// The scope `message_validation` verified for a message, if any.
+fn message_scope(kind: &str, data: &Map<String, Value>) -> String {
+    data.get("scope_key")
+        .and_then(Value::as_str)
+        .filter(|_| kind == "chat.message")
+        .unwrap_or_default()
+        .to_owned()
+}
+
 pub(super) fn append(
     home: &HomeLayout,
     group_id: &str,
     kind: &str,
     by: &str,
+    data: Map<String, Value>,
+) -> Result<Event, OpError> {
+    append_in_scope(home, group_id, kind, by, data, String::new(), false)
+}
+
+fn append_in_scope(
+    home: &HomeLayout,
+    group_id: &str,
+    kind: &str,
+    by: &str,
     mut data: Map<String, Value>,
+    scope_key: String,
+    chet_answer: bool,
 ) -> Result<Event, OpError> {
     let origin = data.remove(cccc_core::voice_notifications::ORIGIN_ARG);
+    reject_chet_provenance(&data)?;
+    if kind == "chat.message" && by == cccc_core::actors::CHET_SERVICE_PRINCIPAL && origin.is_none()
+    {
+        return Err(OpError::new("permission_denied", "Chet origin is required"));
+    }
     let mut event = Event::new(kind, group_id);
     event.by = by.into();
+    event.scope_key = scope_key;
     event.data = data;
     if let Some(origin) = origin {
         let token = origin
@@ -1034,8 +1435,51 @@ pub(super) fn append(
             .ok_or_else(|| OpError::new("invalid_voice_origin", "invalid Voice origin"))?;
         // Source copies never establish a second request or notification.
         if !event.data.contains_key("dst_group_id") {
-            cccc_core::voice_notifications::register_request(home, token, &event)
-                .map_err(OpError::io)?;
+            if event.by == cccc_core::actors::CHET_SERVICE_PRINCIPAL {
+                cccc_core::voice_notifications::require_active_origin(home, token)
+                    .map_err(OpError::io)?;
+                let group = store(home)?.load(group_id).map_err(OpError::io)?;
+                let generation = cccc_core::connect_groups::generation(&group);
+                if generation == "legacy:" {
+                    return Err(OpError::new(
+                        "invalid_group",
+                        "Cannot determine this Group's generation",
+                    ));
+                }
+                event.data.insert(
+                    cccc_contracts::chet::GROUP_AUTHOR_GENERATION_FIELD.into(),
+                    json!(generation),
+                );
+                if chet_answer {
+                    event.data.insert(
+                        cccc_core::user_requests::CHET_ANSWER_FOR_FIELD.into(),
+                        json!("user"),
+                    );
+                } else {
+                    // The recording lease approximates call-time handoffs.
+                    // Only ordinary replies may register Voice work here.
+                    let voice_active = match cccc_core::voice_recording_lease::current(home) {
+                        Ok(lease) => {
+                            lease["capture_mode"] == "codex_voice"
+                                && lease["dispatch_target"] == "codex_voice"
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                code = error.code,
+                                "Voice handoff tracking is unavailable"
+                            );
+                            false
+                        }
+                    };
+                    if voice_active {
+                        cccc_core::voice_notifications::register_request(home, token, &event)
+                            .map_err(OpError::io)?;
+                    }
+                }
+            } else {
+                cccc_core::voice_notifications::register_request(home, token, &event)
+                    .map_err(OpError::io)?;
+            }
         }
     }
     cccc_core::ledger::append(
@@ -1044,6 +1488,64 @@ pub(super) fn append(
     )
     .map_err(OpError::io)?;
     Ok(event)
+}
+
+/// Fails a message write whose request carries a top-level key its operation
+/// does not accept. It runs before the handler, so the request has no effect.
+/// Internal producers call the handlers directly and are not checked.
+pub(super) fn accept_arguments(
+    request: &DaemonRequest,
+    operation: MessageWrite,
+) -> Result<(), OpError> {
+    reject_unknown(message_args::unknown(operation, request.args.keys()))
+}
+
+/// A preflight that names no operation, or an unknown one, is reported by the
+/// preflight itself.
+fn accept_upload_arguments(request: &DaemonRequest) -> Result<(), OpError> {
+    match request
+        .args
+        .get("operation")
+        .and_then(Value::as_str)
+        .and_then(MessageWrite::for_upload)
+    {
+        Some(operation) => reject_unknown(message_args::unknown_for_upload(
+            operation,
+            request.args.keys(),
+        )),
+        None => Ok(()),
+    }
+}
+
+fn reject_unknown(unknown: Vec<&str>) -> Result<(), OpError> {
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let mut error = OpError::new(
+        message_args::UNKNOWN_ARGUMENTS,
+        format!(
+            "unknown argument(s): {}; this attempt made no new changes",
+            unknown.join(", ")
+        ),
+    );
+    error.details.insert("unknown".into(), json!(unknown));
+    error
+        .details
+        .insert("new_side_effects".into(), Value::Bool(false));
+    Err(error)
+}
+
+/// This attestation belongs to the local host, never to a message caller.
+pub(super) fn reject_chet_provenance(data: &Map<String, Value>) -> Result<(), OpError> {
+    if data.contains_key(cccc_contracts::chet::GROUP_AUTHOR_GENERATION_FIELD)
+        || data.contains_key(cccc_core::user_requests::CHET_ANSWER_FOR_FIELD)
+    {
+        return Err(OpError::new(
+            "invalid_args",
+            "Chet author provenance is host-owned",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn load(home: &HomeLayout, request: &DaemonRequest) -> Result<GroupDoc, OpError> {

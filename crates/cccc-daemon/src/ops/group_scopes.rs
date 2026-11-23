@@ -25,33 +25,65 @@ fn attach(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     if let Some(id) = &group_id {
         require_scope_authority(home, request, id)?;
     }
-    let path = string_arg(request, "path").unwrap_or_else(|| ".".into());
+    let activate = match request.args.get("activate") {
+        None => true,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(OpError::invalid("activate must be a boolean")),
+    };
+    if !activate && group_id.is_none() {
+        return Err(OpError::invalid(
+            "group_id is required for nonactivating attachment",
+        ));
+    }
+    let path = if activate {
+        string_arg(request, "path").unwrap_or_else(|| ".".into())
+    } else {
+        required_arg(request, "path")?
+    };
     let detected = scope::detect(std::path::Path::new(&path)).map_err(OpError::invalid)?;
+    if !activate && !std::path::Path::new(&detected.url).is_dir() {
+        return Err(OpError::invalid("path must be a directory"));
+    }
     let event_data = json!({
         "url": detected.url.clone(),
         "label": detected.label.clone(),
         "git_remote": detected.git_remote.clone(),
+        "activate": activate,
     });
     let group = if let Some(id) = group_id {
-        group_scope::attach(&store(home)?, &id, detected).map_err(OpError::io)?
+        group_scope::attach_with_activation(&store(home)?, &id, detected.clone(), activate)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    OpError::new("scope_conflict", error.to_string())
+                } else {
+                    OpError::io(error)
+                }
+            })?
     } else {
         let created = store(home)?
             .create(&detected.label, "")
             .map_err(OpError::io)?;
-        group_scope::attach(&store(home)?, &created.group_id, detected).map_err(OpError::io)?
+        group_scope::attach(&store(home)?, &created.group_id, detected.clone())
+            .map_err(OpError::io)?
     };
+    if activate {
+        record_web_instruction_baselines(home, &group);
+    }
     append_scope_event(
         home,
         &group,
         "group.attach",
-        &group.active_scope_key,
+        &detected.scope_key,
         request,
         event_data,
     )?;
-    active::set(home, &group.group_id).map_err(OpError::io)?;
+    if activate {
+        active::set(home, &group.group_id).map_err(OpError::io)?;
+    }
     object(json!({
         "group_id":group.group_id,
-        "scope_key":group.active_scope_key,
+        "scope_key":detected.scope_key,
+        "scope":detected,
         "title":group.title,
     }))
 }
@@ -61,6 +93,7 @@ fn detach(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let scope_key = required_arg(request, "scope_key")?;
     require_scope_authority(home, request, &group_id)?;
     let group = group_scope::detach(&store(home)?, &group_id, &scope_key).map_err(OpError::io)?;
+    record_web_instruction_baselines(home, &group);
     let event = append_scope_event(
         home,
         &group,
@@ -85,6 +118,7 @@ fn use_group(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
                 OpError::io(error)
             }
         })?;
+    record_web_instruction_baselines(home, &updated);
     let event = append_scope_event(
         home,
         &updated,
@@ -98,6 +132,22 @@ fn use_group(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         "active_scope_key":updated.active_scope_key,
         "event":event,
     }))
+}
+
+/// Web conversations can read their new effective workspace during an
+/// existing turn, before the next CCCC delivery. Start watching it when the
+/// scope changes; recording an already observed workspace never resets it.
+fn record_web_instruction_baselines(home: &HomeLayout, group: &GroupDoc) {
+    if !group.running {
+        return;
+    }
+    for actor in group
+        .actors
+        .iter()
+        .filter(|actor| actor.enabled && actor.runtime.is_web_model())
+    {
+        super::runtime_state::record_web_instruction_baseline(home, group, actor);
+    }
 }
 
 fn require_scope_authority(

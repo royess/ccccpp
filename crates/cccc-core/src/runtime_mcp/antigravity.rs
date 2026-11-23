@@ -10,7 +10,7 @@ pub fn ensure(
     environment: &BTreeMap<String, String>,
     add: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<PathBuf> {
-    let effective: BTreeMap<String, String> = std::env::vars()
+    let effective: BTreeMap<String, String> = cccc_runtime::unicode_environment()
         .chain(environment.iter().map(|(k, v)| (k.clone(), v.clone())))
         .collect();
     let keys = if cfg!(windows) {
@@ -117,6 +117,11 @@ fn read_entry(path: &Path) -> io::Result<Option<Value>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    // Antigravity's first run leaves an empty file, which it reads as having no
+    // servers; `agy mcp add` then fills it in.
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
     let invalid = || {
         io::Error::new(
             io::ErrorKind::InvalidData,

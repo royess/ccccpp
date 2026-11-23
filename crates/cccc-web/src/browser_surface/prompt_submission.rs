@@ -33,6 +33,7 @@ struct ComposerCandidate {
     selector: String,
     descriptor: String,
     verification_required: bool,
+    login_required: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -111,7 +112,10 @@ impl BrowserSurfaces {
             "prompt":"", "needles":[marker]
         }))?;
         let observed = page
-            .evaluate(format!("({INSPECT_SUBMISSION_SCRIPT})({payload})"))
+            .evaluate(super::chatgpt_dom::with_messages(
+                INSPECT_SUBMISSION_SCRIPT,
+                &payload,
+            ))
             .await?
             .into_value::<SubmissionSnapshot>()?;
         let same_target = if is_chatgpt_url(target_url) {
@@ -687,6 +691,22 @@ impl BrowserSurfaces {
 
     pub(crate) async fn prompt_readiness(&self, key: &str) -> Result<Value> {
         let page = self.page(key).await?;
+        let readiness = Self::inspect_prompt_readiness(&page).await;
+        let snapshot = match &readiness {
+            Ok(value) => value.clone(),
+            Err(_) => json!({
+                "ready":false,"login_required":false,"verification_required":false,
+                "state":"inspection_failed","checked_at":cccc_contracts::utc_now(),
+                "message":"The browser page could not be inspected. Check again without reloading the conversation."
+            }),
+        };
+        // An explicit failed check must invalidate the old successful snapshot,
+        // otherwise the next cached GET would immediately resurrect "ready".
+        self.record_prompt_readiness(key, &page, &snapshot).await;
+        readiness
+    }
+
+    async fn inspect_prompt_readiness(page: &Page) -> Result<Value> {
         let url = page.url().await?.unwrap_or_default();
         // A new window may still be waiting for response headers. It cannot
         // contain a composer, and evaluating JS there can wait for navigation.
@@ -702,17 +722,19 @@ impl BrowserSurfaces {
         };
         let ready = !candidate.selector.is_empty();
         let snapshot = if ready {
-            inspect_submission(&page, "", &[]).await?
+            inspect_submission(page, "", &[]).await?
         } else {
             SubmissionSnapshot::default()
         };
         let readiness = json!({
             "ready":ready,
             "composer_chars":snapshot.composer_chars,
-            "composer_has_attachments":!loading && composer_has_attachments(&page).await?,
+            "composer_has_attachments":!loading && composer_has_attachments(page).await?,
             "running":snapshot.running,
-            "login_required":!ready && !loading,
+            "login_required":candidate.login_required,
             "verification_required":candidate.verification_required,
+            "state":if loading {"loading"} else if candidate.verification_required {"verification_required"}
+                else if candidate.login_required {"sign_in_required"} else if ready {"ready"} else {"page_not_ready"},
             "tab_url":url,
             "input_selector":candidate.descriptor,
             "checked_at":cccc_contracts::utc_now(),
@@ -722,11 +744,12 @@ impl BrowserSurfaces {
                 "Complete the website's security verification in this browser. Delivery is waiting."
             } else if ready {
                 "Browser model composer is ready."
+            } else if candidate.login_required {
+                "Sign in using the shared ChatGPT browser."
             } else {
-                "Browser model sign-in or composer setup is required."
+                "The conversation input is not available yet. Check the page before retrying."
             }
         });
-        self.record_prompt_readiness(key, &page, &readiness).await;
         Ok(readiness)
     }
 
@@ -1032,6 +1055,7 @@ async fn activate_send_control(
         "prompt":prompt, "needles":needles, "url":url,
         "descriptor":candidate.descriptor
     });
+    let messages = super::chatgpt_dom::MESSAGES_SCRIPT;
     // Reuse the same receipt, draft and visible-control predicates. All final
     // checks and activation run in one JS task, so a draft edit, manual send,
     // navigation or disabled/covered button cannot slip between CDP calls.
@@ -1039,7 +1063,7 @@ async fn activate_send_control(
         r#"(() => {{
             const payload = {payload};
             const blocked = {{action:'', invoked:false, unsafe_state:true, error:''}};
-            const state = ({INSPECT_SUBMISSION_SCRIPT})(payload);
+            const state = ({INSPECT_SUBMISSION_SCRIPT})(payload, ({messages})());
             if (state.url !== payload.url || state.echo_found || !state.composer_exact) return blocked;
             const current = ({SELECT_SEND_CONTROL_SCRIPT})();
             if (!current.selector || current.descriptor !== payload.descriptor) return blocked;
@@ -1070,11 +1094,14 @@ async fn inspect_submission(
     needles: &[String],
 ) -> Result<SubmissionSnapshot> {
     let payload = serde_json::to_string(&json!({"prompt":prompt,"needles":needles}))?;
-    page.evaluate(format!("({INSPECT_SUBMISSION_SCRIPT})({payload})"))
-        .await
-        .context("inspect browser prompt submission")?
-        .into_value::<SubmissionSnapshot>()
-        .context("decode browser prompt submission state")
+    page.evaluate(super::chatgpt_dom::with_messages(
+        INSPECT_SUBMISSION_SCRIPT,
+        &payload,
+    ))
+    .await
+    .context("inspect browser prompt submission")?
+    .into_value::<SubmissionSnapshot>()
+    .context("decode browser prompt submission state")
 }
 
 fn weak_submission_evidence(
@@ -1103,7 +1130,7 @@ fn conversation_route_changed(before: &str, after: &str) -> bool {
         .is_some_and(|id| !provisional_conversation_id(&id))
 }
 
-pub(crate) fn conversation_url_for_target(target: &str, current: &str) -> Option<String> {
+fn conversation_url_for_target(target: &str, current: &str) -> Option<String> {
     let target = reqwest::Url::parse(target).ok()?;
     let mut current = reqwest::Url::parse(current).ok()?;
     if target.scheme() != current.scheme()
@@ -1157,7 +1184,26 @@ pub(crate) fn normalized_chatgpt_conversation_url(value: &str) -> Option<String>
     Some(url.to_string())
 }
 
+fn chatgpt_conversation_identity(value: &str) -> Option<(String, Option<u16>, String)> {
+    let normalized = normalized_chatgpt_conversation_url(value)?;
+    let url = reqwest::Url::parse(&normalized).ok()?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    Some((
+        url.host_str()?.to_owned(),
+        url.port(),
+        chatgpt_conversation_id(&url)?,
+    ))
+}
+
 pub(crate) fn conversation_target_matches(expected: &str, observed: &str) -> bool {
+    if let (Some(expected), Some(observed)) = (
+        chatgpt_conversation_identity(expected),
+        chatgpt_conversation_identity(observed),
+    ) {
+        return expected == observed;
+    }
     normalized_chatgpt_conversation_url(expected)
         .zip(normalized_chatgpt_conversation_url(observed))
         .is_some_and(|(expected, observed)| expected == observed)
@@ -1179,7 +1225,10 @@ fn chatgpt_conversation_id(url: &reqwest::Url) -> Option<String> {
 
 pub(super) fn provisional_conversation_id(value: &str) -> bool {
     let value = value.trim().to_ascii_uppercase();
-    value.starts_with("WEB:") || value.starts_with("WEB%3A")
+    value.starts_with("WEB:")
+        || value.starts_with("WEB%3A")
+        || value.starts_with("LOCAL-CHATGPT:")
+        || value.starts_with("LOCAL-CHATGPT%3A")
 }
 
 fn submission_needles(prompt: &str) -> Vec<String> {
@@ -1255,8 +1304,11 @@ const SELECT_COMPOSER_SCRIPT: &str = r#"() => {
         return { selector: '', descriptor: '', verification_required: true };
     }
     // ChatGPT exposes a guest composer too; its presence does not prove sign-in.
-    if (Array.from(document.querySelectorAll('[data-testid="login-button"]')).some(visible)) {
-        return { selector: '', descriptor: '' };
+    if (location.hostname === 'auth.openai.com'
+        || /^(chatgpt\.com|chat\.openai\.com)$/.test(location.hostname)
+            && /^\/auth\/(login|signup)(\/|$)/.test(location.pathname || '')
+        || Array.from(document.querySelectorAll('[data-testid="login-button"], a[href^="/auth/login"]')).some(visible)) {
+        return { selector: '', descriptor: '', login_required: true };
     }
     const editable = node => {
         if (!visible(node)) return false;
@@ -1301,7 +1353,10 @@ const SELECT_COMPOSER_SCRIPT: &str = r#"() => {
     // conversation composer is a delivery target; generic inputs are not.
     const chatGptHost = /(^|\.)chatgpt\.com$/.test(location.hostname)
         || ['chat.openai.com', 'auth.openai.com'].includes(location.hostname);
-    const selectors = chatGptHost ? ['#prompt-textarea'] : [
+    const selectors = chatGptHost ? [
+        '#prompt-textarea',
+        'form[data-chatgpt-composer] [data-composer-markdown][role="textbox"][contenteditable="true"]'
+    ] : [
         '.ProseMirror', '#prompt-textarea', '[contenteditable="true"][data-virtualkeyboard="true"]',
         '[role="textbox"][contenteditable="true"]', 'textarea[data-id="prompt-textarea"]',
         'textarea[name="prompt-textarea"]', 'textarea[placeholder*="Send a message"]',
@@ -1445,7 +1500,7 @@ const REQUEST_SUBMIT_SCRIPT: &str = r#"() => {
     }
 }"#;
 
-const INSPECT_SUBMISSION_SCRIPT: &str = r#"payload => {
+const INSPECT_SUBMISSION_SCRIPT: &str = r#"(payload, messages) => {
     const normalize = value => String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
     const expected = normalize(payload.prompt);
     const prefix = expected.slice(0, 160);
@@ -1478,7 +1533,7 @@ const INSPECT_SUBMISSION_SCRIPT: &str = r#"payload => {
     const composerTexts = composers.map(read).filter(Boolean);
     // Virtualized history can grow without a send, and assistants may quote a
     // pending batch. Only the exact receipt inside a user message proves it.
-    const messageNodes = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+    const messageNodes = messages.filter(message => message.role === 'user').map(message => message.node);
     const needles = Array.isArray(payload.needles) ? payload.needles.map(normalize).filter(Boolean) : [];
     const echoFound = messageNodes.some(node => {
         const text = read(node);
@@ -1593,21 +1648,302 @@ const ATTACHMENT_STATUS_SCRIPT: &str = r#"payload => {
         preview_count: previewNodes.length, image_preview_count: imagePreviews.length };
 }"#;
 
-pub(super) async fn composer_has_attachments(page: &Page) -> Result<bool> {
-    // An empty text box can still contain a user's pending file upload.
-    // Restrict previews to the composer, never earlier chat images.
-    page.evaluate(r#"() => {
+// An empty text box can still contain a user's pending file upload. Restrict
+// previews to the composer, never earlier chat images.
+pub(super) const COMPOSER_ATTACHMENTS_SCRIPT: &str = r#"() => {
             if ([...document.querySelectorAll('input[type=file]')].some(e => e.files?.length)) return true;
             const composer = document.querySelector('#prompt-textarea, [data-cccc-web-model-composer]');
             let root = composer?.closest('form, [data-testid*="composer" i], [class*="composer" i]');
             return !!root && [...root.querySelectorAll('[data-testid*="file-preview" i], [data-testid="attachment" i], [data-testid*="attachment-preview" i], [data-testid*="upload-preview" i], [class*="file-preview" i], [class*="attachment-preview" i], [class*="upload-preview" i], img[src^="blob:"]')]
                 .some(e => e.getClientRects().length > 0);
-        }"#).await?.into_value::<bool>().map_err(Into::into)
+        }"#;
+
+pub(super) async fn composer_has_attachments(page: &Page) -> Result<bool> {
+    page.evaluate(COMPOSER_ATTACHMENTS_SCRIPT)
+        .await?
+        .into_value::<bool>()
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod conversation_target_tests {
+    use super::*;
+
+    #[test]
+    fn project_and_standalone_routes_match_by_conversation_id() {
+        let standalone = "https://chatgpt.com/c/stable-id";
+        let project = "https://chatgpt.com/g/g-p-example/c/stable-id";
+        assert!(conversation_target_matches(standalone, project));
+        assert!(conversation_target_matches(project, standalone));
+        assert!(!conversation_target_matches(
+            standalone,
+            "https://chatgpt.com/g/g-p-example/c/other-id"
+        ));
+    }
+
+    #[test]
+    fn conversation_identity_keeps_origin_and_rejects_provisional_ids() {
+        let stable = "https://chatgpt.com/c/stable-id";
+        assert!(conversation_target_matches(
+            stable,
+            "https://chatgpt.com/g/g-p-example/c/stable-id?model=fixture#reply"
+        ));
+        for other in [
+            "https://chat.openai.com/c/stable-id",
+            "https://chatgpt.com:8443/c/stable-id",
+            "https://user@chatgpt.com/c/stable-id",
+            "http://chatgpt.com/c/stable-id",
+            "https://chatgpt.com.example/c/stable-id",
+            "https://chatgpt.com/",
+        ] {
+            assert!(!conversation_target_matches(stable, other), "{other}");
+        }
+        for id in [
+            "WEB:pending",
+            "WEB%3Apending",
+            "local-chatgpt:pending",
+            "local-chatgpt%3Apending",
+        ] {
+            let provisional = format!("https://chatgpt.com/c/{id}");
+            assert!(normalized_chatgpt_conversation_url(&provisional).is_none());
+            assert!(!conversation_target_matches(&provisional, &provisional));
+        }
+    }
 }
 
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_page_inspection_invalidates_earlier_readiness() {
+        if crate::system_browser_path().is_none() {
+            return;
+        }
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("fixture");
+        let (url, server) = super::super::browser_surface_tests::local_page(
+            "<textarea id=prompt-textarea></textarea>",
+        )
+        .await;
+        let surfaces = BrowserSurfaces::default();
+        surfaces
+            .open("inspection", &temp.path().join("profile"), &url, 800, 600)
+            .await
+            .expect("open");
+        let page = surfaces.page("inspection").await.expect("page");
+        assert_eq!(
+            surfaces
+                .prompt_readiness("inspection")
+                .await
+                .expect("ready")["ready"],
+            true
+        );
+        page.evaluate("window.fixtureStyle=getComputedStyle;window.getComputedStyle=()=>{throw new Error('fixture inspection failure')}").await.expect("inspection failure");
+        assert!(surfaces.prompt_readiness("inspection").await.is_err());
+        let snapshot = surfaces.info("inspection").await;
+        assert_eq!(
+            snapshot["metadata"]["prompt_readiness"]["state"],
+            "inspection_failed"
+        );
+        assert_eq!(
+            snapshot["metadata"]["prompt_readiness"]["login_required"],
+            false
+        );
+        page.evaluate("window.getComputedStyle=window.fixtureStyle")
+            .await
+            .expect("restore");
+        assert_eq!(
+            surfaces
+                .prompt_readiness("inspection")
+                .await
+                .expect("recovered")["ready"],
+            true
+        );
+        surfaces.close("inspection").await.expect("close");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn current_chatgpt_composer_is_not_an_auth_or_search_input() {
+        if crate::system_browser_path().is_none() {
+            return;
+        }
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("fixture");
+        let (url, server) = super::super::browser_surface_tests::local_page(
+            r#"<main><input type=search><form data-chatgpt-composer><div data-composer-body><div class=ProseMirror data-composer-markdown role=textbox contenteditable=true style="width:400px;height:40px"></div></div><button type=button aria-label="Start Voice">Voice</button></form></main>"#,
+        ).await;
+        let manager = BrowserSurfaces::default();
+        manager
+            .open("current", &temp.path().join("profile"), &url, 800, 600)
+            .await
+            .expect("open");
+        let page = manager.page("current").await.expect("page");
+        let candidate = page
+            .evaluate(format!(
+                "(location => ({SELECT_COMPOSER_SCRIPT})())({{hostname:'chatgpt.com'}})"
+            ))
+            .await
+            .expect("current composer")
+            .into_value::<ComposerCandidate>()
+            .expect("candidate");
+        assert!(
+            !candidate.selector.is_empty(),
+            "current ChatGPT composer has no prompt-textarea id"
+        );
+        page.evaluate("document.querySelector('main').insertAdjacentHTML('afterbegin','<a href=\"/auth/login?returnTo=%2F\">Log in</a>')").await.expect("guest login control");
+        let guest = manager
+            .prompt_readiness("current")
+            .await
+            .expect("guest composer");
+        assert_eq!(
+            guest["ready"], false,
+            "a guest composer must not admit deliveries"
+        );
+        assert_eq!(guest["login_required"], true);
+        page.evaluate("document.querySelector('a').remove()")
+            .await
+            .expect("remove login");
+        page.evaluate("document.querySelector('[contenteditable]').remove(); document.querySelector('form').insertAdjacentHTML('beforeend', '<textarea placeholder=Search></textarea>')").await.expect("unavailable composer");
+        let search = page
+            .evaluate(format!(
+                "(location => ({SELECT_COMPOSER_SCRIPT})())({{hostname:'chatgpt.com'}})"
+            ))
+            .await
+            .expect("search input")
+            .into_value::<ComposerCandidate>()
+            .expect("candidate");
+        assert!(search.selector.is_empty());
+        assert!(!search.login_required, "missing input is not missing login");
+        page.evaluate("document.querySelector('textarea').remove()")
+            .await
+            .expect("remove search");
+        let unknown = manager
+            .prompt_readiness("current")
+            .await
+            .expect("unknown auth");
+        assert_eq!(unknown["ready"], false);
+        assert_eq!(unknown["login_required"], false);
+        manager.close("current").await.expect("close");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn current_chatgpt_user_bubble_is_required_for_delivery_receipt() {
+        if crate::system_browser_path().is_none() {
+            return;
+        }
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("fixture");
+        let (url, server) = super::super::browser_surface_tests::local_page(
+            "<main><textarea id=prompt-textarea></textarea><div data-content-search-unit-key><h4 data-conversation-role=assistant>Assistant</h4><div id=answer></div></div></main>",
+        ).await;
+        let manager = BrowserSurfaces::default();
+        manager
+            .open(
+                "current-receipt",
+                &temp.path().join("profile"),
+                &url,
+                800,
+                600,
+            )
+            .await
+            .expect("open");
+        let page = manager.page("current-receipt").await.expect("page");
+        let prompt = "[cccc] Browser batch webdelivery:A:current events=e1 actor=A\nTask";
+        page.evaluate(format!(
+            "document.querySelector('#answer').textContent={}",
+            json!(prompt)
+        ))
+        .await
+        .expect("assistant quote");
+        assert!(
+            !inspect_submission(&page, prompt, &submission_needles(prompt))
+                .await
+                .expect("quote")
+                .echo_found
+        );
+        page.evaluate(format!("(() => {{const bubble=document.createElement('div');bubble.setAttribute('data-user-message-bubble','');bubble.textContent={};document.querySelector('main').append(bubble)}})()", json!(prompt))).await.expect("user bubble");
+        assert!(
+            inspect_submission(&page, prompt, &submission_needles(prompt))
+                .await
+                .expect("receipt")
+                .echo_found
+        );
+        manager.close("current-receipt").await.expect("close");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn current_chatgpt_layout_submits_once_and_protects_drafts_and_generation() {
+        if crate::system_browser_path().is_none() {
+            return;
+        }
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("fixture");
+        let (url, server) = super::super::browser_surface_tests::local_page(r#"
+            <main><form data-chatgpt-composer><div data-composer-body>
+            <div class=ProseMirror role=textbox data-composer-markdown contenteditable=true style="width:400px;height:40px"></div>
+            <button type=button aria-label="Send prompt">Send</button></div></form></main>
+            <script>window.sends=0;document.querySelector('button').onclick=()=>{
+              window.sends++;const composer=document.querySelector('[contenteditable]');
+              const bubble=document.createElement('div');bubble.setAttribute('data-user-message-bubble','');
+              bubble.textContent=composer.innerText;document.querySelector('main').prepend(bubble);composer.textContent='';
+            };</script>"#).await;
+        let surfaces = BrowserSurfaces::default();
+        surfaces
+            .open("current-send", &temp.path().join("profile"), &url, 800, 600)
+            .await
+            .expect("open");
+        let page = surfaces.page("current-send").await.expect("page");
+        let prompt = "[cccc] Browser batch webdelivery:A:layout events=e1 actor=A\nTask";
+        let result = surfaces
+            .submit_prompt_with_attachment("current-send", &url, prompt, None, "layout", None)
+            .await
+            .expect("submit");
+        assert!(matches!(result, PromptSubmissionOutcome::Verified(_)));
+        page.evaluate("document.querySelector('[contenteditable]').textContent='keep human draft'")
+            .await
+            .expect("draft");
+        let blocked = surfaces
+            .submit_prompt_with_attachment("current-send", &url, "next task", None, "next", None)
+            .await
+            .expect("blocked");
+        assert!(matches!(blocked, PromptSubmissionOutcome::Ambiguous(_)));
+        assert_eq!(
+            page.evaluate("document.querySelector('[contenteditable]').textContent")
+                .await
+                .expect("draft survives")
+                .into_value::<String>()
+                .expect("text"),
+            "keep human draft"
+        );
+        page.evaluate("document.querySelector('[contenteditable]').textContent='';document.querySelector('button').setAttribute('aria-label','Stop streaming');document.querySelector('button').textContent='Stop'").await.expect("generation");
+        let blocked = surfaces
+            .submit_prompt_with_attachment("current-send", &url, "next task", None, "next", None)
+            .await
+            .expect("busy");
+        assert!(matches!(blocked, PromptSubmissionOutcome::Deferred(_)));
+        assert_eq!(
+            page.evaluate("window.sends")
+                .await
+                .expect("sends")
+                .into_value::<usize>()
+                .expect("count"),
+            1
+        );
+        surfaces.close("current-send").await.expect("close");
+        server.abort();
+    }
 
     #[tokio::test]
     async fn image_compat_submission_waits_for_enabled_button_and_sends_once() {
@@ -1616,7 +1952,9 @@ mod readiness_tests {
         if crate::system_browser_path().is_none() {
             return;
         }
-        let _chrome_guard = crate::browser_surface::chrome_test_guard().await;
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
         let temp = tempfile::tempdir().expect("fixture");
         let image = temp.path().join("compat.png");
         std::fs::write(&image, base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAKUlEQVR42u3OIQEAAAACIP+f1hkWWEB6FgEBAQEBAQEBAQEBAQEBgXdgl/rw4tnPBf0AAAAASUVORK5CYII=").expect("PNG")).expect("image");
@@ -1668,7 +2006,9 @@ mod readiness_tests {
         if crate::system_browser_path().is_none() {
             return;
         }
-        let _chrome_guard = crate::browser_surface::chrome_test_guard().await;
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
         let temp = tempfile::tempdir().expect("fixture");
         let manager = BrowserSurfaces::default();
         let (url, server) = super::super::browser_surface_tests::local_page("<main></main>").await;
@@ -1768,7 +2108,9 @@ mod readiness_tests {
         if crate::system_browser_path().is_none() {
             return;
         }
-        let _chrome_guard = crate::browser_surface::chrome_test_guard().await;
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
         let temp = tempfile::tempdir().expect("fixture");
         let manager = BrowserSurfaces::default();
         let (url, server) = super::super::browser_surface_tests::local_page(
@@ -1820,7 +2162,9 @@ mod readiness_tests {
         if crate::system_browser_path().is_none() {
             return;
         }
-        let _chrome_guard = crate::browser_surface::chrome_test_guard().await;
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
         let temp = tempfile::tempdir().expect("fixture");
         let manager = BrowserSurfaces::default();
         let (url, server) = super::super::browser_surface_tests::local_page(r#"<main><form onsubmit="event.preventDefault();window.sends++"><textarea id="prompt-textarea"></textarea><button id="composer-submit-button" type="submit" style="position:absolute;left:20px;top:200px;width:80px;height:30px">Send</button></form><div id="cover" style="position:absolute;left:20px;top:200px;width:80px;height:30px;background:white" onclick="window.wrongClicks++"></div></main><script>window.sends=0;window.wrongClicks=0;</script>"#).await;
@@ -1884,7 +2228,9 @@ mod readiness_tests {
         if crate::system_browser_path().is_none() {
             return;
         }
-        let _chrome_guard = crate::browser_surface::chrome_test_guard().await;
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
         let temp = tempfile::tempdir().expect("fixture");
         let manager = BrowserSurfaces::default();
         let (url, server) = super::super::browser_surface_tests::local_page("<main></main>").await;
@@ -2008,7 +2354,9 @@ mod readiness_tests {
         if crate::system_browser_path().is_none() {
             return;
         }
-        let _chrome_guard = crate::browser_surface::chrome_test_guard().await;
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
         let temp = tempfile::tempdir().expect("fixture");
         let manager = BrowserSurfaces::default();
         let (url, server) = super::super::browser_surface_tests::local_page(
@@ -2088,7 +2436,9 @@ mod readiness_tests {
         if crate::system_browser_path().is_none() {
             return;
         }
-        let _chrome_guard = crate::browser_surface::chrome_test_guard().await;
+        let Some(_chrome_guard) = crate::browser_surface::chrome_test_guard().await else {
+            return;
+        };
         let temp = tempfile::tempdir().expect("tempdir");
         let manager = BrowserSurfaces::default();
         let (url, server) = super::super::browser_surface_tests::local_page("<main></main>").await;

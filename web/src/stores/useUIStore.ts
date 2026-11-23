@@ -18,9 +18,11 @@ interface UINotice {
   message: string;
   actionLabel?: string;
   onAction?: () => void;
+  /** An actionable notice stays until dismissed unless it has its own lifetime, like an undo. */
+  durationMs?: number;
 }
 
-export type ChatFilter = "all" | "user" | "mail" | "request_reply";
+export type ChatFilter = "all" | "user" | "pinned" | "pending_user";
 /** Empty means unrestricted; entries are concrete event.by identities. */
 export type ChatSenderFilter = string[];
 
@@ -44,6 +46,12 @@ function normalizeChatSenderFilter(value: unknown): ChatSenderFilter {
 export type ChatFollowMode = "follow" | "detached";
 export const CHAT_SCROLL_SNAPSHOT_COORDINATE_VERSION = 1;
 
+/** A message on screen when a snapshot was taken, with its offset as for anchorId. */
+export interface ChatVisibleMessage {
+  id: string;
+  offsetPx: number;
+}
+
 export interface ChatScrollSnapshot {
   coordinateVersion: typeof CHAT_SCROLL_SNAPSHOT_COORDINATE_VERSION;
   mode: ChatFollowMode;
@@ -51,6 +59,14 @@ export interface ChatScrollSnapshot {
   offsetPx: number;
   scrollTop?: number;
   updatedAt: number;
+  /** The filtered view that took the snapshot; another view restores by focus instead. */
+  viewKey?: string;
+  /** The message being read (last touched, else mid-list) and its offset, as for anchorId. */
+  focusId?: string;
+  focusOffsetPx?: number;
+  /** The messages on screen, the one being read first. Another view keeps the first it shows.
+   * A follow snapshot carries only a message the reader touched. */
+  visible?: ChatVisibleMessage[];
 }
 
 export type GroupWorkView = "messages" | "terminals";
@@ -72,7 +88,6 @@ export interface ChatSessionState {
   scrollSnapshot: ChatScrollSnapshot | null;
   mobileSurface: MobileSurface;
   presentationDockOpen: boolean;
-  presentationDisplayMode: "modal" | "split";
   filesPanelOpen: boolean;
   sidePanelWidth: number;
   presentationCompact: boolean;
@@ -91,7 +106,6 @@ const DEFAULT_CHAT_SESSION: ChatSessionState = {
   scrollSnapshot: null,
   mobileSurface: "messages",
   presentationDockOpen: false,
-  presentationDisplayMode: "split",
   filesPanelOpen: false,
   sidePanelWidth: SIDE_PANEL_DEFAULT_WIDTH,
   presentationCompact: true,
@@ -116,13 +130,19 @@ interface UIState {
   sidebarOpen: boolean;
   sidebarCollapsed: boolean; // Desktop sidebar collapsed state
   sidebarWidth: number;
+  /** Counts and the filter for requests waiting for the user's answer. */
+  showPendingPrompts: boolean;
   isSmallScreen: boolean;
   composerHeight: number | null;
   chatSessions: Record<string, ChatSessionState>;
   actorBusy: Record<string, number>;
   webReadOnly: boolean;
   canAccessGlobalSettings: boolean | null;
+  /** The current Web principal, not bootstrap access to settings. */
+  isWebAdmin: boolean | null;
   workspaceFileViewerGroupId: string;
+  /** Large views over this page; never saved across page loads. */
+  chatObscuringViews: number;
   sseStatus: "connected" | "connecting" | "disconnected";
   sseError: SSEErrorDetail | null;
 
@@ -139,6 +159,7 @@ interface UIState {
   setSidebarOpen: (v: boolean) => void;
   setSidebarCollapsed: (v: boolean) => void;
   setSidebarWidth: (v: number) => void;
+  setShowPendingPrompts: (v: boolean) => void;
   toggleSidebarCollapsed: () => void;
   setShowScrollButton: (groupId: string, v: boolean) => void;
   setChatUnreadCount: (groupId: string, v: number) => void;
@@ -153,7 +174,6 @@ interface UIState {
   setGroupTerminalPage: (groupId: string, page: number) => void;
   setChatMobileSurface: (groupId: string, v: MobileSurface) => void;
   setChatPresentationDockOpen: (groupId: string, v: boolean) => void;
-  setChatPresentationDisplayMode: (groupId: string, v: "modal" | "split") => void;
   setChatFilesPanelOpen: (groupId: string, v: boolean) => void;
   setChatVoicePreferences: (
     groupId: string,
@@ -165,8 +185,10 @@ interface UIState {
     >,
   ) => void;
   setWorkspaceFileViewerGroupId: (groupId: string) => void;
+  registerChatObscuringView: () => () => void;
   setWebReadOnly: (v: boolean) => void;
   setCanAccessGlobalSettings: (v: boolean | null) => void;
+  setIsWebAdmin: (v: boolean | null) => void;
   setSSEStatus: (v: "connected" | "connecting" | "disconnected") => void;
   setSSEError: (v: SSEErrorDetail | null) => void;
 }
@@ -184,6 +206,7 @@ let noticeTimeoutId: number | null = null;
 // localStorage key for sidebar collapsed state
 const SIDEBAR_COLLAPSED_KEY = "cccc-sidebar-collapsed";
 const SIDEBAR_WIDTH_KEY = "cccc-sidebar-width";
+const PENDING_PROMPTS_KEY = "cccc-pending-prompts";
 const CHAT_SESSIONS_KEY = "cccc-chat-sessions";
 
 export function clampSidebarWidth(value: number): number {
@@ -195,6 +218,17 @@ export function clampSidebarWidth(value: number): number {
 export function getSidebarWidthCssValue(value: number): string {
   const preferred = clampSidebarWidth(value);
   return `clamp(${SIDEBAR_MIN_WIDTH}px, ${preferred}px, min(${SIDEBAR_MAX_WIDTH}px, ${SIDEBAR_MAX_VIEWPORT_PERCENT}vw))`;
+}
+
+// On a phone the Group list is a drawer over the chat. A visit without a Group opens it; a page
+// opened on a Group or one of its messages, as from a notification or a reload, shows that
+// conversation instead.
+function loadSidebarOpen(): boolean {
+  try {
+    return !new URLSearchParams(window.location.search).get("group")?.trim();
+  } catch {
+    return true;
+  }
 }
 
 function loadSidebarCollapsed(): boolean {
@@ -211,6 +245,22 @@ function saveSidebarCollapsed(collapsed: boolean): void {
     localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(collapsed));
   } catch (e) {
     console.warn("Failed to persist sidebar state to localStorage:", e);
+  }
+}
+
+function loadPendingPrompts(): boolean {
+  try {
+    return localStorage.getItem(PENDING_PROMPTS_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function savePendingPrompts(show: boolean): void {
+  try {
+    localStorage.setItem(PENDING_PROMPTS_KEY, String(show));
+  } catch {
+    // The choice still applies until this page is closed.
   }
 }
 
@@ -247,12 +297,17 @@ export function groupMessagesVisible(
   groupId: string,
   state: Pick<
     UIState,
-    "activeTab" | "chatSessions" | "isSmallScreen" | "workspaceFileViewerGroupId"
+    | "activeTab"
+    | "chatSessions"
+    | "isSmallScreen"
+    | "workspaceFileViewerGroupId"
+    | "chatObscuringViews"
   >,
 ): boolean {
   const session = getChatSession(groupId, state.chatSessions);
   return (
     state.activeTab === "chat" &&
+    !state.chatObscuringViews &&
     state.workspaceFileViewerGroupId !== groupId &&
     session.workView !== "terminals" &&
     (!state.isSmallScreen || session.mobileSurface === "messages")
@@ -276,7 +331,6 @@ function sanitizeChatSessions(value: unknown): Record<string, ChatSessionState> 
       chatSenderFilter?: unknown;
       mobileSurface?: unknown;
       presentationDockOpen?: unknown;
-      presentationDisplayMode?: unknown;
       filesPanelOpen?: unknown;
       sidePanelWidth?: unknown;
       presentationCompact?: unknown;
@@ -288,10 +342,11 @@ function sanitizeChatSessions(value: unknown): Record<string, ChatSessionState> 
       voiceRecognitionLanguage: voiceRecognitionLanguage(session.voiceRecognitionLanguage),
       workView: session.workView === "terminals" ? "terminals" : "messages",
       terminalPage: sanitizeTerminalPage(session.terminalPage),
+      // Filters this version no longer offers, such as Mail, open as All.
       chatFilter:
         session.chatFilter === "user" ||
-        session.chatFilter === "mail" ||
-        session.chatFilter === "request_reply"
+        session.chatFilter === "pinned" ||
+        session.chatFilter === "pending_user"
           ? session.chatFilter
           : "all",
       scrollSnapshot: null,
@@ -300,7 +355,6 @@ function sanitizeChatSessions(value: unknown): Record<string, ChatSessionState> 
         ? (session.mobileSurface as MobileSurface)
         : "messages",
       presentationDockOpen: Boolean(session.presentationDockOpen),
-      presentationDisplayMode: session.presentationDisplayMode === "modal" ? "modal" : "split",
       filesPanelOpen: Boolean(session.filesPanelOpen),
       sidePanelWidth: clampSidePanelWidth(Number(session.sidePanelWidth)),
       presentationCompact:
@@ -336,7 +390,6 @@ function saveChatSessions(sessions: Record<string, ChatSessionState>): void {
           chatSenderFilter: session.chatSenderFilter,
           mobileSurface: session.mobileSurface,
           presentationDockOpen: session.presentationDockOpen,
-          presentationDisplayMode: session.presentationDisplayMode,
           filesPanelOpen: session.filesPanelOpen,
           sidePanelWidth: session.sidePanelWidth,
           presentationCompact: session.presentationCompact,
@@ -381,15 +434,18 @@ export const useUIStore = create<UIState>((set) => ({
   errorMsg: "",
   notice: null,
   isTransitioning: false,
-  sidebarOpen: true,
+  sidebarOpen: loadSidebarOpen(),
   sidebarCollapsed: loadSidebarCollapsed(),
   sidebarWidth: loadSidebarWidth(),
+  showPendingPrompts: loadPendingPrompts(),
   isSmallScreen: false,
   composerHeight: loadComposerHeight(),
   chatSessions: loadChatSessions(),
   webReadOnly: false,
   canAccessGlobalSettings: null,
+  isWebAdmin: null,
   workspaceFileViewerGroupId: "",
+  chatObscuringViews: 0,
   sseStatus: "disconnected" as const,
   sseError: null as SSEErrorDetail | null,
 
@@ -431,12 +487,12 @@ export const useUIStore = create<UIState>((set) => ({
     }
     set({ notice });
     // Actionable notices remain until user dismisses/clicks action.
-    const persistent = Boolean(notice.onAction && notice.actionLabel);
+    const persistent = Boolean(notice.onAction && notice.actionLabel) && !notice.durationMs;
     if (!persistent) {
       noticeTimeoutId = window.setTimeout(() => {
         set({ notice: null });
         noticeTimeoutId = null;
-      }, 3500);
+      }, notice.durationMs || 3500);
     }
   },
   dismissNotice: () => {
@@ -457,6 +513,10 @@ export const useUIStore = create<UIState>((set) => ({
     const next = clampSidebarWidth(v);
     saveSidebarWidth(next);
     set({ sidebarWidth: next });
+  },
+  setShowPendingPrompts: (show) => {
+    savePendingPrompts(show);
+    set({ showPendingPrompts: show });
   },
   toggleSidebarCollapsed: () =>
     set((state) => {
@@ -496,12 +556,10 @@ export const useUIStore = create<UIState>((set) => ({
       saveChatSessions(chatSessions);
       return { chatSessions };
     }),
+  // Filters keep the snapshot: the next view restores the message being read from it.
   setChatFilter: (groupId, v) =>
     set((state) => {
-      const chatSessions = updateChatSession(state.chatSessions, groupId, {
-        chatFilter: v,
-        scrollSnapshot: null,
-      });
+      const chatSessions = updateChatSession(state.chatSessions, groupId, { chatFilter: v });
       saveChatSessions(chatSessions);
       return { chatSessions };
     }),
@@ -509,7 +567,6 @@ export const useUIStore = create<UIState>((set) => ({
     set((state) => {
       const chatSessions = updateChatSession(state.chatSessions, groupId, {
         chatSenderFilter: normalizeChatSenderFilter(v),
-        scrollSnapshot: null,
       });
       saveChatSessions(chatSessions);
       return { chatSessions };
@@ -550,14 +607,6 @@ export const useUIStore = create<UIState>((set) => ({
       saveChatSessions(chatSessions);
       return { chatSessions };
     }),
-  setChatPresentationDisplayMode: (groupId, v) =>
-    set((state) => {
-      const chatSessions = updateChatSession(state.chatSessions, groupId, {
-        presentationDisplayMode: v,
-      });
-      saveChatSessions(chatSessions);
-      return { chatSessions };
-    }),
   setChatFilesPanelOpen: (groupId, v) =>
     set((state) => {
       const chatSessions = updateChatSession(state.chatSessions, groupId, { filesPanelOpen: v });
@@ -581,8 +630,18 @@ export const useUIStore = create<UIState>((set) => ({
       return { chatSessions };
     }),
   setWorkspaceFileViewerGroupId: (groupId) => set({ workspaceFileViewerGroupId: groupId }),
+  registerChatObscuringView: () => {
+    set((state) => ({ chatObscuringViews: state.chatObscuringViews + 1 }));
+    let registered = true;
+    return () => {
+      if (!registered) return;
+      registered = false;
+      set((state) => ({ chatObscuringViews: state.chatObscuringViews - 1 }));
+    };
+  },
   setWebReadOnly: (v) => set({ webReadOnly: v }),
   setCanAccessGlobalSettings: (v) => set({ canAccessGlobalSettings: v }),
+  setIsWebAdmin: (v) => set({ isWebAdmin: v }),
   setSSEStatus: (v) => set({ sseStatus: v }),
   setSSEError: (v) => set({ sseError: v }),
 }));

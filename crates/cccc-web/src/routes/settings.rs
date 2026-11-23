@@ -21,6 +21,10 @@ pub fn routes() -> Router<AppState> {
             post(automation_manage),
         )
         .route(
+            "/api/v1/groups/{group_id}/automation/run",
+            post(automation_run_now),
+        )
+        .route(
             "/api/v1/groups/{group_id}/automation/reset_baseline",
             post(automation_reset),
         )
@@ -67,17 +71,6 @@ fn projected_settings(group: &Value) -> Value {
                 "terminal_transcript",
                 "visibility",
             ),
-            (
-                "terminal_transcript_notify_tail",
-                "terminal_transcript",
-                "notify_tail",
-            ),
-            (
-                "terminal_transcript_notify_lines",
-                "terminal_transcript",
-                "notify_lines",
-            ),
-            ("panorama_enabled", "features", "panorama_enabled"),
         ] {
             if let Some(value) = group
                 .get(section)
@@ -88,31 +81,12 @@ fn projected_settings(group: &Value) -> Value {
             }
         }
     }
-    if let (Some(target), Some(automation)) = (
-        stored.as_object_mut(),
-        group.get("automation").and_then(Value::as_object),
-    ) {
-        for key in cccc_core::group::AUTOMATION_TIMING_KEYS {
-            if let Some(value) = automation.get(*key) {
-                target.insert((*key).into(), value.clone());
-            }
-        }
-    }
     let mut settings = json!({
         "default_send_to":"foreman",
-        "actor_idle_timeout_seconds":0,
-        "keepalive_delay_seconds":120,
-        "keepalive_max_per_actor":3,
-        "silence_timeout_seconds":0,
-        "help_nudge_interval_seconds":600,
-        "help_nudge_min_messages":10,
         "mail_notice_after_seconds":1800,
         "mail_notice_idle_after_seconds":60,
         "reply_notice_after_seconds":900,
-        "terminal_transcript_visibility":"foreman",
-        "terminal_transcript_notify_tail":true,
-        "terminal_transcript_notify_lines":20,
-        "panorama_enabled":false
+        "terminal_transcript_visibility":"foreman"
     });
     if let (Some(target), Some(source)) = (settings.as_object_mut(), stored.as_object()) {
         cccc_core::settings::merge(target, source);
@@ -196,6 +170,29 @@ async fn automation_reset(
     call(&state, "group_automation_reset_baseline", args).await
 }
 
+async fn automation_run_now(
+    State(state): State<AppState>,
+    Path(group_id): Path<String>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    call(
+        &state,
+        "group_automation_run_now",
+        automation_run_now_args(group_id, body)?,
+    )
+    .await
+}
+
+fn automation_run_now_args(
+    group_id: String,
+    body: Value,
+) -> Result<serde_json::Map<String, Value>, crate::api::ApiError> {
+    let mut args = body_object(body)?;
+    args.insert("group_id".into(), Value::String(group_id));
+    args.insert("by".into(), Value::String("user".into()));
+    Ok(args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,8 +210,8 @@ mod tests {
                 "mail_notice_idle_after_seconds":61,
                 "reply_notice_after_seconds":901
             },
-            "terminal_transcript":{"visibility":"all","notify_tail":false,"notify_lines":37},
-            "features":{"panorama_enabled":true}
+            "terminal_transcript":{"visibility":"all"},
+            "automation":{"keepalive_delay_seconds":456}
         }));
 
         assert_eq!(settings["default_send_to"], json!("foreman"));
@@ -226,9 +223,7 @@ mod tests {
         );
         assert_eq!(settings["reply_notice_after_seconds"], json!(901));
         assert_eq!(settings["terminal_transcript_visibility"], json!("all"));
-        assert_eq!(settings["terminal_transcript_notify_tail"], json!(false));
-        assert_eq!(settings["terminal_transcript_notify_lines"], json!(37));
-        assert_eq!(settings["panorama_enabled"], json!(true));
+        assert!(settings.get("keepalive_delay_seconds").is_none());
         assert_eq!(settings["native_extension"], json!({"keep":true}));
     }
 
@@ -251,5 +246,20 @@ mod tests {
         assert_eq!(args["expected_version"], json!(7));
         assert_eq!(args["by"], json!("user"));
         assert!(args.get("patch").is_none());
+    }
+
+    #[test]
+    fn automation_run_binds_the_user_and_requested_group() {
+        let args = automation_run_now_args(
+            "g_real".into(),
+            json!({
+                "group_id":"g_other", "by":"peer", "rule_id":"standup", "expected_version":7
+            }),
+        )
+        .expect("arguments");
+        assert_eq!(args["group_id"], "g_real");
+        assert_eq!(args["by"], "user");
+        assert_eq!(args["rule_id"], "standup");
+        assert_eq!(args["expected_version"], 7);
     }
 }

@@ -1,0 +1,109 @@
+import { expect, it } from "vite-plus/test";
+import type { Task } from "../../types";
+import { taskSearchMatch, taskSearchTextMatch } from "./taskSearchExcerpt";
+
+const task = (fields: Partial<Task>): Task => ({ id: "T7", title: "Board polish", ...fields });
+it("quotes the matched field around the match on one line", () => {
+  const notes = `Context:\n\n${"earlier words ".repeat(5)}the Flaky test\tfails\n${"later ".repeat(20)}`;
+  const found = taskSearchMatch(task({ notes }), "flaky test");
+  expect(found?.field).toBe("notes");
+  expect(found?.match).toBe("Flaky test");
+  expect(found?.before.startsWith("…")).toBe(true);
+  expect(found?.before.endsWith("the ")).toBe(true);
+  expect(found?.after.startsWith(" fails")).toBe(true);
+  expect(found?.after.endsWith("…")).toBe(true);
+  expect(`${found?.before}${found?.match}${found?.after}`).not.toMatch(/[\n\t]/);
+
+  const short = taskSearchMatch(task({ outcome: "Deploy after review" }), "review");
+  expect(short).toMatchObject({
+    field: "outcome",
+    before: "Deploy after ",
+    match: "review",
+    after: "",
+  });
+  // A Done card hides its handoff, so the quote explains the match there.
+  expect(taskSearchMatch(task({ handoff_to: "reviewer" }), "view")?.field).toBe("handoff_to");
+});
+
+it("maps the match back to the original text when casing lengthens a character", () => {
+  // "İ" lowercases to two units, which would shift every later offset.
+  const found = taskSearchMatch(task({ notes: "İİİ İzmir rollout DONE" }), "done");
+  expect(found?.match).toBe("DONE");
+  expect(found?.before).toBe("İİİ İzmir rollout ");
+  expect(taskSearchMatch(task({ notes: "Check İzmir first" }), "i̇zmir")?.match).toBe("İzmir");
+  // With İ forcing the mapped path, a final sigma still cases as the server's
+  // whole-string lowercase does: ΟΣ at a word end is ος, not οσ.
+  expect(taskSearchMatch(task({ notes: "İΟΣ" }), "ος")?.match).toBe("ΟΣ");
+  expect(taskSearchMatch(task({ notes: "İΟΣ" }), "οσ")).toBeNull();
+});
+
+it("never splits a character or emoji at the edge of the quote", () => {
+  const family = "👨‍👩‍👧";
+  const notes = `${family.repeat(30)} needle ${"😀".repeat(80)}`;
+  const found = taskSearchMatch(task({ notes }), "needle");
+  expect(found?.match).toBe("needle");
+  // Each emoji counts double, which keeps the match within the quote's two lines.
+  expect(found?.before).toBe(`…${family.repeat(9)} `);
+  expect(found?.after).toBe(` ${"😀".repeat(59)}…`);
+});
+
+// Speed is measured separately (2M characters: 10–19 ms in Node 24); a wall
+// clock limit here would fail on a busy CI runner.
+it("finds and maps matches in very long notes, also when casing lengthens a character", () => {
+  for (const notes of [
+    `${"x".repeat(2_000_000)} late match`,
+    // One İ sends the search down the path that maps offsets back.
+    `İ${"x".repeat(2_000_000)} late match`,
+    `${"x".repeat(2_000_000)}İ late match`,
+  ]) {
+    const found = taskSearchMatch(task({ notes }), "late");
+    expect(found?.match).toBe("late");
+    expect(found?.after).toBe(" match");
+  }
+  // A match right after a chunk edge, with an İ before it, maps exactly.
+  const edge = `İ${"y".repeat(4094)}ZZ tail`;
+  expect(taskSearchMatch(task({ notes: edge }), "zz")?.match).toBe("ZZ");
+});
+
+it("starts the lead-in at a whole word and finds a match in a long title", () => {
+  const notes = "We discussed the rollback plan and then the flaky cache test again";
+  expect(taskSearchMatch(task({ notes }), "cache")?.before).toBe("…and then the flaky ");
+  const title = "A long title that runs past the two lines a card shows, about zebra crossings";
+  const found = taskSearchMatch(task({ title }), "zebra");
+  expect(found?.field).toBe("title");
+  expect(found?.match).toBe("zebra");
+});
+
+it("finds every daemon-searchable field without assuming a rendered width", () => {
+  const fields = ["title", "id", "outcome", "notes", "assignee", "priority", "handoff_to"] as const;
+  for (const field of fields) {
+    const text = `prefix needle-${field} suffix`;
+    const value = task({ [field]: text });
+    const found = taskSearchMatch(value, `NEEDLE-${field.toUpperCase()}`);
+    expect(found?.field).toBe(field);
+    expect(text.slice(found!.start, found!.end)).toBe(`needle-${field}`);
+    expect(found?.match).toBe(`needle-${field}`);
+  }
+  expect(taskSearchMatch(task({ notes: "nothing" }), "   ")).toBeNull();
+  expect(taskSearchMatch(task({ notes: "nothing" }), "absent")).toBeNull();
+});
+
+it("returns indexes for the exact displayed title, including casing expansion and emoji", () => {
+  const text = "  İ🌟ZEBRA  ";
+  const found = taskSearchTextMatch(text, "zebra");
+  expect(found).toEqual([5, 10]);
+  expect(text.slice(...found!)).toBe("ZEBRA");
+  const trimmed = text.trim();
+  expect(trimmed.slice(...taskSearchTextMatch(trimmed, "zebra")!)).toBe("ZEBRA");
+  expect(taskSearchTextMatch(text, " ")).toBeNull();
+  expect(taskSearchTextMatch(text, "absent")).toBeNull();
+});
+
+it("keeps a long match intact and maps offsets through Unicode casing", () => {
+  const matching = "long-needle-".repeat(40);
+  const text = `İ🌟${"before ".repeat(5)}${matching} tail`;
+  const found = taskSearchMatch(task({ notes: text }), matching.toUpperCase());
+  expect(found?.field).toBe("notes");
+  expect(found?.match).toBe(matching);
+  expect(text.slice(found!.start, found!.end)).toBe(matching);
+});

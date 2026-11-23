@@ -10,13 +10,13 @@ use std::time::Duration;
 // an HTTP chunk containing multiple events, while preserving lifecycle data.
 const SSE_BUFFER_LIMIT: usize = 16 * 1024 * 1024;
 
-struct SseLineBuffer {
+pub(in super::super) struct SseLineBuffer {
     bytes: Vec<u8>,
     limit: usize,
 }
 
 impl SseLineBuffer {
-    fn new(limit: usize) -> Self {
+    pub(in super::super) fn new(limit: usize) -> Self {
         Self {
             bytes: Vec::new(),
             limit,
@@ -25,7 +25,7 @@ impl SseLineBuffer {
 
     // The caller splits at LF, including it in each completed fragment. Count
     // all framing bytes (including CR/LF) before retaining any fragment.
-    fn push(&mut self, fragment: &[u8]) -> io::Result<Option<Value>> {
+    pub(in super::super) fn push(&mut self, fragment: &[u8]) -> io::Result<Option<Value>> {
         let size = self.bytes.len().saturating_add(fragment.len());
         if size > self.limit {
             return Err(io::Error::new(
@@ -170,10 +170,10 @@ pub(super) async fn attach(
     }
     let control = protocol.lifecycle_control();
     let session_id = session_id.to_owned();
+    let mut stream = super::stream::SessionStream::attach(protocol)?;
     let task = tokio::spawn(async move {
         let mut response = response;
         let mut buffer = SseLineBuffer::new(SSE_BUFFER_LIMIT);
-        let mut stream = super::stream::SessionStream::default();
         let outcome: io::Result<()> =
             async {
                 while let Some(chunk) = response.chunk().await.map_err(|error| {
@@ -192,6 +192,7 @@ pub(super) async fn attach(
                 ))
             }
             .await;
+        drop(stream);
         if let Err(error) = outcome {
             control.disconnected(error.to_string()).await;
         }
@@ -226,12 +227,10 @@ pub(super) fn observed_user_text(
         }
         Some("message.part.updated") => {
             let part = payload.pointer("/properties/part")?;
+            let user = current_user_message.as_ref()?;
             if part.get("sessionID").and_then(Value::as_str) != Some(session_id)
                 || part.get("type").and_then(Value::as_str) != Some("text")
-                || part.get("messageID").and_then(Value::as_str)
-                    != current_user_message
-                        .as_ref()
-                        .map(|message| message.id.as_str())
+                || part.get("messageID").and_then(Value::as_str) != Some(user.id.as_str())
             {
                 return None;
             }
@@ -270,7 +269,7 @@ fn observed_model(info: &Value) -> Option<String> {
     })
 }
 
-fn basic_authorization(username: &str, password: &str) -> String {
+pub(in super::super) fn basic_authorization(username: &str, password: &str) -> String {
     let credentials =
         base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
     format!("Basic {credentials}")

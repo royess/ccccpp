@@ -14,7 +14,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** ar
 ## 1. Overview
 
 `context_sync` applies a batch of small operations to a group's context v3 storage:
-- `coordination` = shared control plane (`brief`, recent notes)
+- `coordination` = shared control plane (`brief`)
 - `tasks` = shared dispatch truth
 - `agent_states` = per-actor short-term working memory
 - `meta` = restricted projection-support metadata
@@ -39,6 +39,12 @@ revision is reserved before payload writes so such a failure invalidates prior
 before deciding what to retry; a newer revision alone is not a success receipt.
 Dry runs and rejected batches do not reserve a revision.
 
+New task records are written in their ordered creation sequence before updates
+to previously stored tasks. Creation references resolve to earlier tasks, so a
+new reference target is durable before the create that names it. This ordering
+also applies across task-number digit widths; lexical filename order MUST NOT
+let a dependent create survive alone and replay stale references on retry.
+
 Task numbers are durable identities within a Group. Deleting a task, including
 its unexecuted descendants, MUST NOT make a reserved number available for a later
 task. The existing Context version record retains the allocation high-water mark
@@ -58,10 +64,7 @@ reference mapping; ambiguous recovery MUST fail before changing existing files
 or recording migration success.
 
 `context_sync` only mutates the Context v3 stores named by its operations. It
-MUST NOT implicitly write the separate durable memory store. Callers that want
-to retain a decision or outcome beyond the bounded Context projections MUST use
-the explicit `memory_reme_write` daemon operation after a successful
-`context_sync` receipt.
+MUST NOT implicitly write the separate legacy Group memory files.
 
 ## 2. Operation Item Shape
 
@@ -96,26 +99,20 @@ Rules:
 Permission: `foreman` or `user`.
 
 Notes:
-- Partial patch: only provided fields are updated.
+- Partial patch: only provided fields are updated. A provided `constraints` replaces the whole list.
 - Daemon sets `updated_by` and `updated_at` automatically.
+- `project_brief_stale` is a manual marker that only the foreman or user sets.
+  It refers to `project_brief` and defaults to false; false does not show that
+  the brief is current.
+- MCP `cccc_bootstrap` recovery returns the brief's own `updated_at` as
+  `coordination_brief.updated_at` when it exists, and omits it otherwise. It is
+  the time of the last brief update, whichever fields that update provided,
+  including `constraints` alone; it is not a check that the content is current.
+  Other Context writes do not change it.
 
-#### `coordination.note.add`
-
-```ts
-{
-  op: "coordination.note.add"
-  kind: "decision" | "handoff"
-  summary: string
-  task_id?: string | null
-}
-```
-
-Permission: any actor.
-
-Notes:
-- Used for compact recent decisions / handoffs.
-- Daemon keeps only the newest bounded slice in context.
-- This operation does not implicitly copy the note into daily or stable memory.
+Coordination notes (`coordination.note.add`, stored as `recent_decisions` and
+`recent_handoffs`) were removed; the op is rejected as unknown. Notes an older
+context file already holds stay in that file unchanged and are never returned.
 
 ### 3.2 Tasks
 
@@ -146,6 +143,61 @@ type TaskType =
   | "optimization"
 ```
 
+Task source references are optional metadata:
+
+```ts
+type BacklogSource = { scope_key: string; path: string; entry_id: string }
+```
+
+`path` MUST be a normalized workspace-relative path without traversal. `entry_id`
+MUST contain exactly 12 lowercase hexadecimal characters. `scope_key` MUST be
+nonempty. Other source fields are rejected. A source reference does not grant
+file access, read the file, or write backlog content. The referenced file or
+entry may later disappear; clients MUST show a missing source rather than
+silently matching another entry by title.
+
+`ever_executed` is daemon-owned, monotonic execution history. Entering `active`
+or `done` through create, move, or restore records it; clients cannot set or
+clear it. Returning to `planned` does not make executed work deletable. Older
+records which had already returned to planned before this marker existed have
+no reconstructible execution history; no history is invented for them.
+
+Reads of tasks with a nonempty `blocked_by` include read-only `open_blocked_by`:
+the stored `blocked_by` subset whose referenced tasks are not completed.
+A dependency is completed only in `done`, or `archived` with `archived_from=done`.
+Archiving unfinished work, or an archive without a known prior status, does not
+release its dependents. Missing references remain unresolved. This is computed
+from the full task snapshot before filtering or
+paging; completing a dependency does not rewrite the dependent task or its
+revision, and reopening it makes it block again. Explicit `waiting_on=actor` or
+`external` remains blocked independently. Clients MUST edit `blocked_by`, not
+this projection; `task.create` and `task.update` ignore `open_blocked_by` input.
+
+Every task read exposes a daemon-owned unsigned `rev`. Existing task files with
+no stored revision read as `rev: 0` without being rewritten; new tasks start at
+`rev: 1`. A semantic task change advances its revision once per operation,
+including tasks changed indirectly. `rev` and the derived `updated_at` timestamp
+are excluded when detecting an identical patch, which retains both values.
+Revision overflow is rejected before persistence. Clients MUST NOT set `rev`.
+
+Every operation targeting an existing task MAY include `if_task_rev: number`.
+The guard is checked under the Context lock against that operation's preceding
+in-memory result. A mismatch rejects the entire batch with `task_conflict` and
+`details {task_id, expected, actual}`. Unrelated task or agent-state writes do not
+invalidate this guard. A supplied whole-context `if_version` still applies
+independently and is checked first. Invalid guards (including null, negative,
+fractional and string values) are rejected. Dry runs validate/project revisions
+without writing. After any I/O failure reload the task before retrying; task
+files atomically contain their content and revision, but the Context file batch
+is not a multi-file transaction. A delete guard covers its named root, not
+independent revisions of every descendant.
+
+`task.create` has no existing task revision and rejects `if_task_rev`; retry
+identity is separate from revision fencing. Task ID non-reuse prevents a deleted
+task's token from referring to later work. Direct file editors must coordinate
+with the Context writer and maintain revisions; this API cannot fence edits
+that bypass its storage lock and metadata.
+
 #### `task.create`
 
 ```ts
@@ -163,6 +215,10 @@ type TaskType =
   task_type?: TaskType
   notes?: string
   checklist?: Array<{ id?: string; text: string; status?: ChecklistStatus }>
+  source?: BacklogSource | null
+  client_request_id?: string
+  parent_ref?: string
+  blocked_by_refs?: string[]
 }
 ```
 
@@ -170,10 +226,24 @@ Permission: any actor.
 
 Rules:
 - `title` is required.
+- `source` is optional. A null source has no association; non-null references are
+  validated as described above. This operation never changes the source file.
 - The daemon assigns the next unused `T<number>` ID. Clients MUST use the assigned
-  ID from authoritative task reads, rather than infer it from the current task
-  count.
+  ID from authoritative task reads, or from the operation's change entry
+  (`task_id`, see §6), rather than infer it from the current task count.
 - If `parent_id` is provided, the parent task MUST exist.
+- `client_request_id` is the caller's own id for the task and is stored on it.
+  If the same caller (`by`) already created a task with that `client_request_id`,
+  the operation creates nothing and its change entry names the existing task
+  with `replayed: true`. The operation's other fields are not compared or
+  applied. A deleted task no longer reserves its `client_request_id`.
+- `parent_ref` names the parent by the `client_request_id` of a task the same
+  caller created, earlier in the same batch or before it. It MUST NOT be
+  combined with `parent_id`. Each `blocked_by_refs` entry is resolved the same
+  way and appended to `blocked_by`. A ref that names no such task MUST reject
+  the batch. One `context_sync` can then create a whole tree, validated as a
+  whole; a retry of that batch, after a lost reply or a storage failure,
+  returns the tasks already written and creates only the missing ones.
 - Peer actors MUST NOT create a task assigned to another peer.
 - If `task_type` is provided, it MUST be one of the allowed task-type ids above.
 - If `task_type` is omitted, the daemon MUST persist `standard` for a root task and `free` for a subtask.
@@ -186,6 +256,7 @@ Rules:
 {
   op: "task.update"
   task_id: string
+  if_task_rev?: number // unsigned revision from the task read
   title?: string
   outcome?: string
   parent_id?: string | null
@@ -197,13 +268,19 @@ Rules:
   task_type?: TaskType
   notes?: string
   checklist?: Array<{ id?: string; text: string; status?: ChecklistStatus }>
+  source?: BacklogSource | null
 }
 ```
 
-Permission: assignee / handoff target / foreman / user.
+Permission: assignee / handoff target / foreman / user. A peer MAY also claim a
+planned or active task that has neither an assignee nor a handoff target by
+setting `assignee` to itself in this update.
+
+Omitted `source` preserves the existing association; null removes it. Setting a
+source follows the same task authorization and revision guard as other fields.
 
 Rules:
-- Partial patch.
+- Partial patch: omitted editable fields stay unchanged, and each provided field replaces its stored value whole. `notes` is not appended to, and `checklist` is not merged item by item.
 - If `parent_id` changes, the daemon MUST reject cycles.
 - `task.update` does not change lifecycle status.
 - If `task_type` is provided, it MUST be one of the allowed task-type ids above.
@@ -214,6 +291,7 @@ Rules:
 {
   op: "task.move"
   task_id: string
+  if_task_rev?: number // unsigned revision from the task read
   status: TaskStatus
 }
 ```
@@ -222,7 +300,7 @@ Permission: assignee / handoff target / foreman / user.
 
 Notes:
 - This is the canonical lifecycle transition op.
-- `task.move` only accepts `task_id` and `status`. Fields such as `outcome`, `notes`, `checklist`, or `task_type` MUST go through `task.update`.
+- `task.move` only accepts `task_id`, `status` and optional `if_task_rev`. Fields such as `outcome`, `notes`, `checklist`, or `task_type` MUST go through `task.update`.
 - Moving to `archived` records `archived_from`.
 - This operation changes only task lifecycle state. It does not implicitly
   rewrite an assignee's `agent_state` or append daily/stable memory.
@@ -230,7 +308,7 @@ Notes:
 #### `task.restore`
 
 ```ts
-{ op: "task.restore"; task_id: string }
+{ op: "task.restore"; task_id: string; if_task_rev?: number }
 ```
 
 Permission: assignee / handoff target / foreman / user.
@@ -241,7 +319,7 @@ Rules:
 #### `task.delete`
 
 ```ts
-{ op: "task.delete"; task_id: string }
+{ op: "task.delete"; task_id: string; if_task_rev?: number }
 ```
 
 Permission: assignee / handoff target / foreman / user. A peer MUST be the
@@ -306,6 +384,10 @@ Permission: self / user.
 
 Notes:
 - Clears both `hot` and `warm`, then refreshes `updated_at`.
+- The stored entry can remain after its Actor is removed. Context read projections
+  MUST omit states whose Actor ID is no longer in the Group's Actor list, including
+  entries left by earlier removals. Disabled or stopped Actors still in that list
+  remain eligible; clearing state does not itself change membership.
 
 ### 3.4 Restricted Meta
 
@@ -346,6 +428,18 @@ If `context_sync.args.dry_run == true`, the daemon MUST NOT persist changes and 
 
 `context_sync` returns `changes: Array<{ index, op, detail }>` where `detail` is intended for logs/UI. SDKs SHOULD NOT parse `detail` as a stable machine contract.
 
+A `task.create` entry also carries `task_id`: the task the operation created or,
+for a replayed `client_request_id`, the existing task, with `replayed: true`.
+
+A Foreman's write that holds a task operation also carries `review_reminder: string`
+once at least 10 top-level tasks have been finished since the last reminder. The
+daemon adds every write's newly finished top-level tasks, by anyone, to
+`meta.finished_since_review_reminder` and restarts it in the write that returns the
+reminder, so the Foreman hears it once. Archiving or deleting tasks leaves the count
+alone, and `meta.merge` cannot set that key. A dry run returns no reminder and
+records nothing. While `skill:cccc:self-evolution` is blocked, removed, disabled or
+hidden for that Foreman, a due reminder is dropped and the count restarts.
+
 When Group Space is enabled and a curated context change is detected, the daemon MAY also return:
 
 ```ts
@@ -373,6 +467,6 @@ Curated trigger allowlist:
 |------|------------|
 | `user` | All ops |
 | `foreman` | All ops except changing another actor's `agent_state` |
-| `peer` | `coordination.note.add`, `task.create`, `task.update` (own assigned / handed-off), `task.move` (own assigned / handed-off), `task.restore` (own assigned / handed-off), `task.delete` (own assigned / handed-off), `agent_state.update` (self), `agent_state.clear` (self) |
+| `peer` | `task.create`, `task.update` (own assigned / handed-off), `task.move` (own assigned / handed-off), `task.restore` (own assigned / handed-off), `task.delete` (own assigned / handed-off), `agent_state.update` (self), `agent_state.clear` (self) |
 
 Permission checks use `context_sync.args.by`.

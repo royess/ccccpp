@@ -48,7 +48,11 @@ async fn normal_mode_does_not_apply_read_only_guard() {
 async fn exhibit_mode_rejects_mutating_get_and_websocket_routes() {
     let (_temp, home) = home();
     let app = auth_support::authenticated_app_with_mode(home, cccc_web::WebMode::Exhibit);
-    for path in ["/api/v1/registry/reconcile", "/nomcp/s/session-1/send"] {
+    for path in [
+        "/api/v1/registry/reconcile",
+        "/nomcp/s/session-1/send",
+        "/api/v1/groups/g_1/assistants/voice_secretary/transcriptions/ws",
+    ] {
         let response = app
             .clone()
             .oneshot(Request::get(path).body(Body::empty()).expect("request"))
@@ -64,6 +68,28 @@ async fn exhibit_mode_rejects_mutating_get_and_websocket_routes() {
         let payload: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(payload["error"]["code"], "read_only", "{path}");
     }
+}
+
+#[tokio::test]
+async fn normal_mode_lets_the_transcription_socket_reach_its_handler() {
+    let (_temp, home) = home();
+    let response = auth_support::authenticated_app_with_mode(home, cccc_web::WebMode::Normal)
+        .oneshot(
+            Request::get("/api/v1/groups/g_1/assistants/voice_secretary/transcriptions/ws")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    // The request reaches the socket route and is refused for its missing upgrade header.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("upgrade"));
 }
 
 #[tokio::test]
@@ -147,7 +173,10 @@ async fn exhibit_ping_matches_python_contract() {
         home.root().to_string_lossy().as_ref()
     );
     assert_eq!(payload["result"]["daemon"]["implementation"], "rust");
-    assert_eq!(payload["result"]["build"], cccc_core::build_info::current());
+    // This app is embedded in the test process, which has no registered
+    // executable identity. The process-level build_identity test covers the
+    // real Web entry point; an empty-to-empty comparison would not do that.
+    assert!(payload["result"]["build"].get("source_id").is_none());
     assert_eq!(
         payload["result"]["daemon"]["build"],
         payload["result"]["build"]
@@ -264,3 +293,5 @@ fn home() -> (tempfile::TempDir, HomeLayout) {
     home.initialize().expect("initialize");
     (temp, home)
 }
+
+cccc_daemon::session_owner_test_entry!();

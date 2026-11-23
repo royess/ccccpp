@@ -1,9 +1,7 @@
 import "./voice-secretary/voiceWorkspaceMobile.css";
-import {
-  useVoiceAudioStore,
-  voiceAudioSnapshot,
-  type VoiceAudioPreferences,
-} from "../../stores/useVoiceAudioStore";
+import { isConnectFramePath } from "../../features/connect/protocol";
+import { beginPendingPageWork } from "../../stores/usePendingPageWork";
+import { useVoiceAudioStore, voiceAudioSnapshot } from "../../stores/useVoiceAudioStore";
 import { useVoiceAudioDevices } from "../../features/voice/useVoiceAudioDevices";
 import { secretaryReadinessIssue } from "../../features/voice/secretaryReadiness";
 import type { SecretaryReadiness } from "../../services/api/voiceSecretary";
@@ -19,6 +17,7 @@ import {
   readVoiceAskNotice,
   saveVoiceAskNotice,
   voiceAskReplyIsCurrent,
+  voiceAskStatusTone,
   type VoiceAskNotice,
 } from "./voice-secretary/voiceAskStatus";
 import { queueVoiceSocketError } from "./voice-secretary/voiceSocketError";
@@ -71,6 +70,7 @@ import {
 import { useUIStore, useModalStore, useGroupStore, useComposerStore } from "../../stores";
 import { getChatSession } from "../../stores/useUIStore";
 import { useModalA11y } from "../../hooks/useModalA11y";
+import { useChatObscuringView } from "../../hooks/useChatObscuringView";
 import { AnimatedShinyText } from "../../registry/magicui/animated-shiny-text";
 import { copyTextToClipboard } from "../../utils/copy";
 import { downloadVoiceDocument } from "./voice-secretary/downloadVoiceDocument";
@@ -93,19 +93,16 @@ import {
   useVoiceDocumentReferenceCleanup,
 } from "./voice-secretary/voiceDocumentReferenceLifecycle";
 import { useVoiceAudioLevelMeter } from "./voice-secretary/useVoiceAudioLevelMeter";
+import { useVoiceInputSilenceHint } from "./voice-secretary/useVoiceInputSilenceHint";
 import {
   BrowserSpeechRecoveryBudget,
   isQuietBrowserSpeechError,
   shouldScheduleBrowserSpeechErrorRestart,
 } from "./voice-secretary/browserSpeechRecoveryModel";
-import {
-  shouldCloseVoiceCaptureSocket,
-  voiceCaptureStopAction,
-} from "./voice-secretary/voiceCaptureStopModel";
+import { shouldCloseVoiceCaptureSocket } from "./voice-secretary/voiceCaptureStopModel";
 import {
   claimVoiceCaptureLock,
   createVoiceCaptureOwnerId,
-  createVoiceRecordingSessionId,
   openVoiceCaptureChannel,
   refreshVoiceCaptureLock,
   releaseVoiceCaptureLock,
@@ -129,7 +126,7 @@ import {
   getBrowserMicrophoneSupportIssue,
   getBrowserSpeechRecognitionConstructor,
   getBrowserSpeechSupportIssue,
-  mediaRecorderSupported,
+  serviceAudioCaptureSupported,
   mediaStreamHasLiveAudio,
   resolveBrowserSpeechLanguage,
   stopMediaStream,
@@ -147,7 +144,7 @@ import {
   formatVoiceActivityTimeMs,
   hasFinalAskReply,
   hashComposerSnapshot,
-  isLowValueBrowserSpeechFragment,
+  joinTranscriptSegments,
   mergeTranscriptChunks,
   nextUncommittedServiceTranscriptText,
   normalizeBrowserTranscriptChunk,
@@ -171,6 +168,7 @@ import {
 } from "./voice-secretary/voiceReplyBubbleModel";
 import {
   isMeaningfulVoiceDispatchText,
+  isVoiceDictationText,
   voiceServiceStopDispatchKind,
 } from "./voice-secretary/voiceServiceStopDispatch";
 import {
@@ -202,18 +200,23 @@ import {
   type VoiceRecordingLeaseConflict,
 } from "./voice-secretary/voiceRecordingLease";
 import {
-  createVoiceRecordingSessionScope,
   voiceRecordingCaptureMode,
   voiceRecordingDispatchTarget,
   voiceRecordingTargetDocumentPath,
   voiceRecordingTargetGroupId,
   type VoiceRecordingSessionScope,
 } from "./voice-secretary/voiceRecordingSessionScope";
+import {
+  useVoiceRecordingSession,
+  type VoiceRecordingSession,
+} from "./voice-secretary/useVoiceRecordingSession";
+import { waitForVoiceRequest } from "./voice-secretary/voiceRequestTimeout";
 import { routeVoiceTextToComposerGroup } from "./voice-secretary/voiceComposerDraftRouting";
 import { buildVoiceDocumentMessageRef } from "../../utils/voiceDocumentRefs";
 import { createVoiceRequestDispatchGate } from "./voice-secretary/voiceRequestDispatchGate";
 import * as voicePcmTransport from "./voice-secretary/voicePcmBackpressure";
 import { Pcm16Resampler } from "./voice-secretary/voicePcmResampler";
+import { VoicePcmCapture, VoicePcmCaptureError } from "./voice-secretary/voicePcmCapture";
 import {
   getUserMediaWithTimeout,
   VoiceAudioCaptureTimeoutError,
@@ -222,6 +225,16 @@ import {
   voiceCaptureDispatchTarget,
   voiceCaptureTransportMode,
 } from "./voice-secretary/voiceDictationRoute";
+import {
+  documentLineEnding,
+  documentTextareaText,
+  serializeDocumentText,
+} from "./voice-secretary/documentLineEndings";
+import {
+  sameVoiceDocumentGeneration,
+  sameVoiceDocumentSession,
+  type VoiceDocumentDraftOwner,
+} from "./voice-secretary/documentDraftSession";
 import {
   createDocumentContentLoadTracker,
   documentContentLoadingMatches,
@@ -243,6 +256,7 @@ export type VoiceSecretaryComposerControlProps = {
   composerContext?: Record<string, unknown>;
   onPromptDraft?: (text: string, opts?: { mode?: "replace" | "append" }) => void;
   onFocusComposer?: () => void;
+  onCompactBlockChange?: (blocked: boolean) => void;
   initiallyOpen?: boolean;
   statusPortalTarget?: HTMLElement | null;
 };
@@ -276,12 +290,49 @@ const BROWSER_SPEECH_RECOVERABLE_ERRORS = new Set([
 const BROWSER_SPEECH_FATAL_ERRORS = new Set(["not-allowed", "service-not-allowed"]);
 const VOICE_DOCUMENT_METADATA_POLL_MS = 30_000;
 const VOICE_LIVE_TRANSCRIPT_VISIBLE_MS = 60_000;
+const VOICE_REQUEST_TIMEOUT_MS = 60_000;
+const VOICE_PROMPT_RESULT_WAIT_MS = 60_000;
 const TWO_LINE_STATUS_STYLE = {
   display: "-webkit-box",
   WebkitLineClamp: 2,
   WebkitBoxOrient: "vertical",
   overflow: "hidden",
 } as const;
+
+type VoiceDocumentWriteBase = { path: string; contentSha256: string; targetId: string };
+type SuspendedVoiceDraft = {
+  document: AssistantVoiceDocument;
+  path: string;
+  content: string;
+  baseContent: string;
+  title: string;
+  baseTitle: string;
+  writeBase: VoiceDocumentWriteBase;
+  lineEnding: "\n" | "\r\n" | "\r";
+  editing: boolean;
+  remoteChanged: boolean;
+  unavailable: boolean;
+  conflict: VoiceDocumentConflict | null;
+};
+type VoiceDocumentConflict = {
+  path: string;
+  session: number;
+  currentSha: string | null;
+  targetChanged: boolean;
+  unavailable: boolean;
+};
+
+function voiceDocumentWriteBase(
+  document: AssistantVoiceDocument | null | undefined,
+): VoiceDocumentWriteBase | null {
+  if (!document || typeof document.content !== "string") return null;
+  const path = voiceDocumentPath(document);
+  const contentSha256 = document.content_sha256 || "";
+  const targetId = document.content_target_id || "";
+  if (!path || !/^[0-9a-f]{64}$/i.test(contentSha256) || !/^[0-9a-f]{64}$/i.test(targetId))
+    return null;
+  return { path, contentSha256: contentSha256.toLowerCase(), targetId: targetId.toLowerCase() };
+}
 
 function voiceDocumentRevisionKey(document: AssistantVoiceDocument | null | undefined): string {
   if (!document) return "";
@@ -296,6 +347,31 @@ function voiceDocumentRevisionKey(document: AssistantVoiceDocument | null | unde
 function browserSpeechRestartDelayMs(transientErrorCount: number): number {
   const count = Math.max(1, transientErrorCount);
   return Math.min(BROWSER_SPEECH_RESTART_MAX_MS, BROWSER_SPEECH_RESTART_BASE_MS * count);
+}
+
+function serviceTranscriptForRecovery(run: VoiceRecordingSession): string {
+  const service = run.service;
+  const liveText = joinTranscriptSegments([
+    service.committed || service.finalText,
+    service.latestPartial,
+  ]);
+  return service.finalIncomplete
+    ? liveText || service.finalAsrText
+    : service.finalAsrText || liveText;
+}
+
+async function withBrowserPendingDispatch<T>(
+  run: VoiceRecordingSession | null,
+  text: string,
+  dispatch: () => Promise<T>,
+): Promise<T> {
+  const pending = { text };
+  run?.browserPendingDispatches.add(pending);
+  try {
+    return await dispatch();
+  } finally {
+    run?.browserPendingDispatches.delete(pending);
+  }
 }
 
 export function VoiceSecretaryComposerControl({
@@ -315,6 +391,7 @@ export function VoiceSecretaryComposerControl({
   composerContext = {},
   onPromptDraft,
   onFocusComposer,
+  onCompactBlockChange,
   initiallyOpen = false,
 }: VoiceSecretaryComposerControlProps) {
   const readCurrentComposerText = useCallback(
@@ -340,24 +417,16 @@ export function VoiceSecretaryComposerControl({
     workspaceRefreshRef.current = null;
   }, []);
   const visibleLoadSeqRef = useRef(0);
+  const componentMountedRef = useRef(true);
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const mediaChunksRef = useRef<Blob[]>([]);
-  const serviceAudioContextRef = useRef<AudioContext | null>(null);
-  const serviceAudioProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const serviceAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const servicePcmCaptureRef = useRef<VoicePcmCapture | null>(null);
   const serviceAudioWsRef = useRef<WebSocket | null>(null);
   const serviceAudioExpectedCloseRunIdRef = useRef(0);
   const serviceAudioPendingPcmRef = useRef<Uint8Array[]>([]);
   const serviceAudioResamplerRef = useRef<Pcm16Resampler | null>(null);
   const serviceAudioSeqRef = useRef(0);
-  const serviceFinalTranscriptRef = useRef("");
-  const serviceLatestPartialTranscriptRef = useRef("");
-  const serviceCommittedTranscriptRef = useRef("");
-  const serviceDocumentCommittedTranscriptRef = useRef("");
   const serviceAsrBackendRef = useRef("assistant_service_local_asr");
-  const serviceFinalAsrTextRef = useRef("");
   const serviceAudioDurationMsRef = useRef(0);
   const serviceCommittedEndMsRef = useRef(0);
   const serviceDocumentCommittedEndMsRef = useRef(0);
@@ -366,22 +435,37 @@ export function VoiceSecretaryComposerControl({
   const servicePartialCommitTimerRef = useRef<number | null>(null);
   const serviceDocumentCheckpointTimerRef = useRef<number | null>(null);
   const voiceCaptureOwnerIdRef = useRef(createVoiceCaptureOwnerId());
-  const voiceRecordingSessionIdRef = useRef("");
-  const voiceRecordingSessionScopeRef = useRef<VoiceRecordingSessionScope | null>(null);
+  const {
+    getCurrent: getVoiceSession,
+    phase: recordingPhase,
+    waitingForFinal,
+    begin: beginSession,
+    isActive: isActiveRecordingRun,
+    markRecording,
+    markFinishing,
+    markAwaitingFinal,
+    end: endSession,
+  } = useVoiceRecordingSession();
+  const recording = recordingPhase === "recording";
+  const recordingStarting = recordingPhase === "starting";
+  const recordingFinishing = recordingPhase === "finishing";
+  const [longFinalWaitRunId, setLongFinalWaitRunId] = useState(0);
+  useEffect(() => {
+    if (!recordingFinishing || !waitingForFinal) return undefined;
+    const runId = getVoiceSession()?.id;
+    if (!runId) return undefined;
+    const timer = window.setTimeout(() => setLongFinalWaitRunId(runId), 20_000);
+    return () => window.clearTimeout(timer);
+  }, [getVoiceSession, recordingFinishing, waitingForFinal]);
   const voiceRecordingLeaseGroupIdRef = useRef("");
   const voiceRecordingLeaseIdRef = useRef("");
   const voiceRecordingLeaseAcquiredRef = useRef(false);
-  const recordingRunIdRef = useRef(0);
-  const recordingStartingRef = useRef(false);
-  const recordingStoppingRef = useRef(false);
   const browserSpeechFinalizingRunIdRef = useRef(0);
   const pendingDiarizationSessionsRef = useRef<Set<string>>(new Set());
-  const recordingRef = useRef(false);
   const lastRecordingStopReasonRef = useRef<VoiceRecordingStopReason | null>(null);
   const transcriptFlushTimerRef = useRef<number | null>(null);
   const transcriptMaxFlushTimerRef = useRef<number | null>(null);
   const transcriptSegmentSeqRef = useRef(0);
-  const browserFinalTranscriptBufferRef = useRef("");
   const browserSpeechReceivedFinalRef = useRef(false);
   const browserSpeechHadErrorRef = useRef(false);
   const browserSpeechStopRequestedRef = useRef(false);
@@ -390,6 +474,14 @@ export function VoiceSecretaryComposerControl({
   const browserSpeechMediaCleanupRef = useRef<(() => void) | null>(null);
   const browserSpeechRecoveryRef = useRef(new BrowserSpeechRecoveryBudget());
   const pendingPromptRequestIdRef = useRef("");
+  const pendingPromptVoiceSourceRef = useRef<{
+    groupId: string;
+    requestId: string;
+    runId: number | null;
+    text: string;
+    restored: boolean;
+    timer: number | null;
+  } | null>(null);
   const requestDispatchGateRef = useRef(createVoiceRequestDispatchGate());
   const pendingPromptGroupIdRef = useRef("");
   const pendingAskRequestIdRef = useRef("");
@@ -406,6 +498,34 @@ export function VoiceSecretaryComposerControl({
   const transcriptDocumentPathRef = useRef("");
   const documentBaseTitleRef = useRef("");
   const documentBaseContentRef = useRef("");
+  const documentWriteBaseRef = useRef<VoiceDocumentWriteBase | null>(null);
+  const documentLineEndingRef = useRef<"\n" | "\r\n" | "\r">("\n");
+  const documentDraftSessionRef = useRef(0);
+  // In-memory only: one unsaved working document per Group, for tab switching.
+  const suspendedVoiceDraftsRef = useRef(new Map<string, SuspendedVoiceDraft>());
+  const releaseDocumentPageWork = useRef<(() => void) | null>(null);
+  const reportDocumentPageWork = useCallback((currentDirty: boolean) => {
+    if (!isConnectFramePath(window.location.pathname) || window.parent === window) return;
+    const dirty = currentDirty || suspendedVoiceDraftsRef.current.size > 0;
+    if (dirty && !releaseDocumentPageWork.current) {
+      releaseDocumentPageWork.current = beginPendingPageWork();
+    } else if (!dirty && releaseDocumentPageWork.current) {
+      releaseDocumentPageWork.current();
+      releaseDocumentPageWork.current = null;
+    }
+  }, []);
+  useEffect(
+    () => () => {
+      releaseDocumentPageWork.current?.();
+      releaseDocumentPageWork.current = null;
+    },
+    [],
+  );
+  const documentOwnerGroupRef = useRef(String(selectedGroupId || "").trim());
+  const documentEditingRef = useRef(false);
+  const documentRemoteChangedRef = useRef(false);
+  const documentSaveConflictRef = useRef<VoiceDocumentConflict | null>(null);
+  const detachedDocumentRef = useRef<AssistantVoiceDocument | null>(null);
   const documentTitleDraftRef = useRef("");
   const documentDraftRef = useRef("");
   const voiceStreamItemIdRef = useRef("");
@@ -415,22 +535,24 @@ export function VoiceSecretaryComposerControl({
   const selectedGroupIdRef = useRef("");
   const unmountCleanupRef = useRef<() => void>(() => undefined);
   selectedGroupIdRef.current = String(selectedGroupId || "").trim();
+  useEffect(() => {
+    componentMountedRef.current = true;
+    return () => {
+      componentMountedRef.current = false;
+    };
+  }, []);
   const isCurrentGroup = useCallback(
     (gid: string) => String(gid || "").trim() === selectedGroupIdRef.current,
     [],
   );
   const recordingTargetGroupId = useCallback(
-    () =>
-      voiceRecordingTargetGroupId(
-        voiceRecordingSessionScopeRef.current,
-        selectedGroupIdRef.current,
-      ),
-    [],
+    () => voiceRecordingTargetGroupId(getVoiceSession()?.scope || null, selectedGroupIdRef.current),
+    [getVoiceSession],
   );
   const recordingTargetDocumentPath = useCallback(
     (fallbackPath = "") =>
-      voiceRecordingTargetDocumentPath(voiceRecordingSessionScopeRef.current, fallbackPath),
-    [],
+      voiceRecordingTargetDocumentPath(getVoiceSession()?.scope || null, fallbackPath),
+    [getVoiceSession],
   );
   const releaseDaemonVoiceRecordingLease = useCallback((groupId?: string) => {
     if (!voiceRecordingLeaseAcquiredRef.current) return;
@@ -457,21 +579,36 @@ export function VoiceSecretaryComposerControl({
   );
   const acquireDaemonVoiceRecordingLease = useCallback(
     async (
+      runId: number,
       groupId: string,
       opts: { captureMode: string; recognitionBackend: string; dispatchTarget: string },
     ): Promise<VoiceRecordingLeaseConflict | null> => {
+      const ownerId = voiceCaptureOwnerIdRef.current;
       const resp = await updateVoiceAssistantRecordingLease(groupId, {
         action: "acquire",
-        ownerId: voiceCaptureOwnerIdRef.current,
+        ownerId,
         ttlSeconds: VOICE_RECORDING_LEASE_TTL_SECONDS,
         captureMode: opts.captureMode,
         recognitionBackend: opts.recognitionBackend,
         dispatchTarget: opts.dispatchTarget,
       });
       if (resp.ok) {
+        const leaseId = resp.result.leaseId || "";
+        if (!isActiveRecordingRun(runId)) {
+          // Unmount or cancellation can happen while acquisition is in flight.
+          // Release only the returned generation; it cannot release a newer lease.
+          if (leaseId) {
+            void updateVoiceAssistantRecordingLease(groupId, {
+              action: "release",
+              ownerId,
+              leaseId,
+            }).catch(() => undefined);
+          }
+          return null;
+        }
         voiceRecordingLeaseAcquiredRef.current = true;
         voiceRecordingLeaseGroupIdRef.current = groupId;
-        voiceRecordingLeaseIdRef.current = resp.result.leaseId || "";
+        voiceRecordingLeaseIdRef.current = leaseId;
         setRecordingGroupId(groupId);
         setRecordingGroupTitle(
           String(resp.result.lease?.group_title || resp.result.lease?.group_id || groupId).trim(),
@@ -482,7 +619,7 @@ export function VoiceSecretaryComposerControl({
       if (conflict) return conflict;
       throw new Error(resp.error.message || "Voice Secretary recording lease failed");
     },
-    [],
+    [isActiveRecordingRun],
   );
   const [open, setOpen] = useState(initiallyOpen);
   const openRef = useRef(open);
@@ -501,6 +638,7 @@ export function VoiceSecretaryComposerControl({
   );
   const [assistant, setAssistant] = useState<BuiltinAssistant | null>(null);
   const [documents, setDocuments] = useState<AssistantVoiceDocument[]>([]);
+  const [detachedDocument, setDetachedDocument] = useState<AssistantVoiceDocument | null>(null);
   const documentsRef = useRef<AssistantVoiceDocument[]>([]);
   const [viewedDocumentPath, setViewedDocumentPath] = useState("");
   const [captureTargetDocumentPath, setCaptureTargetDocumentPath] = useState("");
@@ -508,8 +646,12 @@ export function VoiceSecretaryComposerControl({
   const [documentDraft, setDocumentDraft] = useState("");
   const [documentBaseTitle, setDocumentBaseTitle] = useState("");
   const [documentBaseContent, setDocumentBaseContent] = useState("");
+  const [documentWriteBase, setDocumentWriteBase] = useState<VoiceDocumentWriteBase | null>(null);
   const [documentEditing, setDocumentEditing] = useState(false);
   const [documentRemoteChanged, setDocumentRemoteChanged] = useState(false);
+  const [documentSaveConflict, setDocumentSaveConflict] = useState<VoiceDocumentConflict | null>(
+    null,
+  );
   const [documentContentLoadingPath, setDocumentContentLoadingPath] = useState("");
   const documentContentLoadTracker = useRef(createDocumentContentLoadTracker());
   const [creatingDocument, setCreatingDocument] = useState(false);
@@ -519,21 +661,19 @@ export function VoiceSecretaryComposerControl({
     voicePanelViewForComposerMode(composerCaptureMode, "document"),
   );
   const [recordingTarget, setRecordingTarget] = useState<VoiceCaptureTarget | null>(null);
-  const [recording, setRecording] = useState(false);
-  const [recordingStarting, setRecordingStarting] = useState(false);
   const [recordingGroupId, setRecordingGroupId] = useState("");
   const [recordingGroupTitle, setRecordingGroupTitle] = useState("");
   const [speechError, setSpeechError] = useState("");
+  const [unavailableInputDeviceId, setUnavailableInputDeviceId] = useState("");
   const [browserSpeechRecoveryCode, setBrowserSpeechRecoveryCode] = useState("");
   const [lastRecordingStopReason, setLastRecordingStopReason] =
     useState<VoiceRecordingStopReason | null>(null);
   const [speechSupported, setSpeechSupported] = useState(() => !getBrowserSpeechSupportIssue());
   const [serviceAudioSupported, setServiceAudioSupported] = useState(() =>
-    mediaRecorderSupported(),
+    serviceAudioCaptureSupported(),
   );
   const audioPreferences = useVoiceAudioStore((state) => state.preferences);
   const { label: audioDeviceLabel, refresh: refreshAudioDevices } = useVoiceAudioDevices(open);
-  const capturedAudioPreferencesRef = useRef<VoiceAudioPreferences | null>(null);
   const [pendingPromptRequestId, setPendingPromptRequestId] = useState("");
   const [pendingPromptProblem, setPendingPromptProblem] = useState("");
   const [pendingPromptTask, setPendingPromptTask] = useState<SecretaryTaskSummary | null>(null);
@@ -556,6 +696,9 @@ export function VoiceSecretaryComposerControl({
   );
   const [promptNeedsReview, setPromptNeedsReview] = useState(false);
   const clearPendingPromptRequest = useCallback((clearDraft: boolean) => {
+    const source = pendingPromptVoiceSourceRef.current;
+    if (source?.timer !== null && source?.timer !== undefined) window.clearTimeout(source.timer);
+    pendingPromptVoiceSourceRef.current = null;
     pendingPromptRequestIdRef.current = "";
     pendingPromptGroupIdRef.current = "";
     pendingPromptComposerHashRef.current = "";
@@ -565,6 +708,46 @@ export function VoiceSecretaryComposerControl({
     setPromptNeedsReview(false);
     if (clearDraft) setPendingPromptDraft(null);
   }, []);
+  const preservePendingPromptVoice = useCallback(
+    (groupId: string, requestId: string, unconfirmed = false) => {
+      const source = pendingPromptVoiceSourceRef.current;
+      if (
+        !source ||
+        source.groupId !== groupId ||
+        source.requestId !== requestId ||
+        source.restored
+      )
+        return false;
+      const routed = routeVoiceTextToComposerGroup({ groupId, text: source.text, mode: "append" });
+      if (routed === "ignored") return false;
+      source.restored = true;
+      if (source.timer !== null) window.clearTimeout(source.timer);
+      source.timer = null;
+      const group =
+        useGroupStore.getState().groups.find((item) => item.group_id === groupId)?.title || groupId;
+      showNotice({
+        message: unconfirmed
+          ? t("voiceSecretaryTranscriptUnconfirmed", {
+              group,
+              defaultValue:
+                "The request result is unconfirmed. The transcript is in the composer in {{group}}; check before retrying.",
+            })
+          : t("voiceSecretaryPromptRawPreserved", {
+              group,
+              defaultValue: "The spoken text was preserved in the composer in {{group}}.",
+            }),
+      });
+      return true;
+    },
+    [showNotice, t],
+  );
+  useEffect(
+    () => () => {
+      const timer = pendingPromptVoiceSourceRef.current?.timer;
+      if (timer !== null && timer !== undefined) window.clearTimeout(timer);
+    },
+    [],
+  );
   const [askFeedbackItems, setAskFeedbackItems] = useState<AssistantVoiceAskFeedback[]>([]);
   const [liveTranscriptPreview, setLiveTranscriptPreview] = useState<VoiceTranscriptPreview | null>(
     null,
@@ -581,10 +764,18 @@ export function VoiceSecretaryComposerControl({
     reset: resetVoiceAudioLevel,
     updateFromSamples: updateVoiceAudioLevelsFromSamples,
   } = useVoiceAudioLevelMeter();
-  const setRecordingStartingFlag = useCallback((next: boolean) => {
-    recordingStartingRef.current = next;
-    setRecordingStarting(next);
-  }, []);
+  const {
+    silent: voiceInputSilent,
+    start: startVoiceInputSilenceHint,
+    observe: observeVoiceInputSamples,
+    stop: stopVoiceInputSilenceHint,
+  } = useVoiceInputSilenceHint();
+  useEffect(() => {
+    const run = getVoiceSession();
+    if (!recording || !run || run.config.recognition_backend === "browser_asr") return;
+    startVoiceInputSilenceHint(run.id);
+    return () => stopVoiceInputSilenceHint(run.id);
+  }, [getVoiceSession, recording, startVoiceInputSilenceHint, stopVoiceInputSilenceHint]);
   const clearRecordingStopReason = useCallback(() => {
     lastRecordingStopReasonRef.current = null;
     setLastRecordingStopReason(null);
@@ -619,63 +810,42 @@ export function VoiceSecretaryComposerControl({
     },
     [],
   );
-  const isActiveRecordingRun = useCallback(
-    (runId: number) => runId > 0 && recordingRunIdRef.current === runId,
-    [],
-  );
-  const capturedConfigRef = useRef<BuiltinAssistant["config"] | null>(null);
   const getActiveCaptureConfig = useCallback(
-    () =>
-      recordingRef.current || recordingStartingRef.current || recordingStoppingRef.current
-        ? capturedConfigRef.current
-        : null,
-    [],
+    () => getVoiceSession()?.config || null,
+    [getVoiceSession],
   );
-  const beginRecordingRun = useCallback(() => {
-    if (recordingStartingRef.current || recordingStoppingRef.current || recordingRef.current)
-      return 0;
-    capturedAudioPreferencesRef.current = voiceAudioSnapshot();
-    capturedConfigRef.current = {
-      ...(assistant?.config || {}),
-      recognition_language:
-        recognitionLanguageOverride || assistant?.config?.recognition_language || "auto",
-    };
-    recordingRunIdRef.current += 1;
-    voiceRecordingSessionIdRef.current = createVoiceRecordingSessionId();
-    transcriptSegmentSeqRef.current = 0;
-    setRecordingStartingFlag(true);
-    setSpeechError("");
-    setBrowserSpeechRecoveryCode("");
-    clearRecordingStopReason();
-    return recordingRunIdRef.current;
-  }, [
-    assistant?.config,
-    recognitionLanguageOverride,
-    clearRecordingStopReason,
-    setRecordingStartingFlag,
-  ]);
-  const finishRecordingStart = useCallback(
-    (runId: number) => {
-      if (isActiveRecordingRun(runId)) setRecordingStartingFlag(false);
+  const beginRecordingRun = useCallback(
+    (scope: Omit<VoiceRecordingSessionScope, "runId" | "sessionId">) => {
+      const run = beginSession({
+        scope,
+        audioPreferences: voiceAudioSnapshot(),
+        config: {
+          ...(assistant?.config || {}),
+          recognition_language:
+            recognitionLanguageOverride || assistant?.config?.recognition_language || "auto",
+        },
+      });
+      if (!run) return 0;
+      transcriptSegmentSeqRef.current = 0;
+      setSpeechError("");
+      setUnavailableInputDeviceId("");
+      setBrowserSpeechRecoveryCode("");
+      clearRecordingStopReason();
+      return run.id;
     },
-    [isActiveRecordingRun, setRecordingStartingFlag],
+    [assistant?.config, beginSession, clearRecordingStopReason, recognitionLanguageOverride],
   );
   const endRecordingRun = useCallback(
-    (runId?: number) => {
-      if (runId && !isActiveRecordingRun(runId)) return;
-      recordingStoppingRef.current = false;
-      if (!runId || browserSpeechFinalizingRunIdRef.current === runId) {
+    (runId: number) => {
+      if (!isActiveRecordingRun(runId)) return null;
+      if (browserSpeechFinalizingRunIdRef.current === runId) {
         browserSpeechFinalizingRunIdRef.current = 0;
       }
-      if (!runId || voiceRecordingSessionScopeRef.current?.runId === runId) {
-        voiceRecordingSessionScopeRef.current = null;
-      }
-      capturedConfigRef.current = null;
-      recordingRunIdRef.current += 1;
+      const run = endSession(runId);
       setRecordingTarget(null);
-      setRecordingStartingFlag(false);
+      return run;
     },
-    [isActiveRecordingRun, setRecordingStartingFlag],
+    [endSession, isActiveRecordingRun],
   );
   const latestVoiceLedgerEvent = useVoiceDocumentLedgerProjection(
     selectedGroupId,
@@ -683,12 +853,10 @@ export function VoiceSecretaryComposerControl({
   );
 
   useEffect(() => {
-    recordingRef.current = recording;
     if (recording) {
-      setRecordingStartingFlag(false);
       voiceStreamItemIdRef.current = "";
     }
-  }, [recording, setRecordingStartingFlag]);
+  }, [recording]);
 
   useEffect(() => {
     const channel = openVoiceCaptureChannel();
@@ -697,7 +865,7 @@ export function VoiceSecretaryComposerControl({
       const message = event.data || {};
       if (message.type !== "probe") return;
       if (String(message.ownerId || "") !== voiceCaptureOwnerIdRef.current) return;
-      if (!recordingRef.current) return;
+      if (getVoiceSession()?.phase !== "recording") return;
       channel.postMessage({
         type: "alive",
         ownerId: voiceCaptureOwnerIdRef.current,
@@ -710,15 +878,15 @@ export function VoiceSecretaryComposerControl({
       channel.removeEventListener("message", handleMessage);
       channel.close();
     };
-  }, [selectedGroupId]);
+  }, [selectedGroupId, getVoiceSession]);
 
   useEffect(() => {
+    // Not on beforeunload: a recording asks before the page is left, and every
+    // beforeunload listener has run before the user can choose to stay.
     const releaseCurrentLock = () => releaseVoiceRecordingGuards();
     window.addEventListener("pagehide", releaseCurrentLock);
-    window.addEventListener("beforeunload", releaseCurrentLock);
     return () => {
       window.removeEventListener("pagehide", releaseCurrentLock);
-      window.removeEventListener("beforeunload", releaseCurrentLock);
       releaseCurrentLock();
     };
   }, [releaseVoiceRecordingGuards]);
@@ -728,9 +896,10 @@ export function VoiceSecretaryComposerControl({
     if (path) {
       const match = findVoiceDocument(documents, path);
       if (match) return match;
+      if (detachedDocument && voiceDocumentMatches(detachedDocument, path)) return detachedDocument;
     }
     return documents.find((document) => String(document.status || "active") === "active") || null;
-  }, [viewedDocumentPath, documents]);
+  }, [viewedDocumentPath, documents, detachedDocument]);
   const activeDocumentWritePath = useMemo(
     () => voiceDocumentPath(activeDocument),
     [activeDocument],
@@ -741,9 +910,17 @@ export function VoiceSecretaryComposerControl({
     documentTitleDraft.trim() ||
     t("voiceSecretaryWorkdocTitle", { defaultValue: "Voice Secretary workdoc" });
   const documentHasUnsavedEdits = documentDraft !== documentBaseContent;
+  useEffect(() => {
+    reportDocumentPageWork(documentHasUnsavedEdits);
+  }, [documentHasUnsavedEdits, reportDocumentPageWork, selectedGroupId]);
   const documentContentLoading = documentContentLoadingMatches(
     documentContentLoadingPath,
     activeDocumentWritePath,
+  );
+  const documentContentUnavailable = Boolean(
+    activeDocumentWritePath &&
+    !documentContentLoading &&
+    documentWriteBase?.path !== activeDocumentWritePath,
   );
   const defaultCaptureDocument = useMemo(() => {
     const targetPath = String(captureTargetDocumentPath || "").trim();
@@ -783,13 +960,10 @@ export function VoiceSecretaryComposerControl({
   const secretaryReadinessDiagnostic = secretaryIssue?.detail || "";
   const composerSecretaryUnavailableReason = composerNeedsSecretary ? secretaryNotReadyReason : "";
   const captureConfig =
-    recording || recordingStarting || recordingStoppingRef.current
-      ? capturedConfigRef.current || assistant?.config
-      : assistant?.config;
+    recordingPhase !== "idle" ? getVoiceSession()?.config || assistant?.config : assistant?.config;
   const recognitionBackend = String(captureConfig?.recognition_backend || "browser_asr").trim();
   const rawConfiguredRecognitionLanguage =
-    (!(recording || recordingStarting || recordingStoppingRef.current) &&
-      recognitionLanguageOverride) ||
+    (recordingPhase === "idle" && recognitionLanguageOverride) ||
     String(captureConfig?.recognition_language || "auto").trim() ||
     "auto";
   const configuredRecognitionLanguage = normalizeVoiceRecognitionLanguageForBackend(
@@ -935,12 +1109,32 @@ export function VoiceSecretaryComposerControl({
             "This browser page cannot access the microphone API. Open it through localhost or HTTPS and allow microphone access.",
         });
       }
+      if (issue === "audio_worklet") {
+        return t("voiceSecretaryAudioWorkletUnsupported", {
+          defaultValue:
+            "This browser does not support the audio processing needed for local or external speech recognition.",
+        });
+      }
       return "";
     },
     [t],
   );
   const getAudioCaptureErrorMessage = useCallback(
     (error: unknown) => {
+      if (error instanceof VoicePcmCaptureError) {
+        return {
+          message:
+            error.code === "unsupported"
+              ? t("voiceSecretaryAudioWorkletUnsupported", {
+                  defaultValue:
+                    "This browser does not support the audio processing needed for local or external speech recognition.",
+                })
+              : t("voiceSecretaryAudioWorkletFailed", {
+                  defaultValue:
+                    "Audio processing could not be started. Refresh the page and try again.",
+                }),
+        };
+      }
       const errorName =
         typeof error === "object" && error && "name" in error
           ? String((error as { name?: unknown }).name || "")
@@ -999,14 +1193,46 @@ export function VoiceSecretaryComposerControl({
     [t],
   );
   const controlDisabled = disabled || !selectedGroupId || busy === "send";
-  const recognitionLanguageDisabled = controlDisabled || recording || recordingStarting;
+  const recognitionLanguageDisabled =
+    controlDisabled || recording || recordingStarting || recordingFinishing;
   const isAssistantRow = variant === "assistantRow";
   const inputDeviceId =
-    (recording || recordingStarting ? capturedAudioPreferencesRef.current : null)?.inputDeviceId ??
+    (recording || recordingStarting ? getVoiceSession()?.audioPreferences : null)?.inputDeviceId ??
     audioPreferences.inputDeviceId;
   const selectedAudioDeviceLabel = inputDeviceId
     ? audioDeviceLabel("input", inputDeviceId)
     : SERVICE_DEFAULT_MIC_LABEL;
+  const canUseSystemDefaultMic = Boolean(
+    unavailableInputDeviceId &&
+    audioPreferences.inputDeviceId === unavailableInputDeviceId &&
+    !recording &&
+    !recordingStarting &&
+    !recordingFinishing,
+  );
+  const useSystemDefaultMic = useCallback(() => {
+    if (
+      !unavailableInputDeviceId ||
+      getVoiceSession() ||
+      voiceAudioSnapshot().inputDeviceId !== unavailableInputDeviceId
+    ) {
+      setUnavailableInputDeviceId("");
+      return;
+    }
+    useVoiceAudioStore.getState().update({ inputDeviceId: "" });
+    setUnavailableInputDeviceId("");
+    setSpeechError("");
+    showNotice({
+      message: t("voiceSecretarySystemDefaultMicSelected", {
+        defaultValue: "System default microphone selected. Start recording again.",
+      }),
+    });
+  }, [getVoiceSession, showNotice, t, unavailableInputDeviceId]);
+  useEffect(() => {
+    if (!unavailableInputDeviceId || audioPreferences.inputDeviceId === unavailableInputDeviceId)
+      return;
+    setUnavailableInputDeviceId("");
+    setSpeechError("");
+  }, [audioPreferences.inputDeviceId, unavailableInputDeviceId]);
   viewedDocumentPathRef.current = viewedDocumentPath;
   captureTargetDocumentPathRef.current = captureTargetDocumentPath;
   documentsRef.current = documents;
@@ -1014,10 +1240,21 @@ export function VoiceSecretaryComposerControl({
   documentDraftRef.current = documentDraft;
   documentBaseTitleRef.current = documentBaseTitle;
   documentBaseContentRef.current = documentBaseContent;
+  documentEditingRef.current = documentEditing;
+  documentRemoteChangedRef.current = documentRemoteChanged;
+  documentSaveConflictRef.current = documentSaveConflict;
 
   const loadDocumentDraft = useCallback((document: AssistantVoiceDocument | null) => {
+    documentDraftSessionRef.current += 1;
+    detachedDocumentRef.current = null;
+    setDetachedDocument(null);
+    const base = voiceDocumentWriteBase(document);
+    documentWriteBaseRef.current = base;
+    setDocumentWriteBase(base);
     const title = String(document?.title || "");
-    const content = String(document?.content || "");
+    const rawContent = String(document?.content || "");
+    const content = documentTextareaText(rawContent);
+    documentLineEndingRef.current = documentLineEnding(rawContent);
     documentTitleDraftRef.current = title;
     documentDraftRef.current = content;
     documentBaseTitleRef.current = title;
@@ -1027,11 +1264,39 @@ export function VoiceSecretaryComposerControl({
     setDocumentBaseTitle(title);
     setDocumentBaseContent(content);
     setDocumentRemoteChanged(false);
+    setDocumentSaveConflict(null);
   }, []);
 
-  const updateDocumentDraft = useCallback((value: string) => {
-    documentDraftRef.current = value;
-    setDocumentDraft(value);
+  const updateDocumentDraft = useCallback(
+    (value: string) => {
+      documentDraftRef.current = value;
+      reportDocumentPageWork(value !== documentBaseContentRef.current);
+      setDocumentDraft(value);
+    },
+    [reportDocumentPageWork],
+  );
+
+  const getDraftSnapshot = useCallback(
+    () => ({
+      path: viewedDocumentPathRef.current,
+      session: documentDraftSessionRef.current,
+      content: documentDraftRef.current,
+      dirty: documentDraftRef.current !== documentBaseContentRef.current,
+    }),
+    [],
+  );
+
+  const preserveUnavailableDraft = useCallback((document: AssistantVoiceDocument, path: string) => {
+    detachedDocumentRef.current = document;
+    setDetachedDocument(document);
+    setDocumentRemoteChanged(true);
+    setDocumentSaveConflict({
+      path,
+      session: documentDraftSessionRef.current,
+      currentSha: null,
+      targetChanged: false,
+      unavailable: true,
+    });
   }, []);
 
   const clearLiveTranscriptPreview = useCallback(() => {
@@ -1058,7 +1323,7 @@ export function VoiceSecretaryComposerControl({
         `voice-stream-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       voiceStreamItemIdRef.current = streamId;
       const pendingFinalText = normalizeBrowserTranscriptChunk(
-        browserFinalTranscriptBufferRef.current,
+        getVoiceSession()?.browserFinalText || "",
       );
       const preview = createVoiceTranscriptPreview({
         id: streamId,
@@ -1066,9 +1331,9 @@ export function VoiceSecretaryComposerControl({
         phase,
         pendingFinalText,
         metadata: {
-          mode: voiceRecordingCaptureMode(voiceRecordingSessionScopeRef.current, captureMode),
+          mode: voiceRecordingCaptureMode(getVoiceSession()?.scope || null, captureMode),
           groupId: recordingTargetGroupId(),
-          sessionId: voiceRecordingSessionIdRef.current,
+          sessionId: getVoiceSession()?.scope.sessionId || "",
           documentTitle: captureTargetDocumentTitle,
           documentPath: effectiveCaptureTargetDocumentPath,
           language: getRecordingRecognitionLanguage(),
@@ -1086,6 +1351,7 @@ export function VoiceSecretaryComposerControl({
       effectiveCaptureTargetDocumentPath,
       captureTargetDocumentTitle,
       getRecordingRecognitionLanguage,
+      getVoiceSession,
       recordingTargetGroupId,
     ],
   );
@@ -1108,7 +1374,7 @@ export function VoiceSecretaryComposerControl({
         cleanText: clean,
         metadata: {
           mode: "document",
-          sessionId: voiceRecordingSessionIdRef.current,
+          sessionId: getVoiceSession()?.scope.sessionId || "",
           documentTitle,
           documentPath,
           language: getRecordingRecognitionLanguage(),
@@ -1123,6 +1389,7 @@ export function VoiceSecretaryComposerControl({
       documents,
       effectiveCaptureTargetDocumentPath,
       getRecordingRecognitionLanguage,
+      getVoiceSession,
     ],
   );
 
@@ -1164,7 +1431,7 @@ export function VoiceSecretaryComposerControl({
   );
 
   const loadAudioDevices = useCallback(async () => {
-    setServiceAudioSupported(mediaRecorderSupported());
+    setServiceAudioSupported(serviceAudioCaptureSupported());
     await refreshAudioDevices();
   }, [refreshAudioDevices]);
 
@@ -1278,6 +1545,7 @@ export function VoiceSecretaryComposerControl({
       });
       if (ownership.shouldShowLoading) setLoading(true);
       const askRevision = askObservationRevisionRef.current;
+      const documentOwner = getDraftSnapshot();
       try {
         const promptRequestId =
           String(pendingPromptGroupIdRef.current || "").trim() === gid
@@ -1289,7 +1557,8 @@ export function VoiceSecretaryComposerControl({
             currentOwnership(),
             ownership.request,
             isCurrentGroup(gid),
-          )
+          ) ||
+          !sameVoiceDocumentGeneration(getDraftSnapshot(), documentOwner)
         )
           return;
         if (!resp.ok) {
@@ -1357,10 +1626,44 @@ export function VoiceSecretaryComposerControl({
           );
         const currentViewedPath = String(viewedDocumentPathRef.current || "").trim();
         const currentViewedDocument = findVoiceDocument(nextDocuments, currentViewedPath);
+        if (
+          currentViewedPath &&
+          !currentViewedDocument &&
+          documentDraftRef.current !== documentBaseContentRef.current
+        ) {
+          const detached =
+            findVoiceDocument(documentsRef.current, currentViewedPath) ||
+            detachedDocumentRef.current;
+          if (detached && voiceDocumentMatches(detached, currentViewedPath)) {
+            preserveUnavailableDraft(detached, currentViewedPath);
+            return;
+          }
+        }
+        if (currentViewedDocument) {
+          detachedDocumentRef.current = null;
+          setDetachedDocument(null);
+          setDocumentSaveConflict((previous) => (previous?.unavailable ? null : previous));
+        }
         const serverViewedDocument = findVoiceDocument(nextDocuments, serverViewedPath);
         let nextActiveDocument =
           currentViewedDocument || serverViewedDocument || nextDocuments[0] || null;
         const nextViewedPath = voiceDocumentPath(nextActiveDocument);
+        const loadedBase = documentWriteBaseRef.current;
+        // Broad workspace responses do not carry a target token. Reuse the
+        // token already read with this exact body, rather than reload and
+        // unmount the editor on every unchanged polling response. A changed
+        // storage target is still rejected by the conditional save.
+        if (
+          nextActiveDocument &&
+          currentViewedPath === nextViewedPath &&
+          loadedBase?.path === nextViewedPath &&
+          !nextActiveDocument.content_target_id &&
+          typeof nextActiveDocument.content === "string" &&
+          nextActiveDocument.content_sha256?.toLowerCase() === loadedBase.contentSha256 &&
+          documentTextareaText(nextActiveDocument.content) === documentBaseContentRef.current
+        ) {
+          nextActiveDocument = { ...nextActiveDocument, content_target_id: loadedBase.targetId };
+        }
         const previousActiveDocument = nextViewedPath
           ? findVoiceDocument(documentsRef.current, nextViewedPath)
           : null;
@@ -1388,7 +1691,8 @@ export function VoiceSecretaryComposerControl({
                   currentOwnership(),
                   ownership.request,
                   isCurrentGroup(gid),
-                )
+                ) ||
+                !sameVoiceDocumentGeneration(getDraftSnapshot(), documentOwner)
               )
                 return;
               if (docResp.ok && docResp.result.document) {
@@ -1409,7 +1713,7 @@ export function VoiceSecretaryComposerControl({
             }
           }
           const serverTitle = String(nextActiveDocument.title || "");
-          const serverContent = String(nextActiveDocument.content || "");
+          const serverContent = documentTextareaText(String(nextActiveDocument.content || ""));
           const localDirty = documentDraftRef.current !== documentBaseContentRef.current;
           const sameDocument = currentViewedPath
             ? voiceDocumentMatches(nextActiveDocument, currentViewedPath)
@@ -1418,8 +1722,25 @@ export function VoiceSecretaryComposerControl({
             serverTitle !== documentBaseTitleRef.current ||
             (nextActiveDocument.content !== undefined &&
               serverContent !== documentBaseContentRef.current);
-          if (!localDirty || !sameDocument) {
+          const sameLoadedBase = Boolean(
+            sameDocument &&
+            loadedBase &&
+            voiceDocumentWriteBase(nextActiveDocument)?.contentSha256 ===
+              loadedBase.contentSha256 &&
+            voiceDocumentWriteBase(nextActiveDocument)?.targetId === loadedBase.targetId &&
+            serverContent === documentBaseContentRef.current,
+          );
+          if ((!localDirty || !sameDocument) && !sameLoadedBase) {
             loadDocumentDraft(nextActiveDocument);
+          } else if (
+            !localDirty &&
+            sameLoadedBase &&
+            serverTitle !== documentBaseTitleRef.current
+          ) {
+            documentTitleDraftRef.current = serverTitle;
+            documentBaseTitleRef.current = serverTitle;
+            setDocumentTitleDraft(serverTitle);
+            setDocumentBaseTitle(serverTitle);
           } else if (serverChangedFromBase) {
             setDocumentRemoteChanged(true);
           }
@@ -1446,8 +1767,10 @@ export function VoiceSecretaryComposerControl({
     [
       applyAskSnapshot,
       clearVoiceDocumentReferences,
+      getDraftSnapshot,
       isCurrentGroup,
       loadDocumentDraft,
+      preserveUnavailableDraft,
       selectedGroupId,
       showError,
     ],
@@ -1585,9 +1908,11 @@ export function VoiceSecretaryComposerControl({
       if (draft?.request_id === requestId) {
         setPendingPromptDraft(draft);
         setPendingPromptProblem("");
+      } else if (task && ["conflict", "failed", "cancelled", "unconfirmed"].includes(task.phase)) {
+        preservePendingPromptVoice(gid, requestId, task.phase === "unconfirmed");
       }
     },
-    [t],
+    [preservePendingPromptVoice, t],
   );
   const receivePromptError = useCallback((groupId: string, requestId: string, message: string) => {
     if (
@@ -1644,12 +1969,23 @@ export function VoiceSecretaryComposerControl({
       const groupId = pendingPromptGroupIdRef.current;
       if (!groupId || draft.request_id !== pendingPromptRequestIdRef.current) return;
       if (draft.status === "no_change") {
+        const preserved = preservePendingPromptVoice(groupId, draft.request_id);
         clearPendingPromptRequest(true);
-        showNotice({ message: t("voiceSecretaryPromptDraftNoChange") });
+        if (!preserved) showNotice({ message: t("voiceSecretaryPromptDraftNoChange") });
         return;
       }
       const text = String(draft.draft_text || "").trim();
       if (!text || draft.status !== "pending") return;
+      const source = pendingPromptVoiceSourceRef.current;
+      if (
+        !reviewed &&
+        source?.groupId === groupId &&
+        source.requestId === draft.request_id &&
+        source.restored
+      ) {
+        setPromptNeedsReview(true);
+        return;
+      }
       const applyMode = promptDraftApplyMode(draft);
       const expectedSnapshotHash = pendingPromptComposerHashRef.current;
       if (
@@ -1689,7 +2025,14 @@ export function VoiceSecretaryComposerControl({
               }),
       });
     },
-    [acknowledgePromptDraft, clearPendingPromptRequest, showError, showNotice, t],
+    [
+      acknowledgePromptDraft,
+      clearPendingPromptRequest,
+      preservePendingPromptVoice,
+      showError,
+      showNotice,
+      t,
+    ],
   );
 
   useEffect(() => {
@@ -1707,9 +2050,17 @@ export function VoiceSecretaryComposerControl({
     if (!draft || !groupId) return;
     try {
       await acknowledgePromptDraft(draft, "dismissed", groupId);
-      if (pendingPromptRequestIdRef.current === draft.request_id) clearPendingPromptRequest(true);
+      if (
+        componentMountedRef.current &&
+        pendingPromptRequestIdRef.current === draft.request_id &&
+        pendingPromptGroupIdRef.current === groupId
+      ) {
+        preservePendingPromptVoice(groupId, draft.request_id);
+        clearPendingPromptRequest(true);
+      }
     } catch (error) {
-      showError(error instanceof Error ? error.message : String(error));
+      if (componentMountedRef.current)
+        showError(error instanceof Error ? error.message : String(error));
     }
   };
 
@@ -1719,13 +2070,53 @@ export function VoiceSecretaryComposerControl({
   }, [loadAudioDevices, open, serviceAsrReady]);
 
   useEffect(() => {
+    const previousGroup = documentOwnerGroupRef.current;
+    const nextGroup = String(selectedGroupId || "").trim();
+    if (previousGroup && previousGroup !== nextGroup) {
+      const path = String(viewedDocumentPathRef.current || "").trim();
+      const document = findVoiceDocument(documentsRef.current, path) || detachedDocumentRef.current;
+      const base = documentWriteBaseRef.current;
+      if (
+        path &&
+        document &&
+        base?.path === path &&
+        documentDraftRef.current !== documentBaseContentRef.current
+      ) {
+        suspendedVoiceDraftsRef.current.set(previousGroup, {
+          document,
+          path,
+          content: documentDraftRef.current,
+          baseContent: documentBaseContentRef.current,
+          title: documentTitleDraftRef.current,
+          baseTitle: documentBaseTitleRef.current,
+          writeBase: base,
+          lineEnding: documentLineEndingRef.current,
+          editing: documentEditingRef.current,
+          remoteChanged: documentRemoteChangedRef.current,
+          unavailable: Boolean(
+            detachedDocumentRef.current && voiceDocumentMatches(detachedDocumentRef.current, path),
+          ),
+          conflict:
+            documentSaveConflictRef.current?.path === path &&
+            documentSaveConflictRef.current.session === documentDraftSessionRef.current
+              ? documentSaveConflictRef.current
+              : null,
+        });
+      } else {
+        suspendedVoiceDraftsRef.current.delete(previousGroup);
+      }
+    }
+    documentOwnerGroupRef.current = nextGroup;
+    const suspended =
+      previousGroup !== nextGroup ? suspendedVoiceDraftsRef.current.get(nextGroup) : undefined;
     const ownership = resetVoiceAssistantVisibleLoading({
       dataSeq: refreshSeq.current,
       visibleLoadingSeq: visibleLoadSeqRef.current,
     });
     refreshSeq.current = ownership.dataSeq;
     visibleLoadSeqRef.current = ownership.visibleLoadingSeq;
-    const keepActiveRecording = recordingRef.current;
+    // A starting or finishing run still owns its original Group and buffers.
+    const keepActiveRecording = Boolean(getVoiceSession());
     const keepPendingPromptRequest = Boolean(pendingPromptRequestIdRef.current.trim());
     if (!keepActiveRecording) {
       const recognition = recognitionRef.current;
@@ -1733,23 +2124,12 @@ export function VoiceSecretaryComposerControl({
       abortBrowserSpeechRecognition(recognition);
       browserSpeechStopRequestedRef.current = true;
       browserSpeechRecoveryRef.current.reset();
-      const recorder = mediaRecorderRef.current;
-      mediaRecorderRef.current = null;
-      if (recorder && recorder.state !== "inactive") {
-        recorder.onstop = null;
-        try {
-          recorder.stop();
-        } catch {
-          // ignore browser cleanup failure
-        }
-      }
       const cleanupBrowserSpeechMedia = browserSpeechMediaCleanupRef.current;
       browserSpeechMediaCleanupRef.current = null;
       if (cleanupBrowserSpeechMedia) cleanupBrowserSpeechMedia();
       resetVoiceAudioLevel();
       stopMediaStream(mediaStreamRef.current);
       mediaStreamRef.current = null;
-      mediaChunksRef.current = [];
     }
     setOpen(false);
     setLoading(false);
@@ -1765,13 +2145,40 @@ export function VoiceSecretaryComposerControl({
     setCaptureTargetDocumentPath("");
     loadDocumentDraft(null);
     setDocumentEditing(false);
+    if (suspended) {
+      suspendedVoiceDraftsRef.current.delete(nextGroup);
+      viewedDocumentPathRef.current = suspended.path;
+      documentsRef.current = suspended.unavailable ? [] : [suspended.document];
+      documentTitleDraftRef.current = suspended.title;
+      documentBaseTitleRef.current = suspended.baseTitle;
+      documentDraftRef.current = suspended.content;
+      documentBaseContentRef.current = suspended.baseContent;
+      documentWriteBaseRef.current = suspended.writeBase;
+      documentLineEndingRef.current = suspended.lineEnding;
+      setDocuments(suspended.unavailable ? [] : [suspended.document]);
+      setViewedDocumentPath(suspended.path);
+      setDocumentTitleDraft(suspended.title);
+      setDocumentBaseTitle(suspended.baseTitle);
+      setDocumentDraft(suspended.content);
+      setDocumentBaseContent(suspended.baseContent);
+      setDocumentWriteBase(suspended.writeBase);
+      setDocumentEditing(suspended.editing);
+      setDocumentRemoteChanged(suspended.remoteChanged);
+      if (suspended.conflict) {
+        setDocumentSaveConflict({
+          ...suspended.conflict,
+          session: documentDraftSessionRef.current,
+        });
+      }
+      if (suspended.unavailable) preserveUnavailableDraft(suspended.document, suspended.path);
+    }
     setDocumentInstruction("");
     setExecutionTaskId("");
     if (!keepActiveRecording) {
-      setRecording(false);
       setRecordingTarget(null);
     }
     setSpeechError("");
+    setUnavailableInputDeviceId("");
     if (!keepActiveRecording) {
       if (!keepPendingPromptRequest) clearPendingPromptRequest(true);
       pendingAskRequestIdRef.current = "";
@@ -1817,11 +2224,6 @@ export function VoiceSecretaryComposerControl({
         window.clearTimeout(serviceDocumentCheckpointTimerRef.current);
         serviceDocumentCheckpointTimerRef.current = null;
       }
-      browserFinalTranscriptBufferRef.current = "";
-      serviceLatestPartialTranscriptRef.current = "";
-      serviceCommittedTranscriptRef.current = "";
-      serviceDocumentCommittedTranscriptRef.current = "";
-      serviceFinalAsrTextRef.current = "";
       serviceAudioResamplerRef.current = null;
       serviceAudioDurationMsRef.current = 0;
       serviceCommittedEndMsRef.current = 0;
@@ -1840,9 +2242,11 @@ export function VoiceSecretaryComposerControl({
   }, [
     clearPendingPromptRequest,
     loadDocumentDraft,
+    preserveUnavailableDraft,
     releaseVoiceRecordingGuards,
     selectedGroupId,
     resetVoiceAudioLevel,
+    getVoiceSession,
   ]);
 
   useEffect(() => {
@@ -1896,7 +2300,10 @@ export function VoiceSecretaryComposerControl({
   }, []);
 
   const attachMediaStreamDiagnostics = useCallback(
-    (stream: MediaStream, opts: { backend: string; groupId: string; runId: number }) => {
+    (
+      stream: MediaStream,
+      opts: { backend: string; groupId: string; runId: number; onEnded: () => void },
+    ) => {
       const cleanupCallbacks: Array<() => void> = [];
       stream.getAudioTracks().forEach((track, index) => {
         const previousEnded = track.onended;
@@ -1913,12 +2320,15 @@ export function VoiceSecretaryComposerControl({
             runId: opts.runId,
             detail: describeTrack(),
           });
-          setSpeechError(
-            t("voiceSecretaryRecordingStoppedTrackEnded", {
-              detail: trackLabel,
-              defaultValue: "Microphone input ended unexpectedly: {{detail}}.",
-            }),
-          );
+          if (isCurrentGroup(opts.groupId)) {
+            setSpeechError(
+              t("voiceSecretaryRecordingStoppedTrackEnded", {
+                detail: trackLabel,
+                defaultValue: "Microphone input ended unexpectedly: {{detail}}.",
+              }),
+            );
+          }
+          opts.onEnded();
         };
         const onMute = (event: Event) => {
           if (typeof previousMute === "function") previousMute.call(track, event);
@@ -1953,7 +2363,7 @@ export function VoiceSecretaryComposerControl({
         cleanupCallbacks.forEach((cleanup) => cleanup());
       };
     },
-    [isActiveRecordingRun, reportRecordingStopReason, t],
+    [isActiveRecordingRun, isCurrentGroup, reportRecordingStopReason, t],
   );
 
   const applyTranscriptAppendResult = useCallback(
@@ -1961,6 +2371,9 @@ export function VoiceSecretaryComposerControl({
       if (result.assistant) setAssistant(result.assistant);
       if ((result.document_updated || result.input_event_created) && result.document) {
         const document = result.document;
+        // Transcript acknowledgements may contain index metadata, not a
+        // content/version pair read from the current storage target.
+        if (!voiceDocumentWriteBase(document)) return;
         const docPath = voiceDocumentPath(document);
         if (
           docPath &&
@@ -1997,11 +2410,36 @@ export function VoiceSecretaryComposerControl({
   );
 
   const applyDocumentMutationResult = useCallback(
-    (document: AssistantVoiceDocument | undefined, assistantNext?: BuiltinAssistant) => {
+    (
+      document: AssistantVoiceDocument | undefined,
+      assistantNext?: BuiltinAssistant,
+      saved?: {
+        draft: string;
+        base: string;
+        path: string;
+        session: number;
+        writeBase: VoiceDocumentWriteBase;
+      },
+      owner?: VoiceDocumentDraftOwner,
+    ): boolean => {
+      if (owner && !sameVoiceDocumentSession(getDraftSnapshot(), owner)) return false;
       if (assistantNext) setAssistant(assistantNext);
-      if (!document) return;
+      if (!document) return false;
       const docPath = voiceDocumentPath(document);
-      if (!docPath) return;
+      if (!docPath) return false;
+      if (saved && !sameVoiceDocumentSession(getDraftSnapshot(), saved)) return false;
+      const responseBase = voiceDocumentWriteBase(document);
+      if (saved && (!responseBase || responseBase.targetId !== saved.writeBase.targetId))
+        return false;
+      if (!saved && !responseBase) {
+        if (
+          viewedDocumentPathRef.current === docPath &&
+          document.content !== undefined &&
+          documentTextareaText(document.content) !== documentBaseContentRef.current
+        )
+          setDocumentRemoteChanged(true);
+        return false;
+      }
       // An accepted write is newer than every workspace read already in flight.
       invalidateWorkspaceRefresh();
       if (viewedDocumentPathRef.current === docPath) {
@@ -2017,10 +2455,45 @@ export function VoiceSecretaryComposerControl({
       });
       if (!viewedDocumentPathRef.current || viewedDocumentPathRef.current === docPath) {
         setViewedDocumentPath(docPath);
+        const currentDraft = documentDraftRef.current;
+        const currentBase = documentBaseContentRef.current;
+        if (saved && saved.path === docPath && currentBase === saved.base) {
+          if (currentDraft !== saved.draft) {
+            const savedContent = document.content;
+            if (savedContent !== undefined) {
+              const normalized = documentTextareaText(savedContent);
+              documentLineEndingRef.current = documentLineEnding(savedContent);
+              documentBaseContentRef.current = normalized;
+              setDocumentBaseContent(normalized);
+              documentWriteBaseRef.current = responseBase;
+              setDocumentWriteBase(responseBase);
+            } else {
+              setDocumentRemoteChanged(true);
+            }
+            return false;
+          }
+        } else if (currentDraft !== currentBase) {
+          if (
+            document.content !== undefined &&
+            documentTextareaText(document.content) !== currentBase
+          ) {
+            setDocumentRemoteChanged(true);
+          }
+          return false;
+        } else if (
+          !responseBase ||
+          (documentWriteBaseRef.current &&
+            responseBase.targetId !== documentWriteBaseRef.current.targetId)
+        ) {
+          setDocumentRemoteChanged(true);
+          return false;
+        }
         loadDocumentDraft(document);
+        return true;
       }
+      return false;
     },
-    [invalidateWorkspaceRefresh, loadDocumentDraft],
+    [getDraftSnapshot, invalidateWorkspaceRefresh, loadDocumentDraft],
   );
 
   const appendTranscriptSegment = useCallback(
@@ -2037,7 +2510,7 @@ export function VoiceSecretaryComposerControl({
         speakerSegments?: Record<string, unknown>[];
       },
     ): Promise<boolean> => {
-      const sessionScope = voiceRecordingSessionScopeRef.current;
+      const sessionScope = getVoiceSession()?.scope || null;
       const gid = recordingTargetGroupId();
       if (!gid || (!sessionScope && !captureNeedsSecretary)) return false;
       const cleanText = String(text || "").trim();
@@ -2046,11 +2519,12 @@ export function VoiceSecretaryComposerControl({
       const targetDocumentPath = recordingTargetDocumentPath(
         opts?.documentPath || captureTargetDocumentPathRef.current,
       );
+      const documentOwner = getDraftSnapshot();
       const segmentSeq = transcriptSegmentSeqRef.current + 1;
       transcriptSegmentSeqRef.current = segmentSeq;
       try {
         const resp = await appendVoiceAssistantTranscriptSegment(gid, {
-          sessionId: voiceRecordingSessionIdRef.current,
+          sessionId: getVoiceSession()?.scope.sessionId || "",
           segmentId: cleanText ? `seg-${segmentSeq}` : "",
           documentPath: targetDocumentPath,
           text: cleanText,
@@ -2064,7 +2538,7 @@ export function VoiceSecretaryComposerControl({
             trigger_kind: opts?.triggerKind || (flush ? "push_to_talk_stop" : "meeting_window"),
             capture_mode: serviceAsrReady ? "service" : "browser",
             recognition_backend: opts?.source || recognitionBackend,
-            client_session_id: voiceRecordingSessionIdRef.current,
+            client_session_id: getVoiceSession()?.scope.sessionId || "",
             input_device_label:
               opts?.inputDeviceLabel ||
               (serviceAsrReady ? selectedAudioDeviceLabel : BROWSER_DEFAULT_MIC_LABEL),
@@ -2074,12 +2548,26 @@ export function VoiceSecretaryComposerControl({
           },
           by: "user",
         });
+        if (!componentMountedRef.current) return false;
         if (!resp.ok) {
           if (isCurrentGroup(gid)) showError(resp.error.message);
           return false;
         }
         if (isCurrentGroup(gid)) {
-          applyTranscriptAppendResult(resp.result);
+          if (sameVoiceDocumentSession(getDraftSnapshot(), documentOwner)) {
+            applyTranscriptAppendResult(resp.result);
+            const responseDocument = resp.result.document;
+            const responsePath = voiceDocumentPath(responseDocument);
+            if (
+              responseDocument &&
+              !voiceDocumentWriteBase(responseDocument) &&
+              (resp.result.document_updated ||
+                (resp.result.input_event_created &&
+                  responsePath &&
+                  !findVoiceDocument(documentsRef.current, responsePath)))
+            )
+              void refreshAssistant({ quiet: true, passive: true });
+          }
           const resultDocumentPath = voiceDocumentPath(resp.result.document) || targetDocumentPath;
           if (cleanText && resultDocumentPath) {
             pushVoiceTranscriptItem(cleanText, {
@@ -2091,7 +2579,7 @@ export function VoiceSecretaryComposerControl({
         }
         return true;
       } catch {
-        if (!isCurrentGroup(gid)) return false;
+        if (!componentMountedRef.current || !isCurrentGroup(gid)) return false;
         showError(
           t("voiceSecretaryTranscriptAppendFailed", {
             defaultValue: "Failed to save Voice Secretary transcript segment.",
@@ -2103,10 +2591,13 @@ export function VoiceSecretaryComposerControl({
     [
       applyTranscriptAppendResult,
       captureNeedsSecretary,
+      getDraftSnapshot,
       getRecordingRecognitionLanguage,
+      getVoiceSession,
       isCurrentGroup,
       pushVoiceTranscriptItem,
       recognitionBackend,
+      refreshAssistant,
       recordingTargetDocumentPath,
       recordingTargetGroupId,
       selectedAudioDeviceLabel,
@@ -2116,67 +2607,156 @@ export function VoiceSecretaryComposerControl({
     ],
   );
 
-  const flushServiceDocumentCheckpoint = useCallback(
-    async (triggerKind = "max_window"): Promise<boolean> => {
-      clearServiceDocumentCheckpointTimer();
-      if (serviceAsrBackendRef.current === "external_provider_asr") return true;
+  const appendDirectDictationToComposer = useCallback(
+    (
+      text: string,
+      recovery?: "interrupted" | "not_sent" | "unconfirmed" | "partial",
+      targetGroupId?: string,
+    ): boolean => {
+      const transcript = String(text || "").trim();
+      if (!transcript || !componentMountedRef.current) return false;
+      const groupId = String(targetGroupId || recordingTargetGroupId()).trim();
+      if (!groupId) return false;
       if (
-        voiceRecordingCaptureMode(voiceRecordingSessionScopeRef.current, captureMode) !== "document"
-      )
-        return false;
-      const committedDocumentText = normalizeBrowserTranscriptChunk(
-        serviceDocumentCommittedTranscriptRef.current,
-      );
-      const finalAsrText = normalizeBrowserTranscriptChunk(serviceFinalAsrTextRef.current);
-      const streamingText = normalizeBrowserTranscriptChunk(
-        serviceCommittedTranscriptRef.current || serviceFinalTranscriptRef.current,
-      );
-      const stableText =
-        committedDocumentText && finalAsrText.startsWith(committedDocumentText)
-          ? finalAsrText
-          : streamingText;
-      const newText = nextUncommittedServiceTranscriptText(stableText, committedDocumentText);
-      if (!newText) return false;
-      const startMs = serviceDocumentCommittedEndMsRef.current;
-      const endMs = Math.max(
-        startMs,
-        serviceCommittedEndMsRef.current || serviceAudioDurationMsRef.current,
-      );
-      const ok = await appendTranscriptSegment(newText, {
-        flush: true,
-        triggerKind,
-        source: "assistant_service_local_asr_streaming",
-        inputDeviceLabel: selectedAudioDeviceLabel,
-        documentPath: recordingTargetDocumentPath(effectiveCaptureTargetDocumentPath),
-        startMs,
-        endMs,
-        speakerSegments: serviceFinalSpeakerSegmentsRef.current.length
-          ? serviceFinalSpeakerSegmentsRef.current
-          : serviceProvisionalSpeakerSegmentsRef.current,
+        isCurrentGroup(groupId) &&
+        useComposerStore.getState().activeGroupId === groupId &&
+        onPromptDraft
+      ) {
+        onPromptDraft(transcript, { mode: "append" });
+      } else {
+        const routed = routeVoiceTextToComposerGroup({ groupId, text: transcript, mode: "append" });
+        if (routed === "ignored") return false;
+      }
+      finalizeLiveTranscriptPreview();
+      const group =
+        useGroupStore.getState().groups.find((item) => item.group_id === groupId)?.title || groupId;
+      const recoveryNotice =
+        recovery === "interrupted"
+          ? t("voiceSecretaryTranscriptInterrupted", {
+              group,
+              defaultValue:
+                "Recording was interrupted. Recognized text was added to the composer in {{group}}.",
+            })
+          : recovery === "not_sent"
+            ? t("voiceSecretaryTranscriptNotSent", {
+                group,
+                defaultValue:
+                  "The transcript was not sent automatically. It is in the composer in {{group}} for review.",
+              })
+            : recovery === "unconfirmed"
+              ? t("voiceSecretaryTranscriptUnconfirmed", {
+                  group,
+                  defaultValue:
+                    "The request result is unconfirmed. The transcript is in the composer in {{group}}; check before retrying.",
+                })
+              : recovery === "partial"
+                ? t("voiceSecretaryTranscriptPartial", {
+                    group,
+                    defaultValue:
+                      "The final transcript is incomplete. Available text is in the composer in {{group}} for review.",
+                  })
+                : "";
+      showNotice({
+        message:
+          recoveryNotice ||
+          (isCurrentGroup(groupId)
+            ? t("voiceDirectDictationFilled", {
+                defaultValue: "Speech transcript appended to the composer.",
+              })
+            : t("voiceDirectDictationFilledOtherGroup", {
+                group,
+                defaultValue: "Speech transcript appended to the composer in {{group}}.",
+              })),
       });
-      if (!ok) return false;
-      serviceDocumentCommittedTranscriptRef.current = mergeTranscriptChunks(
-        committedDocumentText,
-        newText,
-      );
-      serviceDocumentCommittedEndMsRef.current = endMs;
       return true;
     },
     [
+      finalizeLiveTranscriptPreview,
+      isCurrentGroup,
+      onPromptDraft,
+      recordingTargetGroupId,
+      showNotice,
+      t,
+    ],
+  );
+
+  const flushServiceDocumentCheckpoint = useCallback(
+    async (triggerKind = "max_window"): Promise<boolean> => {
+      clearServiceDocumentCheckpointTimer();
+      const session = getVoiceSession();
+      if (!session) return false;
+      const service = session.service;
+      if (serviceAsrBackendRef.current === "external_provider_asr") return true;
+      if (voiceRecordingCaptureMode(getVoiceSession()?.scope || null, captureMode) !== "document")
+        return false;
+      const previous = service.documentCheckpointTail;
+      const checkpoint = (async () => {
+        if (previous && !(await previous)) return false;
+        if (getVoiceSession() !== session) return false;
+        // Calculate the suffix only after the preceding checkpoint has settled.
+        const committedDocumentText = normalizeBrowserTranscriptChunk(service.documentHandled);
+        const finalAsrText = normalizeBrowserTranscriptChunk(service.finalAsrText);
+        const streamingText = normalizeBrowserTranscriptChunk(
+          service.committed || service.finalText,
+        );
+        const stableText =
+          committedDocumentText && finalAsrText.startsWith(committedDocumentText)
+            ? finalAsrText
+            : streamingText;
+        const newText = nextUncommittedServiceTranscriptText(stableText, committedDocumentText);
+        if (!newText) return true;
+        const startMs = serviceDocumentCommittedEndMsRef.current;
+        const endMs = Math.max(
+          startMs,
+          serviceCommittedEndMsRef.current || serviceAudioDurationMsRef.current,
+        );
+        const ok = await appendTranscriptSegment(newText, {
+          flush: true,
+          triggerKind,
+          source: "assistant_service_local_asr_streaming",
+          inputDeviceLabel: selectedAudioDeviceLabel,
+          documentPath: recordingTargetDocumentPath(effectiveCaptureTargetDocumentPath),
+          startMs,
+          endMs,
+          speakerSegments: serviceFinalSpeakerSegmentsRef.current.length
+            ? serviceFinalSpeakerSegmentsRef.current
+            : serviceProvisionalSpeakerSegmentsRef.current,
+        });
+        if (getVoiceSession() !== session) return false;
+        if (
+          !ok &&
+          !appendDirectDictationToComposer(newText, "unconfirmed", session.scope.groupId)
+        ) {
+          return false;
+        }
+        // This prefix was either written or kept for the user. Re-merging overlap
+        // would cease to be a prefix of later snapshots and could replay it.
+        service.documentHandled = stableText;
+        serviceDocumentCommittedEndMsRef.current = endMs;
+        return true;
+      })();
+      service.documentCheckpointTail = checkpoint;
+      try {
+        return await checkpoint;
+      } finally {
+        if (service.documentCheckpointTail === checkpoint) service.documentCheckpointTail = null;
+      }
+    },
+    [
       appendTranscriptSegment,
+      appendDirectDictationToComposer,
       captureMode,
       clearServiceDocumentCheckpointTimer,
       effectiveCaptureTargetDocumentPath,
       recordingTargetDocumentPath,
       selectedAudioDeviceLabel,
+      getVoiceSession,
     ],
   );
 
   const scheduleServiceDocumentCheckpoint = useCallback(() => {
     if (serviceAsrBackendRef.current === "external_provider_asr") return;
-    if (
-      voiceRecordingCaptureMode(voiceRecordingSessionScopeRef.current, captureMode) !== "document"
-    )
+    if (voiceRecordingCaptureMode(getVoiceSession()?.scope || null, captureMode) !== "document")
       return;
     if (autoDocumentMaxWindowMs === null) return;
     if (serviceDocumentCheckpointTimerRef.current !== null) return;
@@ -2184,7 +2764,7 @@ export function VoiceSecretaryComposerControl({
       serviceDocumentCheckpointTimerRef.current = null;
       void flushServiceDocumentCheckpoint("max_window");
     }, autoDocumentMaxWindowMs);
-  }, [autoDocumentMaxWindowMs, captureMode, flushServiceDocumentCheckpoint]);
+  }, [autoDocumentMaxWindowMs, captureMode, flushServiceDocumentCheckpoint, getVoiceSession]);
 
   const sendInstructionTranscript = useCallback(
     async (
@@ -2197,7 +2777,7 @@ export function VoiceSecretaryComposerControl({
       },
     ): Promise<boolean> => {
       const explicitGroupId = String(opts?.targetGroupId || "").trim();
-      const sessionScope = explicitGroupId ? null : voiceRecordingSessionScopeRef.current;
+      const sessionScope = explicitGroupId ? null : getVoiceSession()?.scope || null;
       const gid = explicitGroupId || recordingTargetGroupId();
       const instruction = normalizeBrowserTranscriptChunk(text);
       if (!gid || (!sessionScope && !captureNeedsSecretary) || !instruction) return false;
@@ -2210,26 +2790,43 @@ export function VoiceSecretaryComposerControl({
       const currentDocumentPath = explicitGroupId
         ? String(fallbackDocumentPath || "").trim()
         : recordingTargetDocumentPath(fallbackDocumentPath);
+      const documentOwner = getDraftSnapshot();
       try {
-        const resp = await appendVoiceAssistantInput(gid, {
-          kind: "voice_instruction",
-          taskKind: "ask",
-          documentPath: opts?.referenceDocument ? currentDocumentPath || undefined : undefined,
-          instruction,
-          requestId,
-          inputAppendId: requestId,
-          trigger: {
-            trigger_kind: opts?.triggerKind || "voice_instruction",
-            mode: "voice_instruction",
-            target_kind: "secretary",
-            current_document_path: currentDocumentPath,
-            recognition_backend: String(
-              getActiveCaptureConfig()?.recognition_backend || recognitionBackend,
-            ),
-            language: getRecordingRecognitionLanguage(),
-          },
-          by: "user",
-        });
+        const outcome = await waitForVoiceRequest(
+          appendVoiceAssistantInput(gid, {
+            kind: "voice_instruction",
+            taskKind: "ask",
+            documentPath: opts?.referenceDocument ? currentDocumentPath || undefined : undefined,
+            instruction,
+            requestId,
+            inputAppendId: requestId,
+            trigger: {
+              trigger_kind: opts?.triggerKind || "voice_instruction",
+              mode: "voice_instruction",
+              target_kind: "secretary",
+              current_document_path: currentDocumentPath,
+              recognition_backend: String(
+                getActiveCaptureConfig()?.recognition_backend || recognitionBackend,
+              ),
+              language: getRecordingRecognitionLanguage(),
+            },
+            by: "user",
+          }),
+          VOICE_REQUEST_TIMEOUT_MS,
+        );
+        if (!componentMountedRef.current) return false;
+        if (outcome.timedOut) {
+          if (isCurrentGroup(gid)) {
+            showError(
+              t("voiceSecretaryRequestTimeout", {
+                defaultValue:
+                  "The request was not confirmed within 60 seconds. The server may still be processing it.",
+              }),
+            );
+          }
+          return false;
+        }
+        const resp = outcome.value;
         if (!resp.ok) {
           if (isCurrentGroup(gid)) showError(resp.error.message);
           return false;
@@ -2252,7 +2849,12 @@ export function VoiceSecretaryComposerControl({
             ].slice(0, 10),
           );
           finalizeLiveTranscriptPreview();
-          applyDocumentMutationResult(resp.result.document, resp.result.assistant);
+          applyDocumentMutationResult(
+            resp.result.document,
+            resp.result.assistant,
+            undefined,
+            documentOwner,
+          );
           showNotice({
             message: t(
               resp.result.secretary_processing_deferred
@@ -2265,7 +2867,7 @@ export function VoiceSecretaryComposerControl({
         }
         return true;
       } catch {
-        if (!isCurrentGroup(gid)) return false;
+        if (!componentMountedRef.current || !isCurrentGroup(gid)) return false;
         showError(
           t("voiceSecretaryDocumentInstructionFailed", {
             defaultValue: "Failed to send the request to Voice Secretary.",
@@ -2280,7 +2882,9 @@ export function VoiceSecretaryComposerControl({
       applyDocumentMutationResult,
       captureNeedsSecretary,
       getActiveCaptureConfig,
+      getDraftSnapshot,
       getRecordingRecognitionLanguage,
+      getVoiceSession,
       finalizeLiveTranscriptPreview,
       isCurrentGroup,
       recognitionBackend,
@@ -2306,7 +2910,7 @@ export function VoiceSecretaryComposerControl({
       },
     ) => {
       const explicitGroupId = String(opts?.targetGroupId || "").trim();
-      const sessionScope = explicitGroupId ? null : voiceRecordingSessionScopeRef.current;
+      const sessionScope = explicitGroupId ? null : getVoiceSession()?.scope || null;
       const gid = explicitGroupId || recordingTargetGroupId();
       const voiceTranscript = normalizeBrowserTranscriptChunk(text);
       const currentComposerText = readCurrentComposerText();
@@ -2318,7 +2922,7 @@ export function VoiceSecretaryComposerControl({
       const requestComposerContext = explicitGroupId
         ? (opts?.composerContext ?? composerContext)
         : (sessionScope?.composerContext ?? composerContext);
-      if (!gid || (!voiceTranscript && !snapshot.trim())) return;
+      if (!gid || (!voiceTranscript && !snapshot.trim())) return "not_dispatched" as const;
       const operation = opts?.operation || "append_to_composer_end";
       const snapshotHash = hashComposerSnapshot(snapshot);
       const nowMs = Date.now();
@@ -2340,9 +2944,13 @@ export function VoiceSecretaryComposerControl({
             }),
           );
         }
-        return;
+        return "not_dispatched" as const;
       }
+      // A new recording is a new user intent. Keep it editable while an earlier
+      // prompt request is still pending instead of folding it into that request.
+      if (requestOwnership === "same_group" && voiceTranscript) return "not_dispatched" as const;
       if (requestOwnership === "none" && existingRequestId) {
+        preservePendingPromptVoice(pendingPromptGroupIdRef.current, existingRequestId);
         clearPendingPromptRequest(true);
       }
       const reuseExistingRequest = Boolean(
@@ -2357,6 +2965,16 @@ export function VoiceSecretaryComposerControl({
       const inputAppendId = `voice-prompt-input-${nowMs.toString(36)}-${Math.random()
         .toString(36)
         .slice(2, 8)}`;
+      if (voiceTranscript && operation === "append_to_composer_end") {
+        pendingPromptVoiceSourceRef.current = {
+          groupId: gid,
+          requestId,
+          runId: sessionScope?.runId ?? null,
+          text: voiceTranscript,
+          restored: false,
+          timer: null,
+        };
+      }
       pendingPromptRequestIdRef.current = requestId;
       pendingPromptComposerHashRef.current = snapshotHash;
       pendingPromptGroupIdRef.current = gid;
@@ -2366,37 +2984,71 @@ export function VoiceSecretaryComposerControl({
       setPendingPromptDraft(null);
       setPromptNeedsReview(false);
       try {
-        const resp = await appendVoiceAssistantInput(gid, {
-          kind: "prompt_refine",
-          voiceTranscript,
-          composerText: snapshot,
-          requestId,
-          inputAppendId,
-          operation,
-          composerSnapshotHash: snapshotHash,
-          composerContext: requestComposerContext,
-          language: getRecordingRecognitionLanguage(),
-          trigger: {
-            trigger_kind: triggerKind,
-            mode: "prompt",
-            recognition_backend: String(
-              getActiveCaptureConfig()?.recognition_backend || recognitionBackend,
-            ),
+        const outcome = await waitForVoiceRequest(
+          appendVoiceAssistantInput(gid, {
+            kind: "prompt_refine",
+            voiceTranscript,
+            composerText: snapshot,
+            requestId,
+            inputAppendId,
+            operation,
+            composerSnapshotHash: snapshotHash,
+            composerContext: requestComposerContext,
             language: getRecordingRecognitionLanguage(),
-          },
-          by: "user",
-        });
+            trigger: {
+              trigger_kind: triggerKind,
+              mode: "prompt",
+              recognition_backend: String(
+                getActiveCaptureConfig()?.recognition_backend || recognitionBackend,
+              ),
+              language: getRecordingRecognitionLanguage(),
+            },
+            by: "user",
+          }),
+          VOICE_REQUEST_TIMEOUT_MS,
+        );
+        if (!componentMountedRef.current) return "unconfirmed" as const;
+        if (outcome.timedOut) {
+          if (
+            pendingPromptRequestIdRef.current === requestId &&
+            pendingPromptGroupIdRef.current === gid
+          ) {
+            clearPendingPromptRequest(false);
+          }
+          if (isCurrentGroup(gid)) {
+            showError(
+              t("voiceSecretaryRequestTimeout", {
+                defaultValue:
+                  "The request was not confirmed within 60 seconds. The server may still be processing it.",
+              }),
+            );
+          }
+          return "unconfirmed" as const;
+        }
+        const resp = outcome.value;
         if (
           pendingPromptRequestIdRef.current !== requestId ||
           pendingPromptGroupIdRef.current !== gid
         )
-          return;
+          return resp.ok ? ("accepted" as const) : ("unconfirmed" as const);
         if (!resp.ok) {
           clearPendingPromptRequest(false);
           if (isCurrentGroup(gid)) showError(resp.error.message);
-          return;
+          return "unconfirmed" as const;
         }
-        if (!isCurrentGroup(gid)) return;
+        const source = pendingPromptVoiceSourceRef.current;
+        if (
+          source &&
+          source.groupId === gid &&
+          source.requestId === requestId &&
+          !source.restored &&
+          source.timer === null
+        ) {
+          source.timer = window.setTimeout(() => {
+            preservePendingPromptVoice(gid, requestId, true);
+          }, VOICE_PROMPT_RESULT_WAIT_MS);
+        }
+        if (!isCurrentGroup(gid)) return "accepted" as const;
         if (resp.result.assistant) setAssistant(resp.result.assistant);
         finalizeLiveTranscriptPreview();
         const deferred = resp.result.secretary_processing_deferred;
@@ -2418,19 +3070,23 @@ export function VoiceSecretaryComposerControl({
                   }),
         });
         void refreshAssistant({ quiet: true });
+        return "accepted" as const;
       } catch {
+        if (!componentMountedRef.current) return "unconfirmed" as const;
         if (
           pendingPromptRequestIdRef.current !== requestId ||
           pendingPromptGroupIdRef.current !== gid
         )
-          return;
+          return "unconfirmed" as const;
         clearPendingPromptRequest(false);
-        if (!isCurrentGroup(gid)) return;
-        showError(
-          t("voiceSecretaryPromptRefineFailed", {
-            defaultValue: "Failed to send prompt refinement to Voice Secretary.",
-          }),
-        );
+        if (isCurrentGroup(gid)) {
+          showError(
+            t("voiceSecretaryPromptRefineFailed", {
+              defaultValue: "Failed to send prompt refinement to Voice Secretary.",
+            }),
+          );
+        }
+        return "unconfirmed" as const;
       }
     },
     [
@@ -2439,12 +3095,14 @@ export function VoiceSecretaryComposerControl({
       readCurrentComposerText,
       getActiveCaptureConfig,
       getRecordingRecognitionLanguage,
+      getVoiceSession,
       finalizeLiveTranscriptPreview,
       isCurrentGroup,
       pendingPromptRequestId,
       pendingPromptDraft,
       pendingPromptProblem,
       pendingPromptTask,
+      preservePendingPromptVoice,
       recognitionBackend,
       recordingTargetGroupId,
       refreshAssistant,
@@ -2454,48 +3112,38 @@ export function VoiceSecretaryComposerControl({
     ],
   );
 
-  const appendDirectDictationToComposer = useCallback(
-    (text: string): boolean => {
-      const transcript = String(text || "").trim();
-      if (!transcript || !onPromptDraft) return false;
-      const groupId = recordingTargetGroupId();
-      if (isCurrentGroup(groupId)) {
-        onPromptDraft(transcript, { mode: "append" });
-      } else {
-        routeVoiceTextToComposerGroup({ groupId, text: transcript, mode: "append" });
-      }
-      finalizeLiveTranscriptPreview();
-      showNotice({
-        message: t("voiceDirectDictationFilled", {
-          defaultValue: "Speech transcript appended to the composer.",
-        }),
-      });
-      return true;
+  const recoverServiceTranscript = useCallback(
+    (runId: number, reason: "interrupted" | "not_sent" | "unconfirmed" | "partial") => {
+      const run = getVoiceSession();
+      if (!run || run.id !== runId || run.scope.dispatchTarget === "document") return false;
+      const service = run.service;
+      if (service.recovered) return false;
+      const text = serviceTranscriptForRecovery(run);
+      if (!isVoiceDictationText(text)) return false;
+      const saved = appendDirectDictationToComposer(text, reason, run.scope.groupId);
+      if (saved) service.recovered = true;
+      return saved;
     },
-    [
-      finalizeLiveTranscriptPreview,
-      isCurrentGroup,
-      onPromptDraft,
-      recordingTargetGroupId,
-      showNotice,
-      t,
-    ],
+    [appendDirectDictationToComposer, getVoiceSession],
   );
 
   const takeBrowserFinalTranscriptBuffer = useCallback((): string => {
-    const text = String(browserFinalTranscriptBufferRef.current || "").trim();
-    browserFinalTranscriptBufferRef.current = "";
+    const session = getVoiceSession();
+    if (!session) return "";
+    const text = session.browserFinalText.trim();
+    session.browserFinalText = "";
     return text;
-  }, []);
+  }, [getVoiceSession]);
 
   const flushBrowserTranscriptWindow = useCallback(
     async (triggerKind = "meeting_window", opts?: { documentPath?: string }): Promise<void> => {
       clearTranscriptFlushTimer();
       clearTranscriptMaxFlushTimer();
       const dispatchTarget = voiceRecordingDispatchTarget(
-        voiceRecordingSessionScopeRef.current,
+        getVoiceSession()?.scope || null,
         captureDispatchTarget,
       );
+      const groupId = recordingTargetGroupId();
       const documentPath = recordingTargetDocumentPath(
         opts?.documentPath || captureTargetDocumentPathRef.current,
       );
@@ -2508,22 +3156,45 @@ export function VoiceSecretaryComposerControl({
         return;
       }
       if (dispatchTarget === "prompt") {
-        if (!isMeaningfulVoiceDispatchText(text)) return;
-        await requestPromptRefine(text, triggerKind || "prompt_refine");
+        if (!isMeaningfulVoiceDispatchText(text)) {
+          if (isVoiceDictationText(text))
+            appendDirectDictationToComposer(text, "not_sent", groupId);
+          return;
+        }
+        const result = await withBrowserPendingDispatch(getVoiceSession(), text, () =>
+          requestPromptRefine(text, triggerKind || "prompt_refine"),
+        );
+        if (result !== "accepted") {
+          appendDirectDictationToComposer(
+            text,
+            result === "not_dispatched" ? "not_sent" : "unconfirmed",
+            groupId,
+          );
+        }
         return;
       }
       if (dispatchTarget === "instruction") {
-        if (!isMeaningfulVoiceDispatchText(text)) return;
-        await sendInstructionTranscript(text, { triggerKind });
+        if (!isMeaningfulVoiceDispatchText(text)) {
+          if (isVoiceDictationText(text))
+            appendDirectDictationToComposer(text, "not_sent", groupId);
+          return;
+        }
+        const sent = await withBrowserPendingDispatch(getVoiceSession(), text, () =>
+          sendInstructionTranscript(text, { triggerKind }),
+        );
+        if (!sent) appendDirectDictationToComposer(text, "unconfirmed", groupId);
         return;
       }
-      await appendTranscriptSegment(text, {
-        flush: true,
-        triggerKind,
-        source: "browser_asr",
-        inputDeviceLabel: BROWSER_DEFAULT_MIC_LABEL,
-        documentPath,
-      });
+      const saved = await withBrowserPendingDispatch(getVoiceSession(), text, () =>
+        appendTranscriptSegment(text, {
+          flush: true,
+          triggerKind,
+          source: "browser_asr",
+          inputDeviceLabel: BROWSER_DEFAULT_MIC_LABEL,
+          documentPath,
+        }),
+      );
+      if (!saved && text.trim()) appendDirectDictationToComposer(text, "unconfirmed", groupId);
       finalizeLiveTranscriptPreview();
     },
     [
@@ -2535,18 +3206,18 @@ export function VoiceSecretaryComposerControl({
       finalizeLiveTranscriptPreview,
       requestPromptRefine,
       recordingTargetDocumentPath,
+      recordingTargetGroupId,
       sendInstructionTranscript,
       takeBrowserFinalTranscriptBuffer,
+      getVoiceSession,
     ],
   );
 
   const scheduleTranscriptMaxFlush = useCallback(
     (triggerKind: string) => {
       if (
-        voiceRecordingDispatchTarget(
-          voiceRecordingSessionScopeRef.current,
-          captureDispatchTarget,
-        ) !== "document"
+        voiceRecordingDispatchTarget(getVoiceSession()?.scope || null, captureDispatchTarget) !==
+        "document"
       )
         return;
       if (autoDocumentMaxWindowMs === null) return;
@@ -2557,24 +3228,23 @@ export function VoiceSecretaryComposerControl({
         void flushBrowserTranscriptWindow(triggerKind, { documentPath });
       }, autoDocumentMaxWindowMs);
     },
-    [autoDocumentMaxWindowMs, captureDispatchTarget, flushBrowserTranscriptWindow],
+    [autoDocumentMaxWindowMs, captureDispatchTarget, flushBrowserTranscriptWindow, getVoiceSession],
   );
 
   const queueBrowserFinalTranscript = useCallback(
     (text: string) => {
       const clean = normalizeBrowserTranscriptChunk(text);
       if (!clean) return;
-      if (!browserFinalTranscriptBufferRef.current && isLowValueBrowserSpeechFragment(clean))
-        return;
+      const session = getVoiceSession();
+      if (!session) return;
       browserSpeechRecoveryRef.current.reset();
       browserSpeechReceivedFinalRef.current = true;
       browserSpeechHadErrorRef.current = false;
       setSpeechError("");
-      const merged = mergeTranscriptChunks(browserFinalTranscriptBufferRef.current, clean);
-      browserFinalTranscriptBufferRef.current = merged;
+      session.browserFinalText = joinTranscriptSegments([session.browserFinalText, clean]);
       scheduleTranscriptMaxFlush("max_window");
     },
-    [scheduleTranscriptMaxFlush],
+    [scheduleTranscriptMaxFlush, getVoiceSession],
   );
 
   const cleanupServiceAudio = useCallback(
@@ -2583,10 +3253,16 @@ export function VoiceSecretaryComposerControl({
       stopReason?: { code: string; detail?: string; backend?: string; groupId?: string },
     ) => {
       if (runId && !isActiveRecordingRun(runId)) return;
+      const service = getVoiceSession()?.service;
+      if (service?.connectStopTimer !== null && service?.connectStopTimer !== undefined) {
+        window.clearTimeout(service.connectStopTimer);
+        service.connectStopTimer = null;
+      }
       if (stopReason?.code) {
+        if (runId) recoverServiceTranscript(runId, "interrupted");
         reportRecordingStopReason(stopReason.code, {
           detail: stopReason.detail,
-          backend: stopReason.backend || "assistant_service_local_asr",
+          backend: stopReason.backend || serviceAsrBackendRef.current,
           groupId: stopReason.groupId,
           runId,
         });
@@ -2602,48 +3278,13 @@ export function VoiceSecretaryComposerControl({
           // ignore websocket cleanup failure
         }
       }
-      const processor = serviceAudioProcessorRef.current;
-      serviceAudioProcessorRef.current = null;
-      if (processor) {
-        processor.onaudioprocess = null;
-        try {
-          processor.disconnect();
-        } catch {
-          // ignore audio processor cleanup failure
-        }
-      }
-      const source = serviceAudioSourceRef.current;
-      serviceAudioSourceRef.current = null;
-      if (source) {
-        try {
-          source.disconnect();
-        } catch {
-          // ignore audio source cleanup failure
-        }
-      }
-      const audioContext = serviceAudioContextRef.current;
-      serviceAudioContextRef.current = null;
-      if (audioContext && audioContext.state !== "closed") {
-        audioContext.onstatechange = null;
-        void audioContext.close().catch(() => undefined);
-      }
-      const recorder = mediaRecorderRef.current;
-      mediaRecorderRef.current = null;
-      if (recorder) {
-        recorder.ondataavailable = null;
-        recorder.onerror = null;
-        recorder.onstop = null;
-      }
+      const capture = servicePcmCaptureRef.current;
+      servicePcmCaptureRef.current = null;
+      capture?.close();
       clearBrowserSpeechMediaHandlers();
       resetVoiceAudioLevel();
       stopMediaStream(mediaStreamRef.current);
       mediaStreamRef.current = null;
-      mediaChunksRef.current = [];
-      serviceFinalTranscriptRef.current = "";
-      serviceLatestPartialTranscriptRef.current = "";
-      serviceCommittedTranscriptRef.current = "";
-      serviceDocumentCommittedTranscriptRef.current = "";
-      serviceFinalAsrTextRef.current = "";
       serviceAudioPendingPcmRef.current = [];
       serviceAudioResamplerRef.current = null;
       serviceAudioDurationMsRef.current = 0;
@@ -2654,9 +3295,8 @@ export function VoiceSecretaryComposerControl({
       clearServicePartialCommitTimer();
       clearServiceDocumentCheckpointTimer();
       releaseVoiceRecordingGuards();
-      recordingRef.current = false;
-      setRecording(false);
-      endRecordingRun(runId);
+      const activeRunId = runId || getVoiceSession()?.id;
+      if (activeRunId) endRecordingRun(activeRunId);
     },
     [
       clearBrowserSpeechMediaHandlers,
@@ -2664,9 +3304,11 @@ export function VoiceSecretaryComposerControl({
       clearServicePartialCommitTimer,
       endRecordingRun,
       isActiveRecordingRun,
+      recoverServiceTranscript,
       releaseVoiceRecordingGuards,
       reportRecordingStopReason,
       resetVoiceAudioLevel,
+      getVoiceSession,
     ],
   );
 
@@ -2677,130 +3319,243 @@ export function VoiceSecretaryComposerControl({
     mediaStreamRef.current = null;
   }, [clearBrowserSpeechMediaHandlers, resetVoiceAudioLevel]);
 
+  const stopWaitingForServiceFinal = useCallback(
+    (expectedRunId: number) => {
+      const run = getVoiceSession();
+      if (
+        !run ||
+        run.id !== expectedRunId ||
+        run.phase !== "finishing" ||
+        !run.service.awaitingFinal ||
+        run.scope.dispatchTarget === "document"
+      )
+        return;
+      const saved = recoverServiceTranscript(run.id, "partial");
+      if (!saved) {
+        showNotice({
+          message: t("voiceSecretaryStoppedWaitingWithoutText", {
+            defaultValue:
+              "Stopped waiting. There was no recognized text to keep from this recording.",
+          }),
+        });
+      }
+      cleanupServiceAudio(run.id);
+    },
+    [cleanupServiceAudio, getVoiceSession, recoverServiceTranscript, showNotice, t],
+  );
+
   const finalizeBrowserRecordingRun = useCallback(
     async (runId: number, triggerKind: string) => {
       if (!isActiveRecordingRun(runId) || browserSpeechFinalizingRunIdRef.current === runId) return;
       browserSpeechFinalizingRunIdRef.current = runId;
       try {
-        await flushBrowserTranscriptWindow(triggerKind);
+        const session = getVoiceSession();
+        const dispatchTarget = session?.scope.dispatchTarget;
+        const interim = session?.browserInterimText || "";
+        if (triggerKind !== "push_to_talk_stop" && dispatchTarget !== "document") {
+          const text = joinTranscriptSegments([takeBrowserFinalTranscriptBuffer(), interim]);
+          if (isVoiceDictationText(text)) appendDirectDictationToComposer(text, "interrupted");
+        } else if (isVoiceDictationText(interim) && dispatchTarget !== "document") {
+          const text = joinTranscriptSegments([takeBrowserFinalTranscriptBuffer(), interim]);
+          appendDirectDictationToComposer(text, "partial");
+        } else {
+          await flushBrowserTranscriptWindow(triggerKind);
+          if (isVoiceDictationText(interim) && dispatchTarget === "document") {
+            appendDirectDictationToComposer(interim, "partial");
+          }
+        }
       } finally {
         if (isActiveRecordingRun(runId)) {
           releaseVoiceRecordingGuards();
-          recordingRef.current = false;
-          setRecording(false);
           endRecordingRun(runId);
         }
       }
     },
     [
       endRecordingRun,
+      appendDirectDictationToComposer,
       flushBrowserTranscriptWindow,
       isActiveRecordingRun,
       releaseVoiceRecordingGuards,
+      takeBrowserFinalTranscriptBuffer,
+      getVoiceSession,
     ],
   );
 
   const stopBrowserSpeech = useCallback(() => {
-    const stopRunId = recordingRunIdRef.current;
-    recordingStoppingRef.current = true;
-    setRecordingStartingFlag(false);
+    const stopRunId = getVoiceSession()?.id || 0;
+    if (!markFinishing(stopRunId)) return;
     browserSpeechStopRequestedRef.current = true;
     browserSpeechRecoveryRef.current.reset();
     clearBrowserSpeechRestartTimer();
     clearBrowserSpeechStopFinalizeTimer();
-    if (voiceCaptureStopAction().releaseLocalMicrophoneNow) {
-      releaseLocalMicrophoneCapture();
-    }
-    const finalizeStoppedSpeech = (recognition: BrowserSpeechRecognition | null) => {
+    releaseLocalMicrophoneCapture();
+    const finalizeStoppedSpeech = (
+      recognition: BrowserSpeechRecognition | null,
+      interrupted = false,
+    ) => {
       if (stopRunId && !isActiveRecordingRun(stopRunId)) return;
       if (recognition && recognitionRef.current === recognition) recognitionRef.current = null;
       abortBrowserSpeechRecognition(recognition);
       releaseLocalMicrophoneCapture();
-      setRecording(false);
-      if (stopRunId) void finalizeBrowserRecordingRun(stopRunId, "push_to_talk_stop");
+      if (interrupted) {
+        const message = t("voiceSecretaryBrowserStopUnconfirmed", {
+          defaultValue:
+            "The browser did not confirm that speech recognition finished; the result may be incomplete.",
+        });
+        if (isCurrentGroup(getVoiceSession()?.scope.groupId || "")) {
+          setSpeechError(message);
+          showError(message);
+        }
+      }
+      if (stopRunId)
+        void finalizeBrowserRecordingRun(
+          stopRunId,
+          interrupted ? "meeting_window" : "push_to_talk_stop",
+        );
     };
     const recognition = recognitionRef.current;
-    setRecording(false);
     if (!recognition) {
+      // Between recognition cycles the previous cycle has already ended. The
+      // normal finish path still preserves any unfinished hypothesis for review.
       finalizeStoppedSpeech(null);
       return;
     }
     browserSpeechStopFinalizeTimerRef.current = window.setTimeout(() => {
       browserSpeechStopFinalizeTimerRef.current = null;
-      finalizeStoppedSpeech(recognition);
+      finalizeStoppedSpeech(recognition, true);
     }, 2000);
     try {
       // stop() lets the browser emit any final result before onend performs the stop flush.
       recognition.stop();
     } catch {
       clearBrowserSpeechStopFinalizeTimer();
-      finalizeStoppedSpeech(recognition);
+      finalizeStoppedSpeech(recognition, true);
     }
   }, [
     clearBrowserSpeechRestartTimer,
     clearBrowserSpeechStopFinalizeTimer,
     finalizeBrowserRecordingRun,
     isActiveRecordingRun,
+    isCurrentGroup,
     releaseLocalMicrophoneCapture,
-    setRecordingStartingFlag,
+    markFinishing,
+    showError,
+    t,
+    getVoiceSession,
   ]);
-  const stopServiceAudio = useCallback(() => {
-    const stopRunId = recordingRunIdRef.current;
-    recordingStoppingRef.current = true;
-    setRecordingStartingFlag(false);
-    const ws = serviceAudioWsRef.current;
-    const processor = serviceAudioProcessorRef.current;
-    if (processor) processor.onaudioprocess = null;
-    clearServiceDocumentCheckpointTimer();
-    if (voiceCaptureStopAction().releaseLocalMicrophoneNow) {
-      releaseLocalMicrophoneCapture();
-    }
-    setRecording(false);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        voicePcmTransport.drainVoicePcmQueue(ws, serviceAudioPendingPcmRef.current);
-        serviceAudioSeqRef.current += 1;
-        ws.send(
-          JSON.stringify({
-            type: "stop",
-            seq: serviceAudioSeqRef.current,
-            skip_final_document_apply:
-              voiceRecordingCaptureMode(voiceRecordingSessionScopeRef.current, captureMode) ===
-                "document" &&
-              Boolean(
-                normalizeBrowserTranscriptChunk(serviceDocumentCommittedTranscriptRef.current),
-              ),
-          }),
+  const failServiceConnection = useCallback(
+    (runId: number) => {
+      const run = getVoiceSession();
+      if (!run || run.id !== runId) return;
+      const message = t("voiceSecretaryRecordingConnectionFailed", {
+        defaultValue:
+          "Could not complete the speech-recognition connection; this recording may not have been fully transcribed.",
+      });
+      if (isCurrentGroup(run.scope.groupId)) {
+        setSpeechError(message);
+        showError(message);
+      }
+      cleanupServiceAudio(runId, {
+        code: "local_asr_ws_error",
+        detail: message,
+        groupId: run.scope.groupId,
+      });
+    },
+    [cleanupServiceAudio, isCurrentGroup, showError, t, getVoiceSession],
+  );
+
+  const sendServiceStopFrame = useCallback(
+    (ws: WebSocket, runId: number) => {
+      const run = getVoiceSession();
+      if (!run || run.id !== runId || ws.readyState !== WebSocket.OPEN) return false;
+      if (run.service.connectStopTimer !== null) {
+        window.clearTimeout(run.service.connectStopTimer);
+        run.service.connectStopTimer = null;
+      }
+      voicePcmTransport.drainVoicePcmQueue(ws, serviceAudioPendingPcmRef.current);
+      serviceAudioSeqRef.current += 1;
+      ws.send(JSON.stringify({ type: "stop", seq: serviceAudioSeqRef.current }));
+      run.service.stopRequested = false;
+      markAwaitingFinal(runId, true);
+      return true;
+    },
+    [getVoiceSession, markAwaitingFinal],
+  );
+
+  const finishServiceStop = useCallback(
+    (stopRunId: number) => {
+      const run = getVoiceSession();
+      if (
+        !run ||
+        run.id !== stopRunId ||
+        !run.service.stopRequested ||
+        run.service.awaitingPcmFlush
+      )
+        return;
+      const ws = serviceAudioWsRef.current;
+      if (
+        ws?.readyState === WebSocket.CONNECTING ||
+        (ws?.readyState === WebSocket.OPEN && !run.service.socketStarted)
+      ) {
+        run.service.connectStopTimer = window.setTimeout(
+          () => failServiceConnection(stopRunId),
+          10000,
         );
         return;
-      } catch {
-        // fall through to local cleanup
       }
-    }
-    const recorder = mediaRecorderRef.current;
-    if (!recorder) {
-      cleanupServiceAudio(stopRunId || undefined);
-      return;
-    }
-    try {
-      if (recorder.state !== "inactive") {
-        recorder.stop();
-        return;
+      if (ws?.readyState === WebSocket.OPEN) {
+        try {
+          if (sendServiceStopFrame(ws, stopRunId)) return;
+        } catch {
+          // The socket closed before the buffered audio could be sent.
+        }
       }
-    } catch {
-      // fall through to cleanup
-    }
-    cleanupServiceAudio(stopRunId || undefined);
+      failServiceConnection(stopRunId);
+    },
+    [failServiceConnection, getVoiceSession, sendServiceStopFrame],
+  );
+
+  const stopServiceAudio = useCallback(() => {
+    const stopRunId = getVoiceSession()?.id || 0;
+    if (!markFinishing(stopRunId)) return;
+    const run = getVoiceSession();
+    if (!run || run.id !== stopRunId) return;
+    run.service.stopRequested = true;
+    run.service.awaitingPcmFlush = true;
+    clearServiceDocumentCheckpointTimer();
+    releaseLocalMicrophoneCapture();
+    const capture = servicePcmCaptureRef.current;
+    void (capture ? capture.flush() : Promise.resolve(false)).then((complete) => {
+      const current = getVoiceSession();
+      if (!current || current.id !== stopRunId) return;
+      current.service.awaitingPcmFlush = false;
+      if (!complete) {
+        current.service.interrupted = true;
+        const message = t("voiceSecretaryAudioFlushUnconfirmed", {
+          defaultValue:
+            "Audio processing did not confirm the last buffered samples; the result may be incomplete.",
+        });
+        if (isCurrentGroup(current.scope.groupId)) {
+          setSpeechError(message);
+          showError(message);
+        }
+      }
+      finishServiceStop(stopRunId);
+    });
   }, [
-    captureMode,
-    cleanupServiceAudio,
     clearServiceDocumentCheckpointTimer,
+    finishServiceStop,
+    getVoiceSession,
+    isCurrentGroup,
+    markFinishing,
     releaseLocalMicrophoneCapture,
-    setRecordingStartingFlag,
+    showError,
+    t,
   ]);
 
   const stopCurrentRecording = useCallback(() => {
-    if (mediaRecorderRef.current || serviceAudioWsRef.current) {
+    if (serviceAudioWsRef.current) {
       stopServiceAudio();
       return;
     }
@@ -2829,6 +3584,7 @@ export function VoiceSecretaryComposerControl({
   // Keep the parent in the modal stack while its settings are open. Its trigger
   // stays mounted, so the existing stack can restore focus on the way back.
   const { modalRef } = useModalA11y(open, closePanel, { preserveTerminalKeys: true });
+  useChatObscuringView(open && !settingsOpen);
   const previousSettingsOpenRef = useRef(settingsOpen);
   useEffect(() => {
     const closed = previousSettingsOpenRef.current && !settingsOpen;
@@ -2879,6 +3635,47 @@ export function VoiceSecretaryComposerControl({
 
   useEffect(() => {
     unmountCleanupRef.current = () => {
+      const source = pendingPromptVoiceSourceRef.current;
+      if (source && !source.restored) {
+        const routed = routeVoiceTextToComposerGroup({
+          groupId: source.groupId,
+          text: source.text,
+          mode: "append",
+        });
+        if (routed !== "ignored") source.restored = true;
+      }
+      const run = getVoiceSession();
+      const browser = run?.config.recognition_backend === "browser_asr";
+      const pendingServiceDocument = Boolean(
+        run &&
+        !browser &&
+        run.scope.dispatchTarget === "document" &&
+        run.service.documentCheckpointTail,
+      );
+      if (
+        run &&
+        (run.scope.dispatchTarget !== "document" || browser || pendingServiceDocument) &&
+        !run.service.recovered &&
+        source?.runId !== run.id
+      ) {
+        // Once this component is gone a late callback must not write into another
+        // page or identity. Preserve already recognized text synchronously first.
+        const text = browser
+          ? joinTranscriptSegments([
+              ...Array.from(run.browserPendingDispatches, (item) => item.text),
+              run.browserFinalText,
+              run.browserInterimText,
+            ])
+          : pendingServiceDocument
+            ? nextUncommittedServiceTranscriptText(
+                serviceTranscriptForRecovery(run),
+                run.service.documentHandled,
+              )
+            : serviceTranscriptForRecovery(run);
+        if (text.trim()) {
+          routeVoiceTextToComposerGroup({ groupId: run.scope.groupId, text, mode: "append" });
+        }
+      }
       invalidateWorkspaceRefresh();
       const recognition = recognitionRef.current;
       recognitionRef.current = null;
@@ -2893,7 +3690,6 @@ export function VoiceSecretaryComposerControl({
       clearServiceDocumentCheckpointTimer();
       cleanupServiceAudio();
       releaseVoiceRecordingGuards();
-      voiceRecordingSessionScopeRef.current = null;
     };
   }, [
     cleanupServiceAudio,
@@ -2903,13 +3699,14 @@ export function VoiceSecretaryComposerControl({
     clearServicePartialCommitTimer,
     clearTranscriptFlushTimer,
     clearTranscriptMaxFlushTimer,
+    getVoiceSession,
     invalidateWorkspaceRefresh,
     releaseVoiceRecordingGuards,
   ]);
   useEffect(() => () => unmountCleanupRef.current(), []);
 
   const startBrowserSpeech = useCallback(
-    async (runId: number, latestAssistant: BuiltinAssistant | null, composerSnapshot: string) => {
+    async (runId: number, latestAssistant: BuiltinAssistant | null) => {
       const gid = String(selectedGroupId || "").trim();
       const browserBackendSelected = latestAssistant?.config?.recognition_backend === "browser_asr";
       const browserRecognitionLanguage = getRecordingRecognitionLanguage();
@@ -2953,7 +3750,11 @@ export function VoiceSecretaryComposerControl({
         return;
       }
       const activeLock = await claimVoiceCaptureLock(voiceCaptureOwnerIdRef.current, gid);
-      if (!isActiveRecordingRun(runId)) return;
+      if (!isActiveRecordingRun(runId)) {
+        if (!activeLock && !getVoiceSession())
+          releaseVoiceCaptureLock(voiceCaptureOwnerIdRef.current);
+        return;
+      }
       if (activeLock) {
         failStart();
         showError(
@@ -2966,7 +3767,7 @@ export function VoiceSecretaryComposerControl({
         return;
       }
       try {
-        const activeLease = await acquireDaemonVoiceRecordingLease(gid, {
+        const activeLease = await acquireDaemonVoiceRecordingLease(runId, gid, {
           captureMode: captureTransportMode,
           recognitionBackend: "browser_asr",
           dispatchTarget: captureDispatchTarget,
@@ -2985,6 +3786,7 @@ export function VoiceSecretaryComposerControl({
           return;
         }
       } catch (error) {
+        if (!isActiveRecordingRun(runId)) return;
         failStart();
         releaseVoiceRecordingGuards(gid);
         const message = error instanceof Error ? error.message : String(error || "");
@@ -3015,6 +3817,7 @@ export function VoiceSecretaryComposerControl({
       try {
         stream = await getUserMediaWithTimeout({ audio: true });
       } catch (error) {
+        if (!isActiveRecordingRun(runId)) return;
         failStart();
         releaseVoiceRecordingGuards(gid);
         const { message } = getAudioCaptureErrorMessage(error);
@@ -3043,19 +3846,7 @@ export function VoiceSecretaryComposerControl({
       // stream can destabilize Edge/Chromium Web Speech capture.
       stopMediaStream(stream);
       mediaStreamRef.current = null;
-      voiceRecordingSessionScopeRef.current = createVoiceRecordingSessionScope({
-        runId,
-        sessionId: voiceRecordingSessionIdRef.current,
-        groupId: gid,
-        documentPath: effectiveCaptureTargetDocumentPath,
-        captureMode,
-        dispatchTarget: captureDispatchTarget,
-        composerText: composerSnapshot,
-        composerContext,
-      });
-      recordingRef.current = true;
-      setRecording(true);
-      finishRecordingStart(runId);
+      markRecording(runId);
       setSpeechError("");
       refreshVoiceCaptureLock(voiceCaptureOwnerIdRef.current, gid);
       void loadAudioDevices();
@@ -3067,7 +3858,7 @@ export function VoiceSecretaryComposerControl({
         showToast = true,
       ) => {
         if (!isActiveRecordingRun(runId)) return;
-        recordingStoppingRef.current = true;
+        markFinishing(runId);
         browserSpeechHadErrorRef.current = true;
         browserSpeechStopRequestedRef.current = true;
         setBrowserSpeechRecoveryCode("");
@@ -3085,7 +3876,6 @@ export function VoiceSecretaryComposerControl({
         abortBrowserSpeechRecognition(recognition);
         stopMediaStream(mediaStreamRef.current);
         mediaStreamRef.current = null;
-        setRecording(false);
         void finalizeBrowserRecordingRun(runId, "meeting_window");
         setSpeechError(message);
         if (showToast) showError(message);
@@ -3104,7 +3894,7 @@ export function VoiceSecretaryComposerControl({
           if (recognitionRef.current !== recognition) return;
           recognitionRef.current = null;
           abortBrowserSpeechRecognition(recognition);
-          setRecording(true);
+          markRecording(runId);
           startRecognitionCycle();
         }, fallbackMs);
       };
@@ -3120,7 +3910,6 @@ export function VoiceSecretaryComposerControl({
             mediaStreamRef.current = null;
             releaseVoiceRecordingGuards();
             endRecordingRun(runId);
-            setRecording(false);
             if (!browserSpeechStopRequestedRef.current)
               void flushBrowserTranscriptWindow("meeting_window");
             return;
@@ -3129,6 +3918,7 @@ export function VoiceSecretaryComposerControl({
           browserSpeechRecoveryRef.current.beginCycle();
           const cycleStartedAt = performance.now();
           const recognition = new SpeechRecognitionCtor();
+          const finalizedResultIndexes = new Set<number>();
           recognition.continuous = true;
           recognition.interimResults = true;
           recognition.lang = browserRecognitionLanguage;
@@ -3139,7 +3929,7 @@ export function VoiceSecretaryComposerControl({
           };
           recognition.onresult = (event) => {
             if (!isActiveRecordingRun(runId)) return;
-            let finalText = "";
+            const finalTexts: string[] = [];
             let interimText = "";
             for (
               let resultIndex = event.resultIndex;
@@ -3151,11 +3941,20 @@ export function VoiceSecretaryComposerControl({
               for (let altIndex = 0; altIndex < result.length; altIndex += 1) {
                 text += result[altIndex]?.transcript || "";
               }
-              if (result.isFinal) finalText += text;
-              else interimText += text;
+              if (result.isFinal) {
+                if (!finalizedResultIndexes.has(resultIndex)) {
+                  finalizedResultIndexes.add(resultIndex);
+                  finalTexts.push(text);
+                }
+              } else {
+                interimText += text;
+              }
             }
+            const finalText = joinTranscriptSegments(finalTexts);
             const hasFinalText = Boolean(finalText.trim());
             const cleanInterimText = interimText.replace(/\s+/g, " ").trim();
+            const session = getVoiceSession();
+            if (session?.id === runId) session.browserInterimText = cleanInterimText;
             if (hasFinalText || cleanInterimText) {
               browserSpeechHadErrorRef.current = false;
               browserSpeechRecoveryRef.current.recordResult();
@@ -3165,7 +3964,7 @@ export function VoiceSecretaryComposerControl({
               updateLiveTranscriptPreview(cleanInterimText, "interim");
             }
             if (hasFinalText) {
-              queueBrowserFinalTranscript(finalText);
+              for (const item of finalTexts) queueBrowserFinalTranscript(item);
               updateLiveTranscriptPreview(finalText, "final");
             }
           };
@@ -3281,34 +4080,47 @@ export function VoiceSecretaryComposerControl({
             }
             if (recognitionRef.current === recognition) recognitionRef.current = null;
             if (shouldRestart) {
-              setRecording(true);
+              markRecording(runId);
               startRecognitionCycle(restartDelay);
               return;
             }
             clearBrowserSpeechMediaHandlers();
             stopMediaStream(mediaStreamRef.current);
             mediaStreamRef.current = null;
-            recordingStoppingRef.current = true;
-            setRecording(false);
+            markFinishing(runId);
+            const hadInterimTranscript = isVoiceDictationText(
+              getVoiceSession()?.browserInterimText || "",
+            );
             void finalizeBrowserRecordingRun(
               runId,
               stoppedByUser ? "push_to_talk_stop" : "meeting_window",
             );
-            if (!browserSpeechReceivedFinalRef.current && !browserSpeechHadErrorRef.current) {
-              setSpeechError(
-                t("voiceSecretaryBrowserAsrEndedWithoutTranscript", {
-                  defaultValue:
-                    "Browser ASR stopped without returning transcript. Check the microphone connection, site permission, and system input device, then try again.",
-                }),
-              );
+            if (
+              !browserSpeechReceivedFinalRef.current &&
+              !browserSpeechHadErrorRef.current &&
+              !hadInterimTranscript
+            ) {
+              if (stoppedByUser) {
+                showNotice({
+                  message: t("voiceSecretaryRecognitionEmpty", {
+                    defaultValue: "No text was recognized.",
+                  }),
+                });
+              } else {
+                setSpeechError(
+                  t("voiceSecretaryBrowserAsrEndedWithoutTranscript", {
+                    defaultValue:
+                      "Browser ASR stopped without returning transcript. Check the microphone connection, site permission, and system input device, then try again.",
+                  }),
+                );
+              }
             }
           };
 
           try {
             if (!isActiveRecordingRun(runId)) return;
             recognitionRef.current = recognition;
-            setRecording(true);
-            finishRecordingStart(runId);
+            if (!markRecording(runId)) return;
             refreshVoiceCaptureLock(voiceCaptureOwnerIdRef.current, gid);
             browserSpeechHadErrorRef.current = false;
             recognition.start();
@@ -3358,21 +4170,20 @@ export function VoiceSecretaryComposerControl({
       acquireDaemonVoiceRecordingLease,
       captureDispatchTarget,
       captureTransportMode,
-      captureMode,
-      composerContext,
       clearBrowserSpeechMediaHandlers,
       clearBrowserSpeechRestartTimer,
       clearBrowserSpeechStopFinalizeTimer,
       clearTranscriptFlushTimer,
       endRecordingRun,
-      effectiveCaptureTargetDocumentPath,
-      finishRecordingStart,
+      markFinishing,
+      markRecording,
       finalizeBrowserRecordingRun,
       flushBrowserTranscriptWindow,
       getAudioCaptureErrorMessage,
       getAudioSupportIssueMessage,
       getBrowserSpeechIssueMessage,
       getRecordingRecognitionLanguage,
+      getVoiceSession,
       isActiveRecordingRun,
       loadAudioDevices,
       queueBrowserFinalTranscript,
@@ -3380,6 +4191,7 @@ export function VoiceSecretaryComposerControl({
       reportRecordingStopReason,
       selectedGroupId,
       showError,
+      showNotice,
       t,
       updateLiveTranscriptPreview,
       resetVoiceAudioLevel,
@@ -3387,22 +4199,20 @@ export function VoiceSecretaryComposerControl({
   );
 
   const handleServiceStreamingFinal = useCallback(
-    async (text: string) => {
+    async (text: string, segmentId = "") => {
       const clean = normalizeBrowserTranscriptChunk(text);
       if (!clean) return;
+      const service = getVoiceSession()?.service;
+      if (!service) return;
+      if (segmentId && service.seenSegmentIds.has(segmentId)) return;
+      if (segmentId) service.seenSegmentIds.add(segmentId);
       clearServicePartialCommitTimer();
-      const committed = normalizeBrowserTranscriptChunk(serviceCommittedTranscriptRef.current);
-      if (committed && (committed === clean || committed.endsWith(clean))) {
-        serviceFinalTranscriptRef.current = committed;
-        finalizeLiveTranscriptPreview();
-        return;
-      }
-      const newText =
-        committed && clean.startsWith(committed) ? clean.slice(committed.length).trim() : clean;
-      serviceFinalTranscriptRef.current = mergeTranscriptChunks(
-        serviceFinalTranscriptRef.current,
-        clean,
-      );
+      // Each streaming final is a segment. Equal text in distinct segments is
+      // still speech; only a repeated, explicitly identified segment is ignored.
+      const newText = clean;
+      service.committed = joinTranscriptSegments([service.committed, newText]);
+      service.finalText = service.committed;
+      service.latestPartial = "";
       if (captureDispatchTarget === "composer" || captureDispatchTarget === "prompt") {
         updateLiveTranscriptPreview(newText || clean, "final");
       } else if (captureDispatchTarget === "instruction") {
@@ -3414,7 +4224,6 @@ export function VoiceSecretaryComposerControl({
         finalizeLiveTranscriptPreview();
         serviceCommittedEndMsRef.current = endMs;
       }
-      serviceCommittedTranscriptRef.current = mergeTranscriptChunks(committed, newText);
       scheduleServiceDocumentCheckpoint();
     },
     [
@@ -3423,26 +4232,26 @@ export function VoiceSecretaryComposerControl({
       finalizeLiveTranscriptPreview,
       scheduleServiceDocumentCheckpoint,
       updateLiveTranscriptPreview,
+      getVoiceSession,
     ],
   );
 
   const commitServiceLatestPartialTranscript = useCallback(async () => {
     if (captureDispatchTarget !== "document") return;
-    const committed = normalizeBrowserTranscriptChunk(serviceCommittedTranscriptRef.current);
-    const newText = nextUncommittedServiceTranscriptText(
-      serviceLatestPartialTranscriptRef.current,
-      committed,
-    );
+    const service = getVoiceSession()?.service;
+    if (!service) return;
+    const committed = normalizeBrowserTranscriptChunk(service.committed);
+    const newText = nextUncommittedServiceTranscriptText(service.latestPartial, committed);
     if (!newText) return;
     const startMs = serviceCommittedEndMsRef.current;
     const endMs = Math.max(startMs, serviceAudioDurationMsRef.current);
     updateLiveTranscriptPreview(newText, "final", { startMs, endMs });
-    serviceCommittedTranscriptRef.current = mergeTranscriptChunks(committed, newText);
+    service.committed = mergeTranscriptChunks(committed, newText);
     serviceCommittedEndMsRef.current = endMs;
-  }, [captureDispatchTarget, updateLiveTranscriptPreview]);
+  }, [captureDispatchTarget, updateLiveTranscriptPreview, getVoiceSession]);
 
   const startServiceAudio = useCallback(
-    async (runId: number, latestAssistant: BuiltinAssistant | null, composerSnapshot: string) => {
+    async (runId: number, latestAssistant: BuiltinAssistant | null) => {
       const gid = String(selectedGroupId || "").trim();
       const failStart = () => endRecordingRun(runId);
       const latestReadiness = resolveVoiceServiceReadiness({ assistant: latestAssistant });
@@ -3465,7 +4274,7 @@ export function VoiceSecretaryComposerControl({
               : "voiceSecretaryLocalAsrModelsNotReady",
             {
               defaultValue:
-                "The local ASR models are not ready. Install or repair Local ASR in Settings > Voice > Voice Secretary, or switch to Browser ASR.",
+                "The local ASR models are not ready. Install or repair Local ASR in Settings > This instance > Voice > Voice Secretary, or switch to Browser ASR.",
             },
           ),
         );
@@ -3481,7 +4290,11 @@ export function VoiceSecretaryComposerControl({
         return;
       }
       const activeLock = await claimVoiceCaptureLock(voiceCaptureOwnerIdRef.current, gid);
-      if (!isActiveRecordingRun(runId)) return;
+      if (!isActiveRecordingRun(runId)) {
+        if (!activeLock && !getVoiceSession())
+          releaseVoiceCaptureLock(voiceCaptureOwnerIdRef.current);
+        return;
+      }
       if (activeLock) {
         failStart();
         showError(
@@ -3494,7 +4307,7 @@ export function VoiceSecretaryComposerControl({
         return;
       }
       try {
-        const activeLease = await acquireDaemonVoiceRecordingLease(gid, {
+        const activeLease = await acquireDaemonVoiceRecordingLease(runId, gid, {
           captureMode: captureTransportMode,
           recognitionBackend: latestReadiness.recognitionBackend,
           dispatchTarget: captureDispatchTarget,
@@ -3513,6 +4326,7 @@ export function VoiceSecretaryComposerControl({
           return;
         }
       } catch (error) {
+        if (!isActiveRecordingRun(runId)) return;
         failStart();
         releaseVoiceRecordingGuards(gid);
         const message = error instanceof Error ? error.message : String(error || "");
@@ -3526,7 +4340,98 @@ export function VoiceSecretaryComposerControl({
       }
       serviceAsrBackendRef.current = latestReadiness.recognitionBackend;
       let pendingStream: MediaStream | null = null;
+      let pendingCapture: VoicePcmCapture | null = null;
       try {
+        // Load the processor before requesting the microphone, so loading the
+        // module cannot consume speech before the capture graph is ready.
+        pendingCapture = await VoicePcmCapture.create({
+          onSamples: (input) => {
+            const run = getVoiceSession();
+            if (
+              !run ||
+              run.id !== runId ||
+              (run.phase !== "recording" &&
+                !(run.phase === "finishing" && run.service.awaitingPcmFlush))
+            )
+              return;
+            if (run.phase === "recording") observeVoiceInputSamples(runId, input);
+            updateVoiceAudioLevelsFromSamples(input);
+            const resampler = serviceAudioResamplerRef.current;
+            if (!resampler) return;
+            const pcm = resampler.push(input);
+            if (!pcm.byteLength) return;
+            try {
+              const { droppedBytes } = voicePcmTransport.queueVoicePcmFrame(
+                run.service.socketStarted ? serviceAudioWsRef.current : null,
+                serviceAudioPendingPcmRef.current,
+                pcm,
+              );
+              if (droppedBytes > 0) {
+                const message = t("voiceSecretaryAudioBackpressureFailed", {
+                  defaultValue: "Recording stopped because the audio stream could not keep up.",
+                });
+                if (isCurrentGroup(gid)) {
+                  setSpeechError(message);
+                  showError(message);
+                }
+                cleanupServiceAudio(runId, {
+                  code: "local_asr_pcm_backpressure",
+                  detail: `${droppedBytes} bytes dropped`,
+                  groupId: gid,
+                });
+                return;
+              }
+              serviceAudioDurationMsRef.current += Math.round((pcm.byteLength / 2 / 16000) * 1000);
+            } catch {
+              failServiceConnection(runId);
+            }
+          },
+          onError: () => {
+            if (!isActiveRecordingRun(runId)) return;
+            const message = t("voiceSecretaryAudioProcessingInterrupted", {
+              defaultValue: "Audio processing stopped; this recording may be incomplete.",
+            });
+            if (isCurrentGroup(gid)) {
+              setSpeechError(message);
+              showError(message);
+            }
+            cleanupServiceAudio(runId, {
+              code: "local_asr_audio_processing_error",
+              detail: message,
+              groupId: gid,
+            });
+          },
+          onContextState: (state) => {
+            const run = getVoiceSession();
+            if (
+              !run ||
+              run.id !== runId ||
+              run.phase !== "recording" ||
+              !state ||
+              state === "running"
+            )
+              return;
+            reportRecordingStopReason("audio_context_state", {
+              backend: latestReadiness.recognitionBackend,
+              groupId: gid,
+              runId,
+              detail: state,
+            });
+            run.service.interrupted = true;
+            const message = t("voiceSecretaryAudioProcessingInterrupted", {
+              defaultValue: "Audio processing stopped; this recording may be incomplete.",
+            });
+            if (isCurrentGroup(gid)) {
+              setSpeechError(message);
+              showError(message);
+            }
+            stopServiceAudio();
+          },
+        });
+        if (!isActiveRecordingRun(runId)) {
+          pendingCapture.close();
+          return;
+        }
         const audioConstraints: MediaTrackConstraints = {
           channelCount: { ideal: 1 },
           echoCancellation: { ideal: false },
@@ -3534,25 +4439,16 @@ export function VoiceSecretaryComposerControl({
           autoGainControl: { ideal: true },
           sampleRate: { ideal: 48000 },
         };
-        const inputDeviceId = capturedAudioPreferencesRef.current?.inputDeviceId || "";
+        const inputDeviceId = getVoiceSession()?.audioPreferences?.inputDeviceId || "";
         if (inputDeviceId) audioConstraints.deviceId = { exact: inputDeviceId };
         const constraints: MediaStreamConstraints = { audio: audioConstraints };
         const stream = await getUserMediaWithTimeout(constraints);
         pendingStream = stream;
         if (!isActiveRecordingRun(runId)) {
           stopMediaStream(stream);
+          pendingCapture.close();
           return;
         }
-        const AudioContextConstructor =
-          window.AudioContext ||
-          (window as typeof window & { webkitAudioContext?: typeof AudioContext })
-            .webkitAudioContext;
-        if (!AudioContextConstructor) {
-          throw new Error("AudioContext unavailable");
-        }
-        const audioContext = new AudioContextConstructor();
-        const source = audioContext.createMediaStreamSource(stream);
-        const processor = audioContext.createScriptProcessor(4096, 1, 1);
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const wsParams = new URLSearchParams({
           owner_id: voiceCaptureOwnerIdRef.current,
@@ -3564,113 +4460,71 @@ export function VoiceSecretaryComposerControl({
         const ws = new WebSocket(wsUrl);
         mediaStreamRef.current = stream;
         pendingStream = null;
-        serviceAudioContextRef.current = audioContext;
-        serviceAudioSourceRef.current = source;
-        serviceAudioProcessorRef.current = processor;
+        servicePcmCaptureRef.current = pendingCapture;
+        pendingCapture = null;
         serviceAudioWsRef.current = ws;
         browserSpeechMediaCleanupRef.current = attachMediaStreamDiagnostics(stream, {
-          backend: "assistant_service_local_asr",
+          backend: latestReadiness.recognitionBackend,
           groupId: gid,
           runId,
-        });
-        audioContext.onstatechange = () => {
-          if (!isActiveRecordingRun(runId)) return;
-          const state = String(audioContext.state || "").trim();
-          if (!state || state === "running") return;
-          reportRecordingStopReason("audio_context_state", {
-            backend: "assistant_service_local_asr",
-            groupId: gid,
-            runId,
-            detail: state,
-          });
-        };
-        voiceRecordingSessionScopeRef.current = createVoiceRecordingSessionScope({
-          runId,
-          sessionId: voiceRecordingSessionIdRef.current,
-          groupId: gid,
-          documentPath: effectiveCaptureTargetDocumentPath,
-          captureMode,
-          dispatchTarget: captureDispatchTarget,
-          composerText: composerSnapshot,
-          composerContext,
+          onEnded: () => {
+            const run = getVoiceSession();
+            if (!run || run.id !== runId || run.phase !== "recording") return;
+            run.service.interrupted = true;
+            stopServiceAudio();
+          },
         });
         setSpeechError("");
-        recordingRef.current = true;
-        setRecording(true);
-        finishRecordingStart(runId);
+        markRecording(runId);
         serviceAudioSeqRef.current = 0;
-        serviceFinalTranscriptRef.current = "";
-        serviceLatestPartialTranscriptRef.current = "";
-        serviceCommittedTranscriptRef.current = "";
-        serviceFinalAsrTextRef.current = "";
         serviceAudioPendingPcmRef.current = [];
-        serviceAudioResamplerRef.current = new Pcm16Resampler(audioContext.sampleRate);
+        serviceAudioResamplerRef.current = new Pcm16Resampler(
+          servicePcmCaptureRef.current.sampleRate,
+        );
         serviceAudioDurationMsRef.current = 0;
         serviceCommittedEndMsRef.current = 0;
         serviceDocumentCommittedEndMsRef.current = 0;
-        serviceDocumentCommittedTranscriptRef.current = "";
         serviceFinalSpeakerSegmentsRef.current = [];
         serviceProvisionalSpeakerSegmentsRef.current = [];
         clearServicePartialCommitTimer();
         clearServiceDocumentCheckpointTimer();
-        processor.onaudioprocess = (event) => {
-          const activeWs = serviceAudioWsRef.current;
-          if (!recordingRef.current || !isActiveRecordingRun(runId)) return;
-          const input = event.inputBuffer.getChannelData(0);
-          updateVoiceAudioLevelsFromSamples(input);
-          let resampler = serviceAudioResamplerRef.current;
-          if (!resampler) {
-            resampler = new Pcm16Resampler(audioContext.sampleRate);
-            serviceAudioResamplerRef.current = resampler;
-          }
-          const pcm = resampler.push(input);
-          if (!pcm.byteLength) return;
-          const { droppedBytes } = voicePcmTransport.queueVoicePcmFrame(
-            activeWs,
-            serviceAudioPendingPcmRef.current,
-            pcm,
-          );
-          if (droppedBytes > 0) {
-            const message = t("voiceSecretaryAudioBackpressureFailed", {
-              defaultValue: "Recording stopped because the audio stream could not keep up.",
-            });
-            if (isCurrentGroup(gid)) {
-              setSpeechError(message);
-              showError(message);
-            }
-            cleanupServiceAudio(runId, {
-              code: "local_asr_pcm_backpressure",
-              detail: `${droppedBytes} bytes dropped`,
-              groupId: gid,
-            });
-            return;
-          }
-          serviceAudioDurationMsRef.current += Math.round((pcm.byteLength / 2 / 16000) * 1000);
-        };
         ws.onopen = () => {
           if (!isActiveRecordingRun(runId)) return;
-          serviceAudioSeqRef.current += 1;
-          ws.send(
-            JSON.stringify({
-              type: "start",
-              seq: serviceAudioSeqRef.current,
-              session_id: voiceRecordingSessionIdRef.current,
-              capture_mode: captureTransportMode,
-              dispatch_target: captureDispatchTarget,
-              document_path:
-                captureDispatchTarget === "document" ? effectiveCaptureTargetDocumentPath : "",
-              sample_rate: 16000,
-              language: getRecordingRecognitionLanguage(),
-              by: "user",
-            }),
-          );
-          voicePcmTransport.flushVoicePcmQueue(ws, serviceAudioPendingPcmRef.current);
+          const service = getVoiceSession()?.service;
+          if (!service || service.socketStarted) return;
+          try {
+            serviceAudioSeqRef.current += 1;
+            ws.send(
+              JSON.stringify({
+                type: "start",
+                seq: serviceAudioSeqRef.current,
+                session_id: getVoiceSession()?.scope.sessionId || "",
+                capture_mode: captureTransportMode,
+                dispatch_target: captureDispatchTarget,
+                document_path:
+                  captureDispatchTarget === "document" ? effectiveCaptureTargetDocumentPath : "",
+                sample_rate: 16000,
+                language: getRecordingRecognitionLanguage(),
+                by: "user",
+              }),
+            );
+            service.socketStarted = true;
+            if (service?.stopRequested && !service.awaitingPcmFlush) {
+              if (!sendServiceStopFrame(ws, runId)) failServiceConnection(runId);
+            } else {
+              voicePcmTransport.flushVoicePcmQueue(ws, serviceAudioPendingPcmRef.current);
+            }
+          } catch {
+            failServiceConnection(runId);
+          }
         };
         let serviceMessageQueue = Promise.resolve();
         ws.onmessage = (event) => {
           serviceMessageQueue = serviceMessageQueue
             .then(async () => {
               if (!isActiveRecordingRun(runId)) return;
+              const service = getVoiceSession()?.service;
+              if (!service) return;
               const payload = JSON.parse(String(event.data || "{}")) as Record<string, unknown>;
               const type = String(payload.type || "").trim();
               if (type === "ready") {
@@ -3678,7 +4532,7 @@ export function VoiceSecretaryComposerControl({
                   payload.backend === "external_provider_asr"
                     ? "external_provider_asr"
                     : latestReadiness.recognitionBackend;
-                if (isCurrentGroup(gid)) setSpeechError("");
+                if (isCurrentGroup(gid) && !service.interrupted) setSpeechError("");
                 return;
               }
               if (type === "recording_segment_saved") {
@@ -3691,8 +4545,10 @@ export function VoiceSecretaryComposerControl({
               }
               if (type === "partial") {
                 const text = String(payload.text || "").trim();
-                if (text && isMeaningfulVoiceDispatchText(text)) {
-                  serviceLatestPartialTranscriptRef.current = text;
+                const segmentId = String(payload.segment_id || "").trim();
+                if (segmentId && service.seenSegmentIds.has(segmentId)) return;
+                if (text && isVoiceDictationText(text)) {
+                  service.latestPartial = text;
                   updateLiveTranscriptPreview(text, "interim", {
                     startMs: serviceCommittedEndMsRef.current,
                     endMs: serviceAudioDurationMsRef.current,
@@ -3702,18 +4558,35 @@ export function VoiceSecretaryComposerControl({
               }
               if (type === "final") {
                 const finalText = String(payload.text || "").trim();
-                if (isMeaningfulVoiceDispatchText(finalText)) {
-                  await handleServiceStreamingFinal(finalText);
+                if (isVoiceDictationText(finalText)) {
+                  await handleServiceStreamingFinal(finalText, String(payload.segment_id || ""));
                 }
                 return;
               }
               if (type === "final_asr_text") {
+                if (payload.ok === false) {
+                  const error = recordFromUnknown(payload.error);
+                  const code = String(error.code || "").trim();
+                  const message =
+                    String(error.message || "").trim() ||
+                    t("voiceSecretaryAudioTranscribeFailed", {
+                      defaultValue: "Voice Secretary could not transcribe the recorded audio.",
+                    });
+                  service.finalError = { code, message };
+                  service.finalIncomplete = true;
+                  if (code !== "empty_transcript" && isCurrentGroup(gid)) {
+                    setSpeechError(message);
+                    showError(message);
+                  }
+                  return;
+                }
                 if (payload.ok !== false) {
                   const documentDisposition =
                     captureDispatchTarget === "document"
                       ? documentFinalAsrDisposition(payload)
                       : null;
                   if (payload.partial === true) {
+                    if (captureDispatchTarget !== "document") service.finalIncomplete = true;
                     showNotice({
                       message: t("voiceSecretaryFinalAsrPartial", {
                         count: Math.max(1, Number(payload.failed_segment_count) || 1),
@@ -3722,24 +4595,28 @@ export function VoiceSecretaryComposerControl({
                     if (documentDisposition === "preserve_live") {
                       const partialText = String(payload.text || "").trim();
                       if (isMeaningfulVoiceDispatchText(partialText)) {
-                        serviceFinalTranscriptRef.current = mergeTranscriptChunks(
-                          serviceFinalTranscriptRef.current,
-                          partialText,
-                        );
+                        service.finalText = mergeTranscriptChunks(service.finalText, partialText);
                       }
                       return;
                     }
                   }
-                  const finalText = String(payload.text || "").trim();
-                  if (isMeaningfulVoiceDispatchText(finalText)) {
+                  const rawFinalText = String(payload.text || "").trim();
+                  const segments = Array.isArray(payload.segments)
+                    ? payload.segments
+                        .map(recordFromUnknown)
+                        .filter((segment) => segment.ok === true)
+                        .map((segment) => String(segment.text || ""))
+                    : [];
+                  const finalText =
+                    captureDispatchTarget === "document"
+                      ? rawFinalText
+                      : joinTranscriptSegments(segments) || rawFinalText;
+                  if (isVoiceDictationText(finalText)) {
                     if (captureDispatchTarget === "document") {
                       if (documentDisposition === "retry_persistence") {
-                        serviceFinalTranscriptRef.current = mergeTranscriptChunks(
-                          serviceFinalTranscriptRef.current,
-                          finalText,
-                        );
+                        service.finalText = mergeTranscriptChunks(service.finalText, finalText);
                         const retry = await retryVoiceAssistantTranscriptPersistence(gid, {
-                          sessionId: voiceRecordingSessionIdRef.current,
+                          sessionId: getVoiceSession()?.scope.sessionId || "",
                           documentPath: effectiveCaptureTargetDocumentPath,
                           text: finalText,
                           language: getRecordingRecognitionLanguage(),
@@ -3789,22 +4666,23 @@ export function VoiceSecretaryComposerControl({
                         if (isCurrentGroup(gid)) {
                           await restoreLatestVoiceMeetingSession({
                             replaceSession: true,
-                            sessionId: voiceRecordingSessionIdRef.current,
+                            sessionId: getVoiceSession()?.scope.sessionId || "",
                           });
                         }
                         return;
                       }
-                      serviceFinalAsrTextRef.current = finalText;
-                      serviceCommittedTranscriptRef.current = finalText;
-                      serviceDocumentCommittedTranscriptRef.current = finalText;
+                      service.finalAsrText = finalText;
+                      service.committed = finalText;
+                      service.documentHandled = finalText;
                       finalizeLiveTranscriptPreview();
                       await restoreLatestVoiceMeetingSession({
                         replaceSession: true,
-                        sessionId: voiceRecordingSessionIdRef.current,
+                        sessionId: getVoiceSession()?.scope.sessionId || "",
                       });
                     } else {
-                      serviceFinalAsrTextRef.current = finalText;
-                      await handleServiceStreamingFinal(finalText);
+                      service.finalAsrText = finalText;
+                      service.latestPartial = "";
+                      updateLiveTranscriptPreview(finalText, "final");
                     }
                   }
                 }
@@ -3813,7 +4691,9 @@ export function VoiceSecretaryComposerControl({
               if (type === "diarization_started" || type === "diarization_status") {
                 const status = String(payload.status || "").trim();
                 if (status === "separating_speakers" && captureDispatchTarget === "document") {
-                  pendingDiarizationSessionsRef.current.add(voiceRecordingSessionIdRef.current);
+                  pendingDiarizationSessionsRef.current.add(
+                    getVoiceSession()?.scope.sessionId || "",
+                  );
                   const now = Date.now();
                   const documentPath = String(
                     effectiveCaptureTargetDocumentPath ||
@@ -3823,8 +4703,8 @@ export function VoiceSecretaryComposerControl({
                   if (documentPath) {
                     setVoiceTranscriptItems((prev) =>
                       upsertLiveVoiceTranscriptItem(prev, {
-                        id: `${voiceRecordingSessionIdRef.current}-analysis`,
-                        sessionId: voiceRecordingSessionIdRef.current,
+                        id: `${getVoiceSession()?.scope.sessionId || ""}-analysis`,
+                        sessionId: getVoiceSession()?.scope.sessionId || "",
                         phase: "interim",
                         text: t("voiceSecretaryTranscriptAnalyzingAudio", {
                           defaultValue: "Analyzing final audio...",
@@ -3855,11 +4735,13 @@ export function VoiceSecretaryComposerControl({
                         defaultValue:
                           "Speaker separation is unavailable. This transcript was saved without speaker labels.",
                       });
-                pendingDiarizationSessionsRef.current.delete(voiceRecordingSessionIdRef.current);
+                pendingDiarizationSessionsRef.current.delete(
+                  getVoiceSession()?.scope.sessionId || "",
+                );
                 if (isCurrentGroup(gid)) setSpeechError(message);
                 if (captureDispatchTarget === "document") {
                   const now = Date.now();
-                  const sessionId = voiceRecordingSessionIdRef.current;
+                  const sessionId = getVoiceSession()?.scope.sessionId || "";
                   const documentPath = String(
                     effectiveCaptureTargetDocumentPath ||
                       captureTargetDocumentPathRef.current ||
@@ -3901,31 +4783,74 @@ export function VoiceSecretaryComposerControl({
                 return;
               }
               if (type === "closed") {
+                markAwaitingFinal(runId, false);
                 serviceAudioExpectedCloseRunIdRef.current = runId;
                 await commitServiceLatestPartialTranscript();
                 if (captureDispatchTarget === "document") {
                   await flushServiceDocumentCheckpoint("service_transcript");
                 }
                 if (!isActiveRecordingRun(runId)) return;
-                const dispatchText =
-                  serviceFinalAsrTextRef.current ||
-                  serviceCommittedTranscriptRef.current ||
-                  serviceFinalTranscriptRef.current;
-                if (captureDispatchTarget === "composer") {
+                const dispatchText = service.finalAsrText || service.committed || service.finalText;
+                if (
+                  captureDispatchTarget !== "document" &&
+                  isVoiceDictationText(service.latestPartial)
+                ) {
+                  service.finalIncomplete = true;
+                }
+                if (
+                  captureDispatchTarget !== "document" &&
+                  (service.finalError || service.finalIncomplete || service.interrupted)
+                ) {
+                  const saved = recoverServiceTranscript(
+                    runId,
+                    service.interrupted ? "interrupted" : "partial",
+                  );
+                  if (!saved && service.finalError?.code === "empty_transcript") {
+                    showNotice({
+                      message: t("voiceSecretaryRecognitionEmpty", {
+                        defaultValue: "No text was recognized.",
+                      }),
+                    });
+                  }
+                } else if (captureDispatchTarget === "composer") {
                   appendDirectDictationToComposer(dispatchText);
+                  if (!isVoiceDictationText(dispatchText)) {
+                    showNotice({
+                      message: t("voiceSecretaryRecognitionEmpty", {
+                        defaultValue: "No text was recognized.",
+                      }),
+                    });
+                  }
                 } else {
                   const dispatchKind = voiceServiceStopDispatchKind({
                     mode: captureTransportMode,
                     transcriptText: dispatchText,
                     pendingPromptRequestId: pendingPromptRequestIdRef.current,
-                    pendingAskRequestId: pendingAskRequestIdRef.current,
                   });
                   if (dispatchKind === "prompt") {
-                    await requestPromptRefine(dispatchText, "service_prompt_refine");
+                    const result = await requestPromptRefine(dispatchText, "service_prompt_refine");
+                    if (result !== "accepted") {
+                      appendDirectDictationToComposer(
+                        dispatchText,
+                        result === "not_dispatched" ? "not_sent" : "unconfirmed",
+                        gid,
+                      );
+                    }
                   } else if (dispatchKind === "instruction") {
-                    await sendInstructionTranscript(dispatchText, {
+                    const sent = await sendInstructionTranscript(dispatchText, {
                       triggerKind: "service_voice_instruction",
                     });
+                    if (!sent) appendDirectDictationToComposer(dispatchText, "unconfirmed", gid);
+                  } else if (captureDispatchTarget !== "document") {
+                    if (isVoiceDictationText(dispatchText)) {
+                      appendDirectDictationToComposer(dispatchText, "not_sent", gid);
+                    } else {
+                      showNotice({
+                        message: t("voiceSecretaryRecognitionEmpty", {
+                          defaultValue: "No text was recognized.",
+                        }),
+                      });
+                    }
                   }
                 }
                 cleanupServiceAudio(runId);
@@ -3936,8 +4861,9 @@ export function VoiceSecretaryComposerControl({
               }
               if (type === "error" || payload.ok === false) {
                 const recovered = String(payload.recovered_text || "").trim();
-                if (recovered && captureDispatchTarget !== "document")
-                  appendDirectDictationToComposer(recovered);
+                if (recovered && captureDispatchTarget !== "document") {
+                  service.finalAsrText = recovered;
+                }
                 const error = recordFromUnknown(payload.error);
                 const message =
                   String(error.message || "") ||
@@ -3977,13 +4903,15 @@ export function VoiceSecretaryComposerControl({
             () =>
               !isActiveRecordingRun(runId) || serviceAudioExpectedCloseRunIdRef.current === runId,
             () => {
+              const external = serviceAsrBackendRef.current === "external_provider_asr";
               const message = t(
-                serviceAsrBackendRef.current === "external_provider_asr"
+                external
                   ? "voiceSecretaryExternalAsrConnectionFailed"
                   : "voiceSecretaryLocalAsrConnectionFailed",
                 {
-                  defaultValue:
-                    "The local ASR connection failed. Refresh the page to initialize the authenticated session, and confirm the updated Web backend is running.",
+                  defaultValue: external
+                    ? "External ASR connection failed. Check the server network and provider configuration."
+                    : "The local ASR connection failed. Refresh the page to initialize the authenticated session, and confirm the updated Web backend is running.",
                 },
               );
               if (isCurrentGroup(gid)) {
@@ -4005,23 +4933,51 @@ export function VoiceSecretaryComposerControl({
               return;
             }
             if (serviceAudioWsRef.current === ws) {
-              cleanupServiceAudio(runId, {
-                code: "local_asr_ws_closed",
-                detail: `${event.code || 0}${event.reason ? ` ${event.reason}` : ""}`.trim(),
-                groupId: gid,
-              });
+              const detail = `${event.code || 0}${event.reason ? ` ${event.reason}` : ""}`.trim();
+              const message = t(
+                serviceAsrBackendRef.current === "external_provider_asr"
+                  ? "voiceSecretaryRecordingStoppedExternalAsrClosed"
+                  : "voiceSecretaryRecordingStoppedLocalAsrClosed",
+                { detail },
+              );
+              if (isCurrentGroup(gid)) {
+                setSpeechError(message);
+                showError(message);
+              }
+              cleanupServiceAudio(runId, { code: "local_asr_ws_closed", detail, groupId: gid });
             }
           });
         };
-        source.connect(processor);
-        processor.connect(audioContext.destination);
+        servicePcmCaptureRef.current.connect(stream);
         void loadAudioDevices();
       } catch (error) {
+        const runWasActive = isActiveRecordingRun(runId);
+        const failedInputDeviceId = getVoiceSession()?.audioPreferences.inputDeviceId || "";
+        const errorName =
+          typeof error === "object" && error && "name" in error
+            ? String((error as { name?: unknown }).name || "")
+            : "";
+        const missingSelectedMic = Boolean(
+          failedInputDeviceId &&
+          [
+            "NotFoundError",
+            "DevicesNotFoundError",
+            "OverconstrainedError",
+            "ConstraintNotSatisfiedError",
+          ].includes(errorName),
+        );
         if (pendingStream) stopMediaStream(pendingStream);
+        pendingCapture?.close();
         // Cleanup must run before invalidating the run that owns these resources.
         cleanupServiceAudio(runId);
-        if (!isCurrentGroup(gid)) return;
-        const { message } = getAudioCaptureErrorMessage(error);
+        if (!runWasActive || !componentMountedRef.current || !isCurrentGroup(gid)) return;
+        const message = missingSelectedMic
+          ? t("voiceSecretarySelectedMicUnavailable", {
+              defaultValue:
+                "The selected microphone may be unavailable. Choose a different microphone or use the system default for voice in this browser.",
+            })
+          : getAudioCaptureErrorMessage(error).message;
+        setUnavailableInputDeviceId(missingSelectedMic ? failedInputDeviceId : "");
         setSpeechError(message);
         showError(message);
       }
@@ -4032,19 +4988,19 @@ export function VoiceSecretaryComposerControl({
       cleanupServiceAudio,
       appendDirectDictationToComposer,
       captureDispatchTarget,
-      captureMode,
       captureTransportMode,
-      composerContext,
       commitServiceLatestPartialTranscript,
       flushServiceDocumentCheckpoint,
       endRecordingRun,
+      failServiceConnection,
       getAudioCaptureErrorMessage,
       getAudioSupportIssueMessage,
       handleServiceStreamingFinal,
       getRecordingRecognitionLanguage,
       clearServiceDocumentCheckpointTimer,
       clearServicePartialCommitTimer,
-      finishRecordingStart,
+      markRecording,
+      markAwaitingFinal,
       loadAudioDevices,
       isActiveRecordingRun,
       isCurrentGroup,
@@ -4052,9 +5008,12 @@ export function VoiceSecretaryComposerControl({
       requestPromptRefine,
       reportRecordingStopReason,
       refreshAssistant,
+      recoverServiceTranscript,
       releaseVoiceRecordingGuards,
       restoreLatestVoiceMeetingSession,
       sendInstructionTranscript,
+      sendServiceStopFrame,
+      stopServiceAudio,
       open,
       selectedGroupId,
       captureTargetDocumentTitle,
@@ -4065,6 +5024,8 @@ export function VoiceSecretaryComposerControl({
       t,
       updateLiveTranscriptPreview,
       updateVoiceAudioLevelsFromSamples,
+      observeVoiceInputSamples,
+      getVoiceSession,
     ],
   );
 
@@ -4075,7 +5036,7 @@ export function VoiceSecretaryComposerControl({
       refreshVoiceCaptureLock(voiceCaptureOwnerIdRef.current, gid);
       if (!voiceRecordingLeaseAcquiredRef.current || !gid) return;
       const leaseId = voiceRecordingLeaseIdRef.current;
-      const sessionScope = voiceRecordingSessionScopeRef.current;
+      const sessionScope = getVoiceSession()?.scope || null;
       void updateVoiceAssistantRecordingLease(gid, {
         action: "heartbeat",
         ownerId: voiceCaptureOwnerIdRef.current,
@@ -4089,7 +5050,7 @@ export function VoiceSecretaryComposerControl({
       })
         .then((resp) => {
           if (leaseId !== voiceRecordingLeaseIdRef.current) return;
-          if (!recordingRef.current) return;
+          if (getVoiceSession()?.phase !== "recording") return;
           if (voiceRecordingLeaseIsDefinitelyLost(resp)) {
             voiceRecordingLeaseAcquiredRef.current = false;
             voiceRecordingLeaseIdRef.current = "";
@@ -4124,6 +5085,7 @@ export function VoiceSecretaryComposerControl({
     showError,
     stopCurrentRecording,
     t,
+    getVoiceSession,
   ]);
 
   const updateRecognitionLanguage = useCallback(
@@ -4217,58 +5179,132 @@ export function VoiceSecretaryComposerControl({
     voiceReplyBubbleRequestId,
   ]);
 
-  const persistCurrentDocument = useCallback(async (): Promise<AssistantVoiceDocument | null> => {
-    const gid = String(selectedGroupId || "").trim();
-    if (!gid) return null;
-    const resp = await saveVoiceAssistantDocument(gid, {
-      documentPath: activeDocumentWritePath || viewedDocumentPath || captureTargetDocumentPath,
-      content: documentDraft,
-      status: activeDocument?.status || "active",
-      by: "user",
-    });
-    if (!isCurrentGroup(gid)) return null;
-    if (!resp.ok) {
-      showError(resp.error.message);
-      return null;
-    }
-    applyDocumentMutationResult(resp.result.document, resp.result.assistant);
-    return resp.result.document || null;
-  }, [
-    activeDocumentWritePath,
-    activeDocument?.status,
-    viewedDocumentPath,
-    applyDocumentMutationResult,
-    captureTargetDocumentPath,
-    documentDraft,
-    isCurrentGroup,
-    selectedGroupId,
-    showError,
-  ]);
-
-  const saveDocument = useCallback(async () => {
-    const gid = String(selectedGroupId || "").trim();
-    setActionBusy("save_doc");
-    try {
-      const document = await persistCurrentDocument();
-      if (!isCurrentGroup(gid)) return;
-      if (!document) return;
-      setDocumentEditing(false);
-      showNotice({
-        message: t("voiceSecretaryDocumentSaved", {
-          defaultValue: "Voice Secretary working document saved.",
-        }),
+  const persistCurrentDocument = useCallback(
+    async (
+      overwriteSha?: string,
+    ): Promise<{ document: AssistantVoiceDocument; applied: boolean } | null> => {
+      const gid = String(selectedGroupId || "").trim();
+      if (!gid) return null;
+      if (documentSaveConflict?.unavailable) return null;
+      const path = activeDocumentWritePath || viewedDocumentPath || captureTargetDocumentPath;
+      const writeBase = documentWriteBaseRef.current;
+      const owner = getDraftSnapshot();
+      if (!writeBase || writeBase.path !== path || owner.path !== path) {
+        showError(t("voiceSecretaryDocumentVersionUnavailable"));
+        return null;
+      }
+      const saved = {
+        path,
+        draft: owner.content,
+        base: documentBaseContentRef.current,
+        session: owner.session,
+        writeBase,
+      };
+      const resp = await saveVoiceAssistantDocument(gid, {
+        documentPath: path,
+        expectedContentSha256: overwriteSha || writeBase.contentSha256,
+        expectedTargetId: writeBase.targetId,
+        content: serializeDocumentText(saved.draft, documentLineEndingRef.current),
+        status: activeDocument?.status || "active",
+        by: "user",
       });
-    } catch {
-      if (!isCurrentGroup(gid)) return;
-      showError(
-        t("voiceSecretaryDocumentSaveFailed", {
-          defaultValue: "Failed to save Voice Secretary working document.",
-        }),
-      );
-    } finally {
-      if (isCurrentGroup(gid)) setActionBusy("");
-    }
-  }, [isCurrentGroup, persistCurrentDocument, selectedGroupId, showError, showNotice, t]);
+      if (!isCurrentGroup(gid) || !sameVoiceDocumentSession(getDraftSnapshot(), saved)) return null;
+      if (detachedDocumentRef.current && voiceDocumentMatches(detachedDocumentRef.current, path))
+        return null;
+      if (!resp.ok) {
+        if (
+          resp.error.code === "voice_document_conflict" ||
+          resp.error.code === "voice_document_target_conflict"
+        ) {
+          const current = recordFromUnknown(resp.error.details).current_sha256;
+          setDocumentSaveConflict({
+            path,
+            session: saved.session,
+            currentSha:
+              typeof current === "string" && /^[0-9a-f]{64}$/i.test(current)
+                ? current.toLowerCase()
+                : null,
+            targetChanged: resp.error.code === "voice_document_target_conflict",
+            unavailable: false,
+          });
+          setDocumentRemoteChanged(true);
+          return null;
+        }
+        showError(resp.error.message);
+        return null;
+      }
+      const document = resp.result.document;
+      const responseBase = voiceDocumentWriteBase(document);
+      if (
+        !document ||
+        !responseBase ||
+        responseBase.path !== path ||
+        responseBase.targetId !== writeBase.targetId
+      ) {
+        setDocumentRemoteChanged(true);
+        showError(t("voiceSecretaryDocumentVersionUnavailable"));
+        return null;
+      }
+      setDocumentSaveConflict(null);
+      const applied = applyDocumentMutationResult(document, resp.result.assistant, saved);
+      return { document, applied };
+    },
+    [
+      activeDocumentWritePath,
+      activeDocument?.status,
+      viewedDocumentPath,
+      applyDocumentMutationResult,
+      captureTargetDocumentPath,
+      documentSaveConflict,
+      getDraftSnapshot,
+      isCurrentGroup,
+      selectedGroupId,
+      showError,
+      t,
+    ],
+  );
+
+  const saveDocument = useCallback(
+    async (overwriteSha?: string) => {
+      const gid = String(selectedGroupId || "").trim();
+      setActionBusy("save_doc");
+      try {
+        const result = await persistCurrentDocument(overwriteSha);
+        if (!isCurrentGroup(gid)) return;
+        if (!result) return;
+        if (result.applied) setDocumentEditing(false);
+        showNotice({
+          message: t("voiceSecretaryDocumentSaved", {
+            defaultValue: "Voice Secretary working document saved.",
+          }),
+        });
+      } catch {
+        if (!isCurrentGroup(gid)) return;
+        showError(
+          t("voiceSecretaryDocumentSaveFailed", {
+            defaultValue: "Failed to save Voice Secretary working document.",
+          }),
+        );
+      } finally {
+        if (isCurrentGroup(gid)) setActionBusy("");
+      }
+    },
+    [isCurrentGroup, persistCurrentDocument, selectedGroupId, showError, showNotice, t],
+  );
+
+  const overwriteDocument = useCallback(() => {
+    const conflict = documentSaveConflict;
+    if (
+      !conflict ||
+      conflict.targetChanged ||
+      !conflict.currentSha ||
+      !sameVoiceDocumentSession(getDraftSnapshot(), conflict) ||
+      conflict.path !== documentWriteBaseRef.current?.path
+    )
+      return;
+    if (!window.confirm(t("voiceSecretaryOverwriteDocumentConfirm"))) return;
+    void saveDocument(conflict.currentSha);
+  }, [documentSaveConflict, getDraftSnapshot, saveDocument, t]);
 
   const startCreateDocument = useCallback(() => {
     if (documentHasUnsavedEdits) {
@@ -4298,6 +5334,7 @@ export function VoiceSecretaryComposerControl({
       newDocumentTitleDraft.trim() ||
       t("voiceSecretaryDefaultDocumentTitle", { defaultValue: "Untitled document" });
     setActionBusy("new_doc");
+    const documentOwner = getDraftSnapshot();
     try {
       const resp = await saveVoiceAssistantDocument(gid, {
         title,
@@ -4310,7 +5347,19 @@ export function VoiceSecretaryComposerControl({
         showError(resp.error.message);
         return;
       }
-      applyDocumentMutationResult(resp.result.document, resp.result.assistant);
+      if (
+        !sameVoiceDocumentSession(getDraftSnapshot(), documentOwner) ||
+        documentOwner.content !== documentDraftRef.current
+      ) {
+        void refreshAssistant({ quiet: true });
+        return;
+      }
+      applyDocumentMutationResult(
+        resp.result.document,
+        resp.result.assistant,
+        undefined,
+        documentOwner,
+      );
       const docPath = voiceDocumentPath(resp.result.document);
       if (docPath) {
         setViewedDocumentPath(docPath);
@@ -4338,9 +5387,11 @@ export function VoiceSecretaryComposerControl({
     }
   }, [
     applyDocumentMutationResult,
+    getDraftSnapshot,
     isCurrentGroup,
     loadDocumentDraft,
     newDocumentTitleDraft,
+    refreshAssistant,
     selectedGroupId,
     showError,
     showNotice,
@@ -4409,6 +5460,7 @@ export function VoiceSecretaryComposerControl({
           return;
         }
         setActionBusy("instruct_doc");
+        const documentOwner = getDraftSnapshot();
         const nowMs = Date.now();
         const requestId = `voice-ask-${nowMs.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         try {
@@ -4432,7 +5484,12 @@ export function VoiceSecretaryComposerControl({
             showError(resp.error.message);
             return;
           }
-          applyDocumentMutationResult(resp.result.document, resp.result.assistant);
+          const appliedDocument = applyDocumentMutationResult(
+            resp.result.document,
+            resp.result.assistant,
+            undefined,
+            documentOwner,
+          );
           const effectiveRequestId = String(resp.result.request_id || requestId).trim();
           if (effectiveRequestId) {
             localVoiceReplyRequestIdsRef.current.add(effectiveRequestId);
@@ -4451,7 +5508,12 @@ export function VoiceSecretaryComposerControl({
             );
           }
           setDocumentInstruction("");
-          setDocumentEditing(false);
+          if (
+            (appliedDocument || sameVoiceDocumentSession(getDraftSnapshot(), documentOwner)) &&
+            viewedDocumentPathRef.current === docPath &&
+            documentDraftRef.current === documentBaseContentRef.current
+          )
+            setDocumentEditing(false);
           showNotice({
             message: t(
               resp.result.secretary_processing_deferred
@@ -4484,6 +5546,7 @@ export function VoiceSecretaryComposerControl({
       documentInstruction,
       documents,
       getActiveCaptureConfig,
+      getDraftSnapshot,
       getRecordingRecognitionLanguage,
       isCurrentGroup,
       recognitionBackend,
@@ -4515,11 +5578,14 @@ export function VoiceSecretaryComposerControl({
         );
         if (!confirmed) return;
       }
+      documentDraftSessionRef.current += 1;
+      setDocumentSaveConflict(null);
       setPanelView("document");
       setVoiceWorkspaceView("document");
       setMobileDocumentListOpen(false);
       viewedDocumentPathRef.current = nextPath;
       setViewedDocumentPath(nextPath);
+      const documentOwner = getDraftSnapshot();
       invalidateWorkspaceRefresh();
       const contentLoad = documentContentLoadTracker.current.begin();
       const draftBeforeLoad = documentDraftRef.current;
@@ -4532,7 +5598,7 @@ export function VoiceSecretaryComposerControl({
           const resp = gid ? await fetchVoiceAssistantDocumentContent(gid, nextPath) : null;
           if (
             !isCurrentGroup(gid) ||
-            viewedDocumentPathRef.current !== nextPath ||
+            !sameVoiceDocumentSession(getDraftSnapshot(), documentOwner) ||
             !documentContentLoadTracker.current.end(contentLoad)
           )
             return;
@@ -4548,6 +5614,7 @@ export function VoiceSecretaryComposerControl({
           }
         }
       }
+      if (!sameVoiceDocumentSession(getDraftSnapshot(), documentOwner)) return;
       if (documentDraftRef.current !== draftBeforeLoad) {
         setDocumentRemoteChanged(true);
         return;
@@ -4561,6 +5628,7 @@ export function VoiceSecretaryComposerControl({
       activeDocumentWritePath,
       viewedDocumentPath,
       documentHasUnsavedEdits,
+      getDraftSnapshot,
       invalidateWorkspaceRefresh,
       isCurrentGroup,
       loadDocumentDraft,
@@ -4568,6 +5636,65 @@ export function VoiceSecretaryComposerControl({
       t,
     ],
   );
+
+  const loadLatestDocument = useCallback(async () => {
+    const gid = String(selectedGroupId || "").trim();
+    const path = activeDocumentWritePath || viewedDocumentPath;
+    if (!gid || !path) return;
+    if (
+      documentDraftRef.current !== documentBaseContentRef.current &&
+      !window.confirm(t("voiceSecretaryLoadLatestConfirm"))
+    )
+      return;
+    const owner = getDraftSnapshot();
+    const load = documentContentLoadTracker.current.begin();
+    setDocumentContentLoadingPath(path);
+    try {
+      const resp = await fetchVoiceAssistantDocumentContent(gid, path);
+      if (
+        !isCurrentGroup(gid) ||
+        !sameVoiceDocumentSession(getDraftSnapshot(), owner) ||
+        owner.path !== path ||
+        !documentContentLoadTracker.current.end(load)
+      )
+        return;
+      if (
+        !resp.ok ||
+        !resp.result.document ||
+        voiceDocumentWriteBase(resp.result.document)?.path !== path
+      ) {
+        showError(t("voiceSecretaryDocumentVersionUnavailable"));
+        return;
+      }
+      if (documentDraftRef.current !== owner.content) {
+        setDocumentRemoteChanged(true);
+        return;
+      }
+      const document = resp.result.document;
+      invalidateWorkspaceRefresh();
+      setDocuments((prev) =>
+        prev.map((item) => (voiceDocumentMatches(item, path) ? document : item)),
+      );
+      loadDocumentDraft(document);
+      setDocumentEditing(false);
+    } catch {
+      if (isCurrentGroup(gid) && sameVoiceDocumentSession(getDraftSnapshot(), owner))
+        showError(t("voiceSecretaryDocumentVersionUnavailable"));
+    } finally {
+      if (isCurrentGroup(gid) && documentContentLoadTracker.current.end(load))
+        setDocumentContentLoadingPath("");
+    }
+  }, [
+    activeDocumentWritePath,
+    viewedDocumentPath,
+    selectedGroupId,
+    isCurrentGroup,
+    getDraftSnapshot,
+    invalidateWorkspaceRefresh,
+    loadDocumentDraft,
+    showError,
+    t,
+  ]);
 
   const setCaptureTargetDocument = useVoiceCaptureTargetDocumentSelection({
     selectedGroupId,
@@ -4592,6 +5719,8 @@ export function VoiceSecretaryComposerControl({
     archivedDocumentPathsRef,
     captureTargetDocumentPathRef,
     isCurrentGroup,
+    getDraftSnapshot,
+    preserveUnavailableDraft,
     loadDocumentDraft,
     clearReferences: clearVoiceDocumentReferences,
     refreshAssistant,
@@ -4682,10 +5811,17 @@ export function VoiceSecretaryComposerControl({
       : false;
   const startDictation = useCallback(async () => {
     const gid = String(selectedGroupId || "").trim();
-    const runId = beginRecordingRun();
-    if (!runId) return;
     // Bind the draft to this Group before any settings, lease or microphone await.
     const composerSnapshot = readCurrentComposerText();
+    const runId = beginRecordingRun({
+      groupId: gid,
+      documentPath: effectiveCaptureTargetDocumentPath,
+      captureMode,
+      dispatchTarget: captureDispatchTarget,
+      composerText: composerSnapshot,
+      composerContext,
+    });
+    if (!runId) return;
     setRecordingTarget({
       mode: captureMode,
       documentPath: effectiveCaptureTargetDocumentPath,
@@ -4703,15 +5839,17 @@ export function VoiceSecretaryComposerControl({
       if (!resp.ok) throw new Error(resp.error.message);
       const latestAssistant = resp.result.assistant || null;
       setAssistant(latestAssistant);
-      capturedConfigRef.current = {
+      const run = getVoiceSession();
+      if (!run || run.id !== runId) return;
+      run.config = {
         ...(latestAssistant?.config || {}),
         recognition_language:
           recognitionLanguageOverride || latestAssistant?.config?.recognition_language || "auto",
       };
       if (latestAssistant?.config?.recognition_backend === "browser_asr") {
-        await startBrowserSpeech(runId, latestAssistant, composerSnapshot);
+        await startBrowserSpeech(runId, latestAssistant);
       } else {
-        await startServiceAudio(runId, latestAssistant, composerSnapshot);
+        await startServiceAudio(runId, latestAssistant);
       }
     } catch (error) {
       if (!isActiveRecordingRun(runId)) return;
@@ -4725,6 +5863,7 @@ export function VoiceSecretaryComposerControl({
     beginRecordingRun,
     captureMode,
     captureDispatchTarget,
+    composerContext,
     effectiveCaptureTargetDocumentPath,
     endRecordingRun,
     isActiveRecordingRun,
@@ -4734,6 +5873,7 @@ export function VoiceSecretaryComposerControl({
     startBrowserSpeech,
     startServiceAudio,
     showError,
+    getVoiceSession,
   ]);
   const activeDocumentPath = voiceDocumentPath(activeDocument);
   const transcriptDocumentPath = String(
@@ -4815,21 +5955,6 @@ export function VoiceSecretaryComposerControl({
       return t("voiceSecretaryAskStatusPending", { defaultValue: "Queued" });
     },
     [t],
-  );
-  const askFeedbackStatusClassName = useCallback(
-    (status: string) => {
-      const key = String(status || "pending")
-        .trim()
-        .toLowerCase();
-      if (key === "needs_user")
-        return isDark ? "bg-amber-400/14 text-amber-100" : "bg-amber-50 text-amber-800";
-      if (key === "failed")
-        return isDark ? "bg-rose-400/14 text-rose-100" : "bg-rose-50 text-rose-800";
-      if (key === "handed_off")
-        return isDark ? "bg-sky-400/14 text-sky-100" : "bg-sky-50 text-sky-800";
-      return isDark ? "bg-white/10 text-slate-200" : "bg-[rgb(245,245,245)] text-[rgb(35,36,37)]";
-    },
-    [isDark],
   );
   const voiceModeLabel = useCallback(
     (mode: VoiceSecretaryCaptureMode) => {
@@ -5015,6 +6140,7 @@ export function VoiceSecretaryComposerControl({
   const lastRecordingStopReasonText = useMemo(() => {
     if (!lastRecordingStopReason || recording || recordingStarting) return "";
     const detail = String(lastRecordingStopReason.detail || "").trim();
+    const external = lastRecordingStopReason.backend === "external_provider_asr";
     if (
       lastRecordingStopReason.code === "media_track_muted" ||
       lastRecordingStopReason.code === "media_track_unmuted" ||
@@ -5031,25 +6157,42 @@ export function VoiceSecretaryComposerControl({
       });
     }
     if (lastRecordingStopReason.code === "local_asr_ws_closed") {
-      return t("voiceSecretaryRecordingStoppedLocalAsrClosed", {
-        detail,
-        defaultValue: detail
-          ? "Recording stopped because the local ASR stream closed: {{detail}}."
-          : "Recording stopped because the local ASR stream closed.",
-      });
+      return t(
+        external
+          ? "voiceSecretaryRecordingStoppedExternalAsrClosed"
+          : "voiceSecretaryRecordingStoppedLocalAsrClosed",
+        {
+          detail,
+          defaultValue: external
+            ? "Recording stopped because the external ASR stream closed: {{detail}}."
+            : "Recording stopped because the local ASR stream closed: {{detail}}.",
+        },
+      );
     }
     if (lastRecordingStopReason.code === "local_asr_ws_error") {
-      return t("voiceSecretaryRecordingStoppedLocalAsrError", {
-        defaultValue: "Recording stopped because the local ASR stream failed.",
-      });
+      return t(
+        external
+          ? "voiceSecretaryRecordingStoppedExternalAsrError"
+          : "voiceSecretaryRecordingStoppedLocalAsrError",
+        {
+          defaultValue: external
+            ? "Recording stopped because the external ASR stream failed."
+            : "Recording stopped because the local ASR stream failed.",
+        },
+      );
     }
     if (lastRecordingStopReason.code === "local_asr_backend_error") {
-      return t("voiceSecretaryRecordingStoppedLocalAsrBackend", {
-        detail,
-        defaultValue: detail
-          ? "Recording stopped because local ASR returned an error: {{detail}}."
-          : "Recording stopped because local ASR returned an error.",
-      });
+      return t(
+        external
+          ? "voiceSecretaryRecordingStoppedExternalAsrBackend"
+          : "voiceSecretaryRecordingStoppedLocalAsrBackend",
+        {
+          detail,
+          defaultValue: external
+            ? "Recording stopped because external ASR returned an error: {{detail}}."
+            : "Recording stopped because local ASR returned an error: {{detail}}.",
+        },
+      );
     }
     if (lastRecordingStopReason.code === "browser_speech_ended") {
       return t("voiceSecretaryRecordingStoppedBrowserSpeechEnded", {
@@ -5069,13 +6212,17 @@ export function VoiceSecretaryComposerControl({
       defaultValue: "Recording stopped unexpectedly: {{reason}}.",
     });
   }, [lastRecordingStopReason, recording, recordingStarting, t]);
+  const audioSupportHint =
+    serviceAudioSupportIssue === "audio_worklet"
+      ? getAudioSupportIssueMessage(serviceAudioSupportIssue)
+      : "";
   const speechErrorHint =
     speechError.trim() && browserSpeechRecoveryCode && (recording || recordingStarting)
       ? t("voiceSecretarySpeechRecovering", {
           code: browserSpeechRecoveryCode,
           defaultValue: "Browser speech recognition encountered {{code}} and is reconnecting.",
         })
-      : speechError.trim();
+      : speechError.trim() || audioSupportHint;
   const panelNoticeText = recordingGroupNoticeText
     ? recordingSettingsLockedTitle
     : speechErrorHint || lastRecordingStopReasonText;
@@ -5099,23 +6246,47 @@ export function VoiceSecretaryComposerControl({
     (!pendingPromptInOtherGroup && pendingPromptProblem) || composerSecretaryUnavailableReason;
   const composerActivity = resolveVoiceComposerActivity({
     recording: recording || recordingStarting,
+    finishing: recordingFinishing,
     promptWaiting: !pendingPromptInOtherGroup && promptDraftWaiting,
     promptReady: !pendingPromptInOtherGroup && !!pendingPromptDraft,
     askSummary: pendingAskFeedback && !askNotice.hidden ? pendingAskFeedbackSummaryText : "",
     transcriptSummary: liveTranscriptSummaryText,
   });
+  const voiceInputSilenceHint =
+    recording && voiceInputSilent ? t("voiceSecretaryInputSilenceHint") : "";
+  const showStopWaiting =
+    recordingFinishing &&
+    waitingForFinal &&
+    longFinalWaitRunId === getVoiceSession()?.id &&
+    getVoiceSession()?.scope.dispatchTarget !== "document";
+  const compactBlocked = Boolean(
+    open ||
+    executionOpen ||
+    recording ||
+    recordingStarting ||
+    recordingFinishing ||
+    composerActivity ||
+    composerErrorText ||
+    speechErrorHint,
+  );
+  useEffect(() => {
+    onCompactBlockChange?.(compactBlocked);
+  }, [compactBlocked, onCompactBlockChange]);
+  useEffect(() => () => onCompactBlockChange?.(false), [onCompactBlockChange]);
   const composerAnnouncement =
-    composerActivity === "recording"
-      ? t("voiceSecretaryRecording")
-      : composerActivity === "promptWaiting"
-        ? promptDraftWaitingTitle
-        : composerActivity === "promptReady"
-          ? promptDraftReadyTitle
-          : composerActivity === "ask" || (askNotice.hidden && pendingAskFeedbackHasFinalReply)
-            ? pendingAskFeedbackHasFinalReply
-              ? t("voiceSecretaryReplyReadyShort")
-              : pendingAskFeedbackStatusText
-            : "";
+    composerActivity === "finishing"
+      ? t("voiceSecretaryFinalizingRecording")
+      : composerActivity === "recording"
+        ? t("voiceSecretaryRecording")
+        : composerActivity === "promptWaiting"
+          ? promptDraftWaitingTitle
+          : composerActivity === "promptReady"
+            ? promptDraftReadyTitle
+            : composerActivity === "ask" || (askNotice.hidden && pendingAskFeedbackHasFinalReply)
+              ? pendingAskFeedbackHasFinalReply
+                ? t("voiceSecretaryReplyReadyShort")
+                : pendingAskFeedbackStatusText
+              : "";
   const assistantRowCurrentMode =
     assistantRowModeOptions.find((option) => option.key === composerCaptureMode) ||
     assistantRowModeOptions[0];
@@ -5145,12 +6316,18 @@ export function VoiceSecretaryComposerControl({
       window.clearTimeout(lateReset);
     };
   }, [activeDocumentPath, executionOpen, isSmallScreen, open, panelView, voiceWorkspaceView]);
-  const modeChangeDisabledReason = recording ? recordingSettingsLockedTitle : "";
-  const assistantRowControlLabel = recording
-    ? t("voiceSecretaryStopAndSave", { defaultValue: "Stop and save recording" })
-    : !composerNeedsSecretary
-      ? t("voiceDirectDictationStart", { defaultValue: "Start direct dictation" })
-      : captureStartTitle;
+  const modeChangeDisabledReason = recordingFinishing
+    ? t("voiceSecretaryFinalizingRecording")
+    : recording
+      ? recordingSettingsLockedTitle
+      : "";
+  const assistantRowControlLabel = recordingFinishing
+    ? t("voiceSecretaryFinalizingRecording")
+    : recording
+      ? t("voiceSecretaryStopAndSave", { defaultValue: "Stop and save recording" })
+      : !composerNeedsSecretary
+        ? t("voiceDirectDictationStart", { defaultValue: "Start direct dictation" })
+        : captureStartTitle;
   const promptCaptureStateLabel = promptAutoRefine
     ? t("voiceSecretaryPromptAutoRefineState")
     : t("voiceSecretaryModeDictation");
@@ -5173,26 +6350,26 @@ export function VoiceSecretaryComposerControl({
           : t("voiceSecretaryPromptOptimizeButton", { defaultValue: "Optimize current prompt" });
   const handleAssistantRowModeChange = useCallback(
     (nextMode: VoiceSecretaryCaptureMode) => {
-      if (recording || recordingStarting) return;
+      if (recording || recordingStarting || recordingFinishing) return;
       onCaptureModeChange?.(nextMode);
       setShowAssistantModeMenu(false);
     },
-    [onCaptureModeChange, recording, recordingStarting],
+    [onCaptureModeChange, recording, recordingStarting, recordingFinishing],
   );
   const updatePromptAutoRefine = useCallback(
     (enabled: boolean) => {
-      if (recording || recordingStarting) return;
+      if (recording || recordingStarting || recordingFinishing) return;
       useUIStore
         .getState()
         .setChatVoicePreferences(selectedGroupId, { voicePromptAutoRefine: enabled });
     },
-    [recording, recordingStarting, selectedGroupId],
+    [recording, recordingStarting, recordingFinishing, selectedGroupId],
   );
   const toggleRecording = useCallback(() => {
-    if (recordingStarting) return;
+    if (recordingStarting || recordingFinishing) return;
     if (recording) stopCurrentRecording();
     else void startDictation();
-  }, [recording, recordingStarting, startDictation, stopCurrentRecording]);
+  }, [recording, recordingStarting, recordingFinishing, startDictation, stopCurrentRecording]);
   const handleAssistantRowRecordClick = useCallback(
     (event?: ReactMouseEvent<HTMLButtonElement>) => {
       event?.preventDefault();
@@ -5249,19 +6426,31 @@ export function VoiceSecretaryComposerControl({
     setPromptCancelBusy(true);
     try {
       const resp = await cancelSecretaryTask(gid, task.task_id);
+      if (!componentMountedRef.current) return;
       if (!resp.ok) {
         showError(resp.error.message);
         return;
       }
-      if (pendingPromptRequestIdRef.current === task.target.request_id) {
+      if (
+        pendingPromptRequestIdRef.current === task.target.request_id &&
+        pendingPromptGroupIdRef.current === gid
+      ) {
+        preservePendingPromptVoice(gid, task.target.request_id);
         clearPendingPromptRequest(true);
       }
     } catch {
-      showError(t("settings:voiceSettings.actionFailed"));
+      if (componentMountedRef.current) showError(t("settings:voiceSettings.actionFailed"));
     } finally {
-      setPromptCancelBusy(false);
+      if (componentMountedRef.current) setPromptCancelBusy(false);
     }
-  }, [clearPendingPromptRequest, pendingPromptTask, selectedGroupId, showError, t]);
+  }, [
+    clearPendingPromptRequest,
+    pendingPromptTask,
+    preservePendingPromptVoice,
+    selectedGroupId,
+    showError,
+    t,
+  ]);
   const copyAskReply = useCallback(
     async (item: AssistantVoiceAskFeedback) => {
       const ok = await copyTextToClipboard(String(item.reply_text || "").trim());
@@ -5391,6 +6580,7 @@ export function VoiceSecretaryComposerControl({
                         <button
                           type="button"
                           data-voice-workstage-toggle
+                          data-lcd-key
                           aria-pressed={executionOpen}
                           disabled={controlDisabled}
                           onClick={() => {
@@ -5415,6 +6605,7 @@ export function VoiceSecretaryComposerControl({
                         <button
                           type="button"
                           data-voice-settings
+                          data-lcd-key
                           className="inline-flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-lg text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-tertiary)] focus-visible:outline-2 focus-visible:outline-[var(--color-border-focus)]"
                           aria-label={t("settings:voiceSettings.title")}
                           title={t("settings:voiceSettings.title")}
@@ -5429,8 +6620,10 @@ export function VoiceSecretaryComposerControl({
                     <p
                       role="status"
                       data-voice-header-notice
+                      data-status-tone={recordingGroupNoticeText ? "warning" : undefined}
                       className={classNames(
-                        "mt-2 line-clamp-2 break-words text-xs leading-5",
+                        "mt-2 break-words text-xs leading-5",
+                        !canUseSystemDefaultMic && "line-clamp-2",
                         recordingGroupNoticeText
                           ? isDark
                             ? "text-rose-200"
@@ -5440,6 +6633,18 @@ export function VoiceSecretaryComposerControl({
                       title={panelNoticeText}
                     >
                       {panelNoticeText}
+                      {canUseSystemDefaultMic ? (
+                        <button
+                          type="button"
+                          data-voice-use-default-mic
+                          className="ml-2 inline-flex min-h-7 items-center font-semibold underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-[var(--color-border-focus)] pointer-coarse:min-h-11"
+                          onClick={useSystemDefaultMic}
+                        >
+                          {t("voiceSecretaryUseSystemDefaultMic", {
+                            defaultValue: "Use system default microphone",
+                          })}
+                        </button>
+                      ) : null}
                     </p>
                   ) : null}
                 </div>
@@ -5448,6 +6653,7 @@ export function VoiceSecretaryComposerControl({
                   <div
                     role="status"
                     data-voice-readiness={secretaryIssue?.code}
+                    data-status-tone="warning"
                     className={classNames(
                       "mx-4 mt-3 flex shrink-0 flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-xs leading-5 sm:mx-5",
                       isDark
@@ -5470,6 +6676,7 @@ export function VoiceSecretaryComposerControl({
                       <button
                         type="button"
                         data-voice-readiness-action
+                        data-lcd-key
                         onClick={() => {
                           if (secretaryIssue?.action === "execution") {
                             setExecutionTaskId("");
@@ -5626,12 +6833,22 @@ export function VoiceSecretaryComposerControl({
                                 <VoicePanelInputBar
                                   isDark={isDark}
                                   recordLabel={t("voiceSecretaryRecordIntoDocument")}
-                                  recordTitle={captureTargetDocumentTitle}
+                                  recordTitle={audioSupportHint || captureTargetDocumentTitle}
                                   recordDisabled={
                                     controlDisabled || !!actionBusy || !dictationSupported
                                   }
                                   recording={recording}
                                   recordingStarting={recordingStarting}
+                                  recordingFinishing={recordingFinishing}
+                                  captureHint={voiceInputSilenceHint}
+                                  finalizingLabel={t("voiceSecretaryFinalizingRecording")}
+                                  stopWaitingLabel={t("voiceSecretaryStopWaiting")}
+                                  stopWaitingHint={t("voiceSecretaryStopWaitingHint")}
+                                  onStopWaiting={
+                                    showStopWaiting
+                                      ? () => stopWaitingForServiceFinal(longFinalWaitRunId)
+                                      : undefined
+                                  }
                                   recordingTargetLabel={recordingTargetText}
                                   stopLabel={t("voiceSecretaryStopAndSaveShort")}
                                   liveSnippet={liveTranscriptSummaryPreview}
@@ -5678,6 +6895,22 @@ export function VoiceSecretaryComposerControl({
                             documentEditing={documentEditing}
                             documentHasUnsavedEdits={documentHasUnsavedEdits}
                             documentLoading={documentContentLoading}
+                            documentError={
+                              documentContentUnavailable
+                                ? t("voiceSecretaryDocumentVersionUnavailable")
+                                : ""
+                            }
+                            documentConflict={
+                              documentSaveConflict
+                                ? documentSaveConflict.unavailable
+                                  ? "unavailable"
+                                  : documentSaveConflict.targetChanged
+                                    ? "target"
+                                    : documentSaveConflict.currentSha
+                                      ? "content"
+                                      : "missing"
+                                : null
+                            }
                             documentRemoteChanged={documentRemoteChanged}
                             isDark={isDark}
                             recording={
@@ -5700,7 +6933,8 @@ export function VoiceSecretaryComposerControl({
                             }}
                             onDownloadDocument={downloadCurrentDocument}
                             onEditDocumentChange={updateDocumentDraft}
-                            onLoadLatestDocument={() => loadDocumentDraft(activeDocument)}
+                            onLoadLatestDocument={() => void loadLatestDocument()}
+                            onOverwriteDocument={overwriteDocument}
                             onQuoteDocument={() => {
                               if (!activeDocument) return;
                               const ref = buildVoiceDocumentMessageRef(
@@ -5730,7 +6964,6 @@ export function VoiceSecretaryComposerControl({
                         documentKey={voiceDocumentKey}
                         tasks={askTasks}
                         statusLabel={askFeedbackStatusLabel}
-                        statusClassName={askFeedbackStatusClassName}
                         formatTime={formatVoiceActivityTimeMs}
                         formatFullTime={formatVoiceActivityFullTimeMs}
                         onOpenDocument={(document) => void selectDocument(document)}
@@ -5744,9 +6977,20 @@ export function VoiceSecretaryComposerControl({
                         <VoicePanelInputBar
                           isDark={isDark}
                           recordLabel={t("voiceSecretaryRecordQuestion")}
+                          recordTitle={audioSupportHint || undefined}
                           recordDisabled={controlDisabled || !!actionBusy || !dictationSupported}
                           recording={recording}
                           recordingStarting={recordingStarting}
+                          recordingFinishing={recordingFinishing}
+                          captureHint={voiceInputSilenceHint}
+                          finalizingLabel={t("voiceSecretaryFinalizingRecording")}
+                          stopWaitingLabel={t("voiceSecretaryStopWaiting")}
+                          stopWaitingHint={t("voiceSecretaryStopWaitingHint")}
+                          onStopWaiting={
+                            showStopWaiting
+                              ? () => stopWaitingForServiceFinal(longFinalWaitRunId)
+                              : undefined
+                          }
                           recordingTargetLabel={recordingTargetText}
                           stopLabel={t("voiceSecretaryStopAndSaveShort")}
                           liveSnippet={liveTranscriptSummaryPreview}
@@ -5774,6 +7018,7 @@ export function VoiceSecretaryComposerControl({
                 </div>
                 <button
                   data-voice-sheet-close
+                  data-modal-close
                   type="button"
                   onClick={closePanel}
                   className="absolute right-3 top-3 inline-flex h-9 w-9 items-center justify-center rounded-lg text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text-primary)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]/45 sm:right-4 sm:top-4"
@@ -5791,6 +7036,7 @@ export function VoiceSecretaryComposerControl({
         <div className="relative flex min-w-0 max-w-full items-center gap-1.5">
           {voiceReplyBubbleFeedback && voiceReplyBubbleText ? (
             <div
+              data-voice-reply-bubble
               className={classNames(
                 "absolute bottom-full left-0 z-[80] mb-2 w-[min(28rem,calc(100vw-1.5rem))] overflow-hidden rounded-2xl border shadow-2xl",
                 isDark
@@ -5803,6 +7049,7 @@ export function VoiceSecretaryComposerControl({
               })}
             >
               <div
+                data-voice-reply-bubble-head
                 className={classNames(
                   "flex items-center justify-between gap-2 border-b px-3 py-2",
                   isDark ? "border-white/[0.08]" : "border-black/[0.06]",
@@ -5813,6 +7060,7 @@ export function VoiceSecretaryComposerControl({
                     {t("voiceSecretaryReplyBubbleTitle", { defaultValue: "Voice Secretary reply" })}
                   </div>
                   <div
+                    data-status-tone="muted"
                     className={classNames(
                       "mt-0.5 text-[10px]",
                       isDark ? "text-slate-400" : "text-gray-500",
@@ -5826,6 +7074,7 @@ export function VoiceSecretaryComposerControl({
                 <div className="flex shrink-0 items-center gap-1">
                   <button
                     type="button"
+                    data-lcd-key
                     onClick={() => void copyVoiceReplyBubble()}
                     className={classNames(
                       "inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors",
@@ -5846,6 +7095,7 @@ export function VoiceSecretaryComposerControl({
                   </button>
                   <button
                     type="button"
+                    data-lcd-key
                     onClick={closeVoiceReplyBubble}
                     className={classNames(
                       "inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors",
@@ -5873,8 +7123,10 @@ export function VoiceSecretaryComposerControl({
             </div>
           ) : null}
           <div
+            data-voice-assistant-row-control
+            data-recording={recording || undefined}
             className={classNames(
-              "inline-flex h-11 min-w-0 max-w-full shrink items-center gap-0.5 rounded-lg border transition-colors sm:h-9 sm:shrink-0 sm:p-0.5",
+              "inline-flex h-[44px] min-w-0 max-w-full shrink items-center gap-0.5 rounded-lg border transition-colors @min-[600px]/composer:h-9 @min-[600px]/composer:shrink-0 @min-[600px]/composer:p-0.5",
               recording
                 ? isDark
                   ? "border-rose-400/30 bg-rose-500/10"
@@ -5886,8 +7138,9 @@ export function VoiceSecretaryComposerControl({
           >
             <button
               type="button"
+              data-voice-row-record
               className={classNames(
-                "relative inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-50 sm:h-8 sm:w-8",
+                "relative inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-50 @min-[600px]/composer:h-8 @min-[600px]/composer:w-8",
                 recording
                   ? isDark
                     ? "bg-rose-500/20 text-rose-200 hover:bg-rose-500/28"
@@ -5903,6 +7156,7 @@ export function VoiceSecretaryComposerControl({
               disabled={
                 !!actionBusy ||
                 recordingStarting ||
+                recordingFinishing ||
                 controlDisabled ||
                 promptCaptureBlocked ||
                 (!recording && !dictationSupported)
@@ -5912,7 +7166,8 @@ export function VoiceSecretaryComposerControl({
               title={
                 promptCaptureBlocked
                   ? promptOptimizeTitle
-                  : `${assistantRowControlLabel} · ${assistantRowCurrentMode.label}`
+                  : audioSupportHint ||
+                    `${assistantRowControlLabel} · ${assistantRowCurrentMode.label}`
               }
             >
               {recording ? (
@@ -5924,7 +7179,7 @@ export function VoiceSecretaryComposerControl({
             <VoiceMobileMenu
               key={selectedGroupId}
               disabled={controlDisabled}
-              settingsLocked={recording || recordingStarting}
+              settingsLocked={recording || recordingStarting || recordingFinishing}
               promptAutoRefine={promptAutoRefine}
               onPromptAutoRefineChange={updatePromptAutoRefine}
               mode={composerCaptureMode}
@@ -5961,7 +7216,9 @@ export function VoiceSecretaryComposerControl({
                           ? "text-[var(--color-text-secondary)] hover:bg-white/10 hover:text-[var(--color-text-primary)]"
                           : "text-[var(--color-text-secondary)] hover:bg-black/5 hover:text-gray-900",
                       )}
-                      disabled={controlDisabled || recording || recordingStarting}
+                      disabled={
+                        controlDisabled || recording || recordingStarting || recordingFinishing
+                      }
                       title={
                         modeChangeDisabledReason ||
                         `${t("voiceSecretaryModeSelector", { defaultValue: "Voice Secretary capture mode" })}: ${assistantRowCurrentMode.label}`
@@ -5993,6 +7250,7 @@ export function VoiceSecretaryComposerControl({
                             key={option.key}
                             role="group"
                             aria-label={option.label}
+                            data-voice-menu-row
                             className={classNames(
                               "rounded-xl transition-colors",
                               active
@@ -6011,13 +7269,14 @@ export function VoiceSecretaryComposerControl({
                                 option.key === "prompt" ? "pt-2.5 pb-0" : "py-2.5",
                               )}
                               aria-pressed={active}
-                              disabled={recording || recordingStarting}
+                              disabled={recording || recordingStarting || recordingFinishing}
                               title={modeChangeDisabledReason || option.description}
                               onClick={() => {
                                 handleAssistantRowModeChange(option.key);
                               }}
                             >
                               <span
+                                data-voice-menu-tile
                                 className={classNames(
                                   "w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0",
                                   option.key === "document"
@@ -6053,6 +7312,7 @@ export function VoiceSecretaryComposerControl({
                                   {option.label}
                                 </span>
                                 <span
+                                  data-voice-menu-hint
                                   className={classNames(
                                     "block text-[11px]",
                                     isDark ? "text-[var(--color-text-tertiary)]" : "text-gray-500",
@@ -6076,7 +7336,12 @@ export function VoiceSecretaryComposerControl({
                               <div className="pb-0.5 pl-[46px] pr-3">
                                 <VoicePromptAutoRefineOption
                                   checked={promptAutoRefine}
-                                  disabled={controlDisabled || recording || recordingStarting}
+                                  disabled={
+                                    controlDisabled ||
+                                    recording ||
+                                    recordingStarting ||
+                                    recordingFinishing
+                                  }
                                   onChange={updatePromptAutoRefine}
                                 />
                               </div>
@@ -6095,6 +7360,8 @@ export function VoiceSecretaryComposerControl({
               {composerCaptureMode === "prompt" ? (
                 <button
                   type="button"
+                  data-voice-optimize
+                  data-status-tone={promptOptimizePending ? "warning" : undefined}
                   className={classNames(
                     "inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-50 sm:h-8 sm:w-8",
                     promptOptimizePending
@@ -6137,9 +7404,15 @@ export function VoiceSecretaryComposerControl({
                     aria-label={`${t("voiceSecretaryLanguage", { defaultValue: "Language" })}: ${configuredRecognitionLanguageLabel}`}
                   >
                     {configuredRecognitionLanguageShortLabel}
+                    <ChevronDownIcon size={12} data-voice-language-chevron aria-hidden="true" />
                   </button>
                 </PopoverTrigger>
-                <PopoverContent align="start" sideOffset={6} className="w-52 rounded-2xl p-1.5">
+                <PopoverContent
+                  align="start"
+                  sideOffset={6}
+                  className="w-52 rounded-2xl p-1.5"
+                  data-voice-language-menu
+                >
                   <div
                     role="group"
                     aria-label={t("voiceSecretaryLanguage", { defaultValue: "Language" })}
@@ -6150,6 +7423,7 @@ export function VoiceSecretaryComposerControl({
                         <button
                           key={optionValue}
                           type="button"
+                          data-voice-menu-row
                           className={classNames(
                             "flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left transition-colors",
                             active
@@ -6167,6 +7441,7 @@ export function VoiceSecretaryComposerControl({
                           }}
                         >
                           <span
+                            data-voice-menu-tile
                             className={classNames(
                               "flex h-6 w-8 shrink-0 items-center justify-center rounded-md text-[10px] font-bold tracking-[0.08em]",
                               isDark ? "bg-white/10 text-slate-200" : "bg-gray-100 text-gray-700",
@@ -6201,6 +7476,8 @@ export function VoiceSecretaryComposerControl({
 
               <button
                 type="button"
+                data-voice-expand
+                data-open={open || undefined}
                 className={classNames(
                   "inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-50 sm:h-8 sm:w-8",
                   open
@@ -6229,6 +7506,7 @@ export function VoiceSecretaryComposerControl({
             {composerErrorText ? (
               <div
                 data-voice-secretary-error
+                data-status-tone="error"
                 role="status"
                 className={classNames(
                   "max-w-[min(34rem,calc(100vw-6rem))] break-words rounded-lg px-2.5 py-1 text-[11px]",
@@ -6251,6 +7529,7 @@ export function VoiceSecretaryComposerControl({
             {speechErrorHint ? (
               <div
                 data-voice-recognition-error
+                data-status-tone="error"
                 role="status"
                 className={classNames(
                   "max-w-[min(34rem,calc(100vw-6rem))] rounded-lg px-2.5 py-1 text-[11px]",
@@ -6258,20 +7537,65 @@ export function VoiceSecretaryComposerControl({
                 )}
               >
                 {speechErrorHint}
+                {canUseSystemDefaultMic ? (
+                  <button
+                    type="button"
+                    data-voice-use-default-mic
+                    className="ml-2 inline-flex min-h-7 items-center font-semibold underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-[var(--color-border-focus)] pointer-coarse:min-h-11"
+                    onClick={useSystemDefaultMic}
+                  >
+                    {t("voiceSecretaryUseSystemDefaultMic", {
+                      defaultValue: "Use system default microphone",
+                    })}
+                  </button>
+                ) : null}
               </div>
             ) : null}
-            {composerActivity === "recording" ? (
+            {!open && voiceInputSilenceHint ? (
+              <div
+                data-voice-input-silence
+                data-status-tone="warning"
+                role="status"
+                className="max-w-[min(34rem,calc(100vw-6rem))] rounded-lg px-2.5 py-1 text-[11px] text-amber-700 dark:text-amber-300"
+              >
+                {voiceInputSilenceHint}
+              </div>
+            ) : null}
+            {composerActivity === "finishing" ? (
+              <div
+                data-voice-composer-activity="finishing"
+                data-status-tone="neutral"
+                className="inline-flex max-w-[min(40rem,calc(100vw-6rem))] flex-wrap items-center gap-1.5 rounded-lg bg-[var(--color-bg-tertiary)] px-2.5 py-1 text-[11px] text-[var(--color-text-secondary)]"
+              >
+                <span className="font-semibold">{t("voiceSecretaryFinalizingRecording")}</span>
+                {showStopWaiting ? (
+                  <>
+                    <span>{t("voiceSecretaryStopWaitingHint")}</span>
+                    <button
+                      type="button"
+                      data-voice-stop-waiting
+                      className="rounded px-1 font-semibold underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-[var(--color-border-focus)]"
+                      onClick={() => stopWaitingForServiceFinal(longFinalWaitRunId)}
+                    >
+                      {t("voiceSecretaryStopWaiting")}
+                    </button>
+                  </>
+                ) : null}
+              </div>
+            ) : composerActivity === "recording" ? (
               <div
                 data-voice-composer-activity="recording"
                 className={classNames(
-                  "inline-flex max-w-[min(40rem,calc(100vw-6rem))] items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px]",
+                  "inline-flex max-w-[min(40rem,calc(100vw-6rem))] flex-wrap items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px]",
                   isDark ? "bg-rose-400/12 text-rose-100" : "bg-rose-50 text-rose-800",
                 )}
                 title={recordingGroupNoticeText ? recordingSettingsLockedTitle : undefined}
               >
-                <span className="shrink-0 font-semibold">{recordingTargetText}</span>
+                <span className="min-w-0 font-semibold [overflow-wrap:anywhere]">
+                  {recordingTargetText}
+                </span>
                 {liveTranscriptSummaryPreview ? (
-                  <span className="min-w-0 truncate opacity-80">
+                  <span className="min-w-0 flex-1 truncate opacity-80">
                     {liveTranscriptSummaryPreview}
                   </span>
                 ) : null}
@@ -6288,6 +7612,9 @@ export function VoiceSecretaryComposerControl({
             ) : composerActivity === "promptWaiting" || composerActivity === "promptReady" ? (
               <div
                 data-voice-composer-activity={composerActivity}
+                data-status-tone={
+                  composerActivity === "promptReady" && !promptNeedsReview ? "ok" : "warning"
+                }
                 className={classNames(
                   "inline-flex max-w-[min(34rem,calc(100vw-6rem))] items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px]",
                   composerActivity === "promptReady" && !promptNeedsReview
@@ -6351,10 +7678,8 @@ export function VoiceSecretaryComposerControl({
             ) : composerActivity === "ask" && pendingAskFeedback ? (
               <div
                 data-voice-composer-activity="ask"
-                className={classNames(
-                  "inline-flex max-w-[min(34rem,calc(100vw-6rem))] items-center rounded-full pl-2.5 pr-1 text-left text-[11px]",
-                  askFeedbackStatusClassName(pendingAskFeedbackStatus),
-                )}
+                data-status-tone={voiceAskStatusTone(pendingAskFeedbackStatus) || "neutral"}
+                className="inline-flex max-w-[min(34rem,calc(100vw-6rem))] items-center pl-2.5 pr-1 text-left text-[11px]"
               >
                 <button
                   type="button"
@@ -6394,6 +7719,7 @@ export function VoiceSecretaryComposerControl({
             ) : composerActivity === "transcript" ? (
               <div
                 data-voice-composer-activity="transcript"
+                data-status-tone="info"
                 className={classNames(
                   "inline-flex max-w-[min(40rem,calc(100vw-6rem))] items-start rounded-full px-2.5 py-1 text-left text-[11px]",
                   isDark ? "bg-cyan-400/12 text-cyan-100" : "bg-cyan-50 text-cyan-900",

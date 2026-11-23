@@ -1,5 +1,7 @@
 #![cfg(unix)]
 mod auth_support;
+#[path = "messaging_upload/origin_authority.rs"]
+mod origin_authority;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -497,3 +499,5 @@ async fn wait_for_address(home: &HomeLayout) {
     }
     panic!("daemon address was not created");
 }
+
+cccc_daemon::session_owner_test_entry!();

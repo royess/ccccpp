@@ -2,6 +2,259 @@ use cccc_contracts::{DaemonRequest, DaemonResponse};
 use cccc_core::{GroupStore, HomeLayout};
 use serde_json::{Map, Value, json};
 
+fn web_instruction_fixture() -> (tempfile::TempDir, HomeLayout, String, std::path::PathBuf) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let instructions = workspace.join("AGENTS.md");
+    std::fs::write(&instructions, "original instructions").expect("original instructions");
+    let created = call(&home, "group_create", json!({"title":"instruction notice"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id")
+        .to_owned();
+    let store = GroupStore::new(home.clone()).expect("store");
+    let scope = cccc_core::scope::detect(&workspace).expect("workspace scope");
+    cccc_core::group_scope::attach(&store, &group_id, scope).expect("attach workspace");
+    call(
+        &home,
+        "actor_add",
+        json!({"group_id":group_id,"actor_id":"web1","runtime":"web_model","by":"user"}),
+    );
+    store
+        .mutate(&group_id, |group| {
+            group.running = true;
+            Ok(())
+        })
+        .expect("running Group");
+    call(
+        &home,
+        "actor_start",
+        json!({"group_id":group_id,"actor_id":"web1","by":"user"}),
+    );
+    (temp, home, group_id, instructions)
+}
+
+fn web_notice_turn(home: &HomeLayout, group_id: &str, transport: &str) -> Value {
+    call(
+        home,
+        "send",
+        json!({"group_id":group_id,"by":"user","to":["web1"],"text":"next","message_mode":"send"}),
+    );
+    let response = call(
+        home,
+        "runtime_wait_next_turn",
+        json!({"group_id":group_id,"actor_id":"web1","by":"web1","transport":transport}),
+    );
+    assert_eq!(response.result["status"], "work_available");
+    response.result["turn"].clone()
+}
+
+fn complete_web_notice_turn(home: &HomeLayout, group_id: &str, turn: &Value) {
+    call(
+        home,
+        "runtime_complete_turn",
+        json!({"group_id":group_id,"actor_id":"web1","by":"web1","status":"done","turn_id":turn["turn_id"],"event_ids":turn["event_ids"]}),
+    );
+}
+
+#[test]
+fn web_scope_change_is_monitored_before_the_next_delivery() {
+    for method in ["attach", "group_use", "group_detach_scope", "actor_update"] {
+        let (temp, home, group_id, _) = web_instruction_fixture();
+        let previous_scope = GroupStore::new(home.clone())
+            .expect("store")
+            .load(&group_id)
+            .expect("group")
+            .active_scope_key;
+        let workspace = temp.path().join("new-workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let instructions = workspace.join("AGENTS.md");
+        std::fs::write(&instructions, "first version").expect("original instructions");
+        let attached = call(
+            &home,
+            "attach",
+            json!({"group_id":group_id,"by":"user","path":workspace,"activate":method == "attach"}),
+        );
+        if method == "group_use" {
+            call(
+                &home,
+                "group_use",
+                json!({"group_id":group_id,"by":"user","path":workspace}),
+            );
+        } else if method == "group_detach_scope" {
+            call(
+                &home,
+                "group_detach_scope",
+                json!({"group_id":group_id,"by":"user","scope_key":previous_scope}),
+            );
+        } else if method == "actor_update" {
+            call(
+                &home,
+                "actor_update",
+                json!({"group_id":group_id,"actor_id":"web1","by":"user","patch":{"default_scope_key":attached.result["scope_key"]}}),
+            );
+        }
+        // This is the group_show projection that cccc_file consults on every
+        // call, including calls made during a previously delivered turn.
+        let shown = call(
+            &home,
+            "group_show",
+            json!({"group_id":group_id,"by":"web1"}),
+        );
+        assert_eq!(
+            shown.result["effective_scope"]["path"],
+            json!(workspace.canonicalize().expect("workspace root")),
+            "{method}"
+        );
+        std::fs::write(instructions, "changed before the next message")
+            .expect("changed instructions");
+        let turn = web_notice_turn(&home, &group_id, "web_model_pull");
+        assert!(
+            turn["coalesced_text"]
+                .as_str()
+                .expect("text")
+                .contains("AGENTS.md changed"),
+            "{method}"
+        );
+    }
+}
+
+#[test]
+fn web_session_retains_instruction_baselines_when_switching_workspaces() {
+    let (temp, home, group_id, instructions_a) = web_instruction_fixture();
+    let workspace_a = instructions_a.parent().expect("first workspace");
+    let workspace_b = temp.path().join("second-workspace");
+    std::fs::create_dir(&workspace_b).expect("second workspace");
+    let instructions_b = workspace_b.join("AGENTS.md");
+    std::fs::write(&instructions_b, "first version").expect("second instructions");
+    let store = GroupStore::new(home.clone()).expect("store");
+    cccc_core::group_scope::attach(
+        &store,
+        &group_id,
+        cccc_core::scope::detect(&workspace_b).expect("second scope"),
+    )
+    .expect("activate second");
+    let first_b = web_notice_turn(&home, &group_id, "web_model_pull");
+    assert!(
+        !first_b["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("INSTRUCTION FILES CHANGED")
+    );
+    complete_web_notice_turn(&home, &group_id, &first_b);
+
+    std::fs::write(&instructions_a, "changed while away").expect("change first");
+    cccc_core::group_scope::attach(
+        &store,
+        &group_id,
+        cccc_core::scope::detect(workspace_a).expect("first scope"),
+    )
+    .expect("reactivate first");
+    let second_a = web_notice_turn(&home, &group_id, "web_model_pull");
+    assert!(
+        second_a["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("AGENTS.md changed")
+    );
+    complete_web_notice_turn(&home, &group_id, &second_a);
+
+    std::fs::write(&instructions_b, "changed while away").expect("change second");
+    cccc_core::group_scope::attach(
+        &store,
+        &group_id,
+        cccc_core::scope::detect(&workspace_b).expect("second scope"),
+    )
+    .expect("reactivate second");
+    let second_b = web_notice_turn(&home, &group_id, "web_model_pull");
+    assert!(
+        second_b["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("AGENTS.md changed")
+    );
+}
+
+#[test]
+fn pulled_web_turn_delivers_the_instruction_notice_only_once() {
+    let (_temp, home, group_id, instructions) = web_instruction_fixture();
+    std::fs::write(instructions, "changed before first turn").expect("changed instructions");
+    let first = web_notice_turn(&home, &group_id, "web_model_pull");
+    assert!(
+        first["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("AGENTS.md changed")
+    );
+    complete_web_notice_turn(&home, &group_id, &first);
+    let second = web_notice_turn(&home, &group_id, "web_model_pull");
+    assert!(
+        !second["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("INSTRUCTION FILES CHANGED")
+    );
+}
+
+#[test]
+fn browser_notice_waits_for_submission_and_keeps_later_changes() {
+    let (_temp, home, group_id, instructions) = web_instruction_fixture();
+    std::fs::write(&instructions, "first change").expect("first change");
+    let first = web_notice_turn(&home, &group_id, "web_model_browser");
+    assert!(
+        first["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("AGENTS.md changed")
+    );
+    // This arrives after the payload was formed, and must not be swallowed by
+    // the successful submission of that earlier payload.
+    std::fs::write(&instructions, "second change").expect("second change");
+    call(
+        &home,
+        "web_model_browser_delivery_record",
+        json!({"group_id":group_id,"actor_id":"web1","by":"web1","turn_id":first["turn_id"],"event_ids":first["event_ids"],"delivery_id":"first","browser_delivery":{"state":"submitted"}}),
+    );
+    complete_web_notice_turn(&home, &group_id, &first);
+
+    let second = web_notice_turn(&home, &group_id, "web_model_browser");
+    assert!(
+        second["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("AGENTS.md changed")
+    );
+    call(
+        &home,
+        "web_model_browser_delivery_record",
+        json!({"group_id":group_id,"actor_id":"web1","by":"web1","turn_id":second["turn_id"],"event_ids":second["event_ids"],"delivery_id":"second","browser_delivery":{"state":"ambiguous"}}),
+    );
+    complete_web_notice_turn(&home, &group_id, &second);
+
+    let third = web_notice_turn(&home, &group_id, "web_model_browser");
+    assert!(
+        third["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("AGENTS.md changed")
+    );
+    call(
+        &home,
+        "web_model_browser_delivery_record",
+        json!({"group_id":group_id,"actor_id":"web1","by":"web1","turn_id":third["turn_id"],"event_ids":third["event_ids"],"delivery_id":"third","browser_delivery":{"state":"submitted"}}),
+    );
+    complete_web_notice_turn(&home, &group_id, &third);
+    let fourth = web_notice_turn(&home, &group_id, "web_model_browser");
+    assert!(
+        !fourth["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("INSTRUCTION FILES CHANGED")
+    );
+}
+
 #[test]
 fn web_model_actor_uses_the_structured_turn_contract_without_a_terminal() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -63,7 +316,7 @@ fn web_model_actor_uses_the_structured_turn_contract_without_a_terminal() {
         .expect("event ids");
     for event_id in &event_ids {
         let event_id = event_id.as_str().expect("event id");
-        assert!(coalesced.contains(&format!("[event_id={event_id}]")));
+        assert!(coalesced.contains(&format!("[event_id={event_id} sent=")));
     }
     let turn_id = turn.result["turn"]["turn_id"]
         .as_str()
@@ -328,6 +581,115 @@ fn stranded_browser_mail_claim_remains_uncertain_until_real_submission_evidence_
         active.result["active_turn_id"], new_turn.result["turn"]["turn_id"],
         "late evidence never resubmits the notice or replaces newer work"
     );
+}
+
+#[test]
+fn idle_browser_polls_rewrite_the_group_file_only_when_its_state_changes() {
+    const OLD: &str = "2000-01-01T00:00:00Z";
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home");
+    let created = call(&home, "group_create", json!({"title":"idle browser"}));
+    let group_id = created.result["group"]["group_id"]
+        .as_str()
+        .expect("group id")
+        .to_owned();
+    call(
+        &home,
+        "actor_add",
+        json!({"group_id":group_id,"actor_id":"web1","runtime":"web_model","by":"user"}),
+    );
+    let store = GroupStore::new(home.clone()).expect("store");
+    store
+        .mutate(&group_id, |group| {
+            group.running = true;
+            Ok(())
+        })
+        .expect("fixture running");
+    let group_file = store
+        .group_dir(&group_id)
+        .expect("group dir")
+        .join("group.yaml");
+    let poll = |transport: &str| {
+        call(
+            &home,
+            "runtime_wait_next_turn",
+            json!({"group_id":group_id,"actor_id":"web1","by":"web1","transport":transport}),
+        )
+        .result["status"]
+            .clone()
+    };
+    let stored = || {
+        cccc_core::integration_state::group_get(&store, &group_id, "runtime_states")
+            .expect("runtime states")["web1"]
+            .clone()
+    };
+    let store_state = |state: Value| {
+        cccc_core::integration_state::group_update(&store, &group_id, "runtime_states", |states| {
+            states["web1"] = state;
+            Ok(())
+        })
+        .expect("state fixture");
+    };
+    let recorded_idle = |state: &Value| {
+        state["status"] == "waiting"
+            && state["active_turn_id"] == ""
+            && state["latest_event_id"] == ""
+            && state["active_event_ids"] == json!([])
+    };
+
+    assert_eq!(poll("web_model_browser"), "idle");
+    assert!(recorded_idle(&stored()), "{}", stored());
+
+    let mut settled = stored();
+    settled["updated_at"] = json!(OLD);
+    store_state(settled.clone());
+    let before = std::fs::read_to_string(&group_file).expect("group file");
+    for _ in 0..3 {
+        assert_eq!(poll("web_model_browser"), "idle");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&group_file).expect("group file"),
+        before
+    );
+    assert_eq!(stored()["updated_at"], OLD);
+
+    assert_eq!(poll("web_model_pull"), "idle");
+    assert_ne!(stored()["updated_at"], OLD, "pull polls keep recording");
+
+    for (field, value) in [
+        ("status", Some(json!("idle"))),
+        ("active_turn_id", None),
+        ("latest_event_id", Some(json!("residual"))),
+        ("active_event_ids", Some(json!(["residual"]))),
+        ("active_event_ids", None),
+        ("updated_at", None),
+    ] {
+        let mut state = settled.clone();
+        match value {
+            Some(value) => state[field] = value,
+            None => {
+                state.as_object_mut().expect("state").remove(field);
+            }
+        }
+        store_state(state);
+        assert_eq!(poll("web_model_browser"), "idle");
+        let after = stored();
+        assert!(recorded_idle(&after), "{field}: {after}");
+        assert!(
+            after["updated_at"]
+                .as_str()
+                .is_some_and(|at| !at.is_empty() && at != OLD),
+            "{field}: {after}"
+        );
+    }
+
+    call(
+        &home,
+        "send",
+        json!({"group_id":group_id,"by":"user","to":["web1"],"text":"new work","message_mode":"send"}),
+    );
+    assert_eq!(poll("web_model_browser"), "work_available");
+    assert_eq!(poll("web_model_browser"), "turn_in_progress");
 }
 
 fn browser_mail_notice_fixture() -> (tempfile::TempDir, HomeLayout, String, cccc_contracts::Event) {

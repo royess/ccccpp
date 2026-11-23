@@ -53,6 +53,7 @@ mod tests {
         let reachable = ordinary
             .chain(cccc_core::web_model_tool_names())
             .chain(cccc_core::USER_CONTROL_TOOL_NAMES.iter().copied())
+            .chain(cccc_core::LOCAL_SESSION_TOOL_NAMES.iter().copied())
             .chain(cccc_core::VOICE_SECRETARY_TASK_TOOL_NAMES.iter().copied())
             .map(str::to_owned)
             .chain(packs)
@@ -87,7 +88,8 @@ mod tests {
         assert!(names.contains("cccc_connect"));
         assert_eq!(names.len(), catalog.len());
         assert!(names.contains("cccc_code_exec"));
-        assert!(names.contains("cccc_memory_admin"));
+        assert!(!names.contains("cccc_memory"));
+        assert!(!names.contains("cccc_memory_admin"));
     }
 
     #[test]
@@ -118,6 +120,28 @@ mod tests {
             assert_eq!(tool["annotations"]["readOnlyHint"], true, "{name}");
             assert_eq!(tool["annotations"]["openWorldHint"], false, "{name}");
         }
+        let search = catalog
+            .iter()
+            .find(|tool| tool["name"] == "cccc_capability_search")
+            .expect("capability search tool");
+        assert_eq!(
+            search["inputSchema"]["properties"]["recommended"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            search["inputSchema"]["properties"]["recommended"]["default"],
+            false
+        );
+        for name in [
+            "kind",
+            "source_id",
+            "trust_tier",
+            "qualification_status",
+            "limit",
+            "include_external",
+        ] {
+            assert!(search["inputSchema"]["properties"].get(name).is_none());
+        }
         for name in [
             "cccc_file_send",
             "cccc_message_reply",
@@ -147,5 +171,37 @@ mod tests {
             .expect("send");
         assert!(send["inputSchema"]["properties"].get("action").is_none());
         assert_eq!(send["inputSchema"]["required"], serde_json::json!(["path"]));
+    }
+
+    #[test]
+    fn the_question_schema_states_the_contract_limits() {
+        use cccc_contracts::reply_question::{
+            MAX_LABEL_CHARS, MAX_NOTE_CHARS, MAX_PROMPT_CHARS, OPTION_IDS,
+        };
+        let catalog = super::catalog();
+        let send = catalog
+            .iter()
+            .find(|t| t["name"] == "cccc_message_send")
+            .expect("send");
+        let question = &send["inputSchema"]["properties"]["question"]["properties"];
+        let options = &question["options"];
+        assert_eq!(options["maxItems"], OPTION_IDS.len());
+        assert_eq!(
+            question["recommended"]["properties"]["option_id"]["enum"],
+            serde_json::json!(OPTION_IDS)
+        );
+        assert_eq!(question["prompt"]["maxLength"], MAX_PROMPT_CHARS);
+        assert_eq!(
+            options["items"]["properties"]["label"]["maxLength"],
+            MAX_LABEL_CHARS
+        );
+        assert_eq!(
+            options["items"]["properties"]["consequence"]["maxLength"],
+            MAX_NOTE_CHARS
+        );
+        assert_eq!(
+            question["recommended"]["properties"]["reason"]["maxLength"],
+            MAX_NOTE_CHARS
+        );
     }
 }

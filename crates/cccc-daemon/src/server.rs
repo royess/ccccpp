@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use cccc_contracts::{DaemonAddress, Transport, utc_now};
 use cccc_core::HomeLayout;
+use cccc_core::attended_update::{self, BuildIdentity};
 use cccc_core::fs::write_json;
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
@@ -24,14 +25,58 @@ use crate::server_lifecycle::{DaemonLifecycle, cleanup_stale};
 type RuntimeRestoreSpawner = fn(HomeLayout, DispatchLocks);
 
 pub async fn run(home: HomeLayout) -> Result<()> {
-    run_with_restore(home, crate::ops::runtime_restore::spawn).await
+    run_with_restore(home, crate::ops::runtime_restore::spawn, false).await
 }
 
-async fn run_with_restore(home: HomeLayout, restore: RuntimeRestoreSpawner) -> Result<()> {
+/// Run the CLI-owned daemon with bounded, content-free diagnostics. The library
+/// entry point leaves subscriber ownership with its embedding application.
+pub async fn run_with_diagnostics(home: HomeLayout) -> Result<()> {
+    run_with_restore(home, crate::ops::runtime_restore::spawn, true).await
+}
+
+/// Continue a prepared, supervised update using an explicit startup permit.
+/// The executable must match the target recorded before the old daemon stopped.
+pub async fn run_with_diagnostics_resuming(home: HomeLayout, transaction_dir: &Path) -> Result<()> {
+    run_with_restore_resuming(
+        home,
+        crate::ops::runtime_restore::spawn,
+        true,
+        Some(transaction_dir),
+    )
+    .await
+}
+
+async fn run_with_restore(
+    home: HomeLayout,
+    restore: RuntimeRestoreSpawner,
+    diagnostics: bool,
+) -> Result<()> {
+    run_with_restore_resuming(home, restore, diagnostics, None).await
+}
+
+async fn run_with_restore_resuming(
+    home: HomeLayout,
+    restore: RuntimeRestoreSpawner,
+    diagnostics: bool,
+    resume: Option<&Path>,
+) -> Result<()> {
     home.initialize().context("initialize Rust home")?;
     let paths = DaemonPaths::new(home);
     std::fs::create_dir_all(&paths.daemon_dir)?;
-    let lock = claim_home(&paths)?;
+    let lock = match resume {
+        Some(transaction) => claim_home_resuming(&paths, Some(transaction))?,
+        None => claim_home(&paths)?,
+    };
+    #[cfg(unix)]
+    validate_endpoint_path(&paths)?;
+    let owner_home = paths.home.clone();
+    let retained =
+        tokio::task::spawn_blocking(move || crate::session_owner::initialize(&owner_home))
+            .await??;
+    crate::session_owner::prepare_shutdown(&paths.home, retained)?;
+    if diagnostics {
+        crate::diagnostic_log::install(&paths.daemon_dir);
+    }
     if let Err(error) = cccc_core::group_bridge_retirement::retire(&paths.home) {
         tracing::warn!(%error, "manual Group Bridge state retained for retirement on next startup");
     }
@@ -41,6 +86,8 @@ async fn run_with_restore(home: HomeLayout, restore: RuntimeRestoreSpawner) -> R
     std::fs::write(&lifecycle.paths.pid, format!("{}\n", std::process::id()))?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let actor_activity = ActorActivityService::start(lifecycle.paths.home.clone());
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let memory_maintenance = crate::server_memory::MemoryMaintenance::start();
     let dispatch_locks = DispatchLocks::default();
 
     let result = if use_tcp() {
@@ -63,6 +110,8 @@ async fn run_with_restore(home: HomeLayout, restore: RuntimeRestoreSpawner) -> R
         .await
     };
     actor_activity.finish().await;
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    memory_maintenance.finish().await;
     lifecycle.finish(result)
 }
 
@@ -213,7 +262,14 @@ async fn serve_platform_default(
 /// lock holder may terminate what a previous owner left behind: a rejected second
 /// start must never touch the running daemon's process groups.
 pub(crate) fn claim_home(paths: &DaemonPaths) -> Result<File> {
+    claim_home_resuming(paths, None)
+}
+
+fn claim_home_resuming(paths: &DaemonPaths, resume: Option<&Path>) -> Result<File> {
+    let actual = BuildIdentity::current();
+    attended_update::check_start(&paths.home, resume, &actual)?;
     let lock = acquire_daemon_lock(&paths.lock)?;
+    attended_update::check_start(&paths.home, resume, &actual)?;
     crate::process_tree::protect_daemon_host(&paths.home).context("protect daemon process tree")?;
     Ok(lock)
 }
@@ -248,6 +304,9 @@ fn write_address(
             port,
             pid: std::process::id(),
             version: env!("CARGO_PKG_VERSION").into(),
+            source_id: cccc_core::build_info::source_id()
+                .unwrap_or_default()
+                .into(),
             ts: utc_now(),
         },
     )?;
@@ -283,9 +342,11 @@ async fn shutdown_signal() -> Result<()> {
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result?,
             _ = terminate.recv() => {},
+            _ = hangup.recv() => {},
         }
     }
     #[cfg(windows)]
@@ -313,7 +374,21 @@ fn use_tcp() -> bool {
     cfg!(not(unix)) || std::env::var("CCCC_DAEMON_TRANSPORT").is_ok_and(|value| value == "tcp")
 }
 
+#[cfg(unix)]
+pub(super) fn validate_endpoint_path(paths: &DaemonPaths) -> Result<()> {
+    if !use_tcp() {
+        std::os::unix::net::SocketAddr::from_pathname(&paths.socket).with_context(|| {
+            format!(
+                "The daemon's Unix socket path is too long: {}. Set CCCC_HOME to a shorter path, such as a symlink in a directory you control pointing to the same CCCC home.",
+                paths.socket.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn begin_runtime_shutdown(home: &HomeLayout) {
+    crate::session_owner::begin_shutdown(home);
     let _ = crate::runtime_start_gate::prevent(home);
 }
 
@@ -322,6 +397,24 @@ mod tests {
     use super::*;
     use cccc_contracts::Actor;
     use cccc_core::{GroupStore, ledger};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hangup_selects_the_same_normal_shutdown_path_as_terminate() {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Keep a test-local handler so the old implementation times out rather
+        // than terminating the entire test process on an unhandled HUP.
+        let _hangup = signal(SignalKind::hangup()).expect("install test HUP handler");
+        let waiting = tokio::spawn(shutdown_signal());
+        tokio::task::yield_now().await;
+        nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGHUP)
+            .expect("send HUP to test process");
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("HUP must request shutdown")
+            .expect("shutdown task completes")
+            .expect("HUP selects normal stop");
+    }
 
     #[tokio::test]
     async fn startup_reconciles_saved_reach_without_a_status_poll() {
@@ -384,7 +477,28 @@ mod tests {
     fn assert_address_is_published(home: HomeLayout, _locks: DispatchLocks) {
         let paths = DaemonPaths::new(home);
         assert!(paths.address.exists());
+        let address: DaemonAddress =
+            serde_json::from_slice(&std::fs::read(&paths.address).expect("read daemon address"))
+                .expect("daemon address");
+        assert_eq!(
+            address.source_id,
+            cccc_core::build_info::source_id().unwrap_or_default()
+        );
         std::fs::write(paths.daemon_dir.join("restore.started"), b"").expect("mark restore start");
+    }
+
+    /// On Unix, a child spawned by a concurrently running test can keep an
+    /// inherited copy of the lock's descriptor until it execs, and the flock
+    /// with it, so a released lock can stay busy until that copy closes.
+    fn reclaim<T>(mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let claimed = attempt();
+            if claimed.is_some() || std::time::Instant::now() >= deadline {
+                return claimed;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -397,7 +511,13 @@ mod tests {
 
         assert!(path.exists());
         drop(lock);
-        acquire_daemon_lock(&path).expect("reclaim released lock");
+        let mut last_error = None;
+        reclaim(|| {
+            acquire_daemon_lock(&path)
+                .map_err(|error| last_error = Some(error))
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("reclaim released lock: {last_error:?}"));
     }
 
     #[test]

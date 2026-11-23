@@ -2,7 +2,7 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
-import type { Actor } from "../types";
+import type { Actor, GroupDoc } from "../types";
 
 const mocks = vi.hoisted(() => ({
   pause: vi.fn(),
@@ -11,8 +11,14 @@ const mocks = vi.hoisted(() => ({
   browser: vi.fn(),
   settings: vi.fn(),
   load: vi.fn(),
+  recovery: vi.fn(),
   update: vi.fn(),
+  release: vi.fn(),
+  refresh: vi.fn(),
+  error: vi.fn(),
   access: true,
+  settingsOpen: false,
+  groupDoc: null as GroupDoc | null,
 }));
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en" } }),
@@ -26,9 +32,10 @@ vi.mock("@xterm/xterm", () => ({
 }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class {} }));
 vi.mock("../stores", () => ({
-  useGroupStore: (select: (state: unknown) => unknown) => select({ chatByGroup: {} }),
+  useGroupStore: (select: (state: unknown) => unknown) =>
+    select({ chatByGroup: {}, groupDoc: mocks.groupDoc, refreshActors: mocks.refresh }),
   useUIStore: (select: (state: unknown) => unknown) =>
-    select({ actorBusy: {}, canAccessGlobalSettings: mocks.access }),
+    select({ actorBusy: {}, canAccessGlobalSettings: mocks.access, showError: mocks.error }),
   useObservabilityStore: (select: (state: unknown) => unknown) =>
     select({ loaded: true, terminalScrollbackLines: 1000 }),
   useTerminalSignalsStore: (select: (state: unknown) => unknown) => select({}),
@@ -36,7 +43,7 @@ vi.mock("../stores", () => ({
     select({
       openActorEditor: mocks.edit,
       openSettingsTarget: mocks.settings,
-      modals: { settings: false },
+      modals: { settings: mocks.settingsOpen },
     }),
 }));
 vi.mock("../hooks/useActorDisplayState", () => ({
@@ -55,6 +62,9 @@ vi.mock("./agentTerminal/useAgentTerminalConnection", () => ({
 }));
 vi.mock("./webModel/WebModelRuntimePanel", () => ({ WebModelRuntimePanel: mocks.browser }));
 vi.mock("./headless/ActorAcpControls", () => ({ ActorAcpControls: () => null }));
+vi.mock("../services/api/localSessions", () => ({
+  fetchLocalSessionRecovery: (...args: unknown[]) => mocks.recovery(...args),
+}));
 vi.mock("../services/api", () => ({
   fetchWebModelConnectors: async () => ({
     ok: true,
@@ -66,8 +76,10 @@ vi.mock("../services/api", () => ({
   fetchGrokActorState: (...args: unknown[]) => mocks.load(...args),
   fetchDotsActorState: (...args: unknown[]) => mocks.load(...args),
   updateDotsActorConnection: (...args: unknown[]) => mocks.update(...args),
+  releaseActorStartupInput: (...args: unknown[]) => mocks.release(...args),
 }));
 import { AgentTab } from "./AgentTab";
+import { STARTUP_INPUT_WAIT_SHOWN_AFTER_MS } from "../hooks/useStartupInputWaiting";
 
 let host: HTMLDivElement;
 let root: ReturnType<typeof createRoot>;
@@ -97,8 +109,23 @@ beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   vi.clearAllMocks();
   mocks.access = true;
+  mocks.settingsOpen = false;
+  mocks.groupDoc = { group_id: "g_dot", state: "active" };
   vi.useFakeTimers();
   mocks.load.mockResolvedValue(dotsState());
+  mocks.recovery.mockImplementation(async (groupId: string, actorId: string) => ({
+    ok: true,
+    result: {
+      group_id: groupId,
+      actor_id: actorId,
+      source_id: "codex:fixture",
+      recovery: {
+        state: "connected",
+        cwd: "/synthetic/native",
+        command: "CCCC_HOME='/synthetic/cccc' codex resume 'fixture'",
+      },
+    },
+  }));
   mocks.update.mockResolvedValue({ ok: true, result: { instructions: "native setup only" } });
   host = document.createElement("div");
   document.body.append(host);
@@ -109,21 +136,28 @@ afterEach(async () => {
   host.remove();
   vi.useRealTimers();
 });
-async function render(compact: boolean, currentActor = actor, groupId = "g_dot") {
+async function render(
+  compact: boolean,
+  currentActor = actor,
+  groupId = "g_dot",
+  readOnly = false,
+  isVisible = true,
+) {
   await act(async () =>
     root.render(
       <AgentTab
         actor={currentActor}
         groupId={groupId}
         agentState={null}
-        isVisible
+        isVisible={isVisible}
         compact={compact}
+        readOnly={readOnly}
         actorStatusProvisional={false}
         onQuit={mocks.pause}
         onLaunch={mocks.launch}
         onRelaunch={vi.fn()}
         onNewSession={vi.fn()}
-        onEdit={vi.fn()}
+        onEdit={mocks.edit}
         onRemove={vi.fn()}
         onInbox={vi.fn()}
         busy=""
@@ -133,6 +167,200 @@ async function render(compact: boolean, currentActor = actor, groupId = "g_dot")
     ),
   );
 }
+
+it("keeps confirmation visible after Actor refresh without adding read-only controls", async () => {
+  const waiting: Actor = {
+    id: "claude",
+    title: "Claude",
+    runtime: "claude",
+    runner_effective: "pty",
+    running: true,
+    runtime_state_source: "terminal",
+    runtime_confirmation_required: true,
+  };
+  // The existing transport mock keeps this a component contract, not a real PTY test.
+  await render(true, waiting, "g_confirmation", true, false);
+  const notice = host.querySelector("[data-runtime-confirmation]")!;
+  expect(notice.getAttribute("role")).toBe("status");
+  // The header names the state; the notice says once what to do.
+  expect(notice.textContent).toBe("runtimeConfirmationHint");
+  expect(host.textContent).toContain("runtimeConfirmationPending");
+  expect(notice.querySelector("button,input")).toBeNull();
+  expect(mocks.launch).not.toHaveBeenCalled();
+  expect(mocks.pause).not.toHaveBeenCalled();
+  await render(
+    true,
+    { ...waiting, runtime_confirmation_required: false },
+    "g_confirmation",
+    true,
+    false,
+  );
+  expect(host.querySelector("[data-runtime-confirmation]")).toBeNull();
+});
+
+it("says why a stopped Claude waits only when the daemon reports the paused confirmation", async () => {
+  const stopped: Actor = {
+    id: "claude",
+    title: "Claude",
+    runtime: "claude",
+    runner_effective: "pty",
+    enabled: true,
+    running: false,
+  };
+  await render(false, { ...stopped, runtime_confirmation_paused: true }, "g_confirmation");
+  const notice = host.querySelector('[data-runtime-confirmation="paused"]')!;
+  expect(notice.getAttribute("role")).toBe("status");
+  expect(notice.textContent).toBe("runtimeConfirmationPausedHint");
+  expect(host.textContent).toContain("runtimeConfirmationPaused");
+  // Without a Launch control the state stays named, but no instruction is shown.
+  await render(false, { ...stopped, runtime_confirmation_paused: true }, "g_confirmation", true);
+  expect(host.querySelector("[data-runtime-confirmation]")).toBeNull();
+  expect(host.textContent).toContain("runtimeConfirmationPaused");
+  for (const paused of [false, undefined]) {
+    await render(false, { ...stopped, runtime_confirmation_paused: paused }, "g_confirmation");
+    expect(host.querySelector("[data-runtime-confirmation]")).toBeNull();
+    expect(host.textContent).not.toContain("runtimeConfirmationPaused");
+  }
+});
+
+it("shows a terminal's startup wait only after the delay and releases that terminal", async () => {
+  const generation = "2026-11-18T00:00:00.000001Z";
+  const waiting: Actor = {
+    id: "kiro",
+    title: "Kiro",
+    runtime: "kiro",
+    runner_effective: "pty",
+    running: true,
+    runtime_state_source: "terminal",
+    runtime_startup_input: { generation },
+  };
+  mocks.release.mockResolvedValue({ ok: true, result: { released: true } });
+  // The transport is mocked, as in the confirmation test: a hidden tab builds no terminal.
+  await render(true, waiting, "g_startup", false, false);
+  // An ordinary start reaches its input within seconds, so nothing is shown yet.
+  expect(host.querySelector("[data-runtime-confirmation]")).toBeNull();
+  expect(host.textContent).not.toContain("runtimeStartupInputPending");
+  await act(async () => {
+    vi.advanceTimersByTime(STARTUP_INPUT_WAIT_SHOWN_AFTER_MS);
+  });
+  const notice = host.querySelector('[data-runtime-confirmation="startup"]')!;
+  expect(notice.getAttribute("role")).toBe("status");
+  expect(notice.textContent).toContain("runtimeStartupInputHint");
+  expect(host.textContent).toContain("runtimeStartupInputPending");
+  const button = notice.querySelector("button")!;
+  expect(button.textContent).toBe("runtimeStartupInputRelease");
+  expect(button.title).toBe("runtimeStartupInputReleaseTitle");
+  await act(async () => button.click());
+  expect(mocks.release).toHaveBeenCalledTimes(1);
+  expect(mocks.release).toHaveBeenCalledWith("g_startup", "kiro", generation);
+  expect(mocks.refresh).toHaveBeenCalledWith("g_startup");
+  expect(mocks.error).not.toHaveBeenCalled();
+  expect(mocks.launch).not.toHaveBeenCalled();
+  // A read-only viewer sees the state but gets no control.
+  await render(true, waiting, "g_startup", true, false);
+  expect(host.querySelector("[data-runtime-confirmation]")).toBeNull();
+  expect(host.textContent).toContain("runtimeStartupInputPending");
+  // The terminal reached its input: the state and the notice go.
+  await render(true, { ...waiting, runtime_startup_input: null }, "g_startup", false, false);
+  expect(host.querySelector("[data-runtime-confirmation]")).toBeNull();
+  expect(host.textContent).not.toContain("runtimeStartupInputPending");
+});
+
+it("reports a replaced terminal instead of releasing input into it", async () => {
+  const waiting: Actor = {
+    id: "cursor",
+    runtime: "cursor",
+    runner_effective: "pty",
+    running: true,
+    runtime_state_source: "terminal",
+    runtime_startup_input: { generation: "2026-11-18T00:00:01.000001Z" },
+  };
+  mocks.release.mockResolvedValue({
+    ok: false,
+    error: { code: "runtime_session_changed", message: "the terminal session changed" },
+  });
+  await render(true, waiting, "g_startup", false, false);
+  await act(async () => {
+    vi.advanceTimersByTime(STARTUP_INPUT_WAIT_SHOWN_AFTER_MS);
+  });
+  await act(async () =>
+    host.querySelector<HTMLButtonElement>('[data-runtime-confirmation="startup"] button')!.click(),
+  );
+  expect(mocks.error).toHaveBeenCalledWith("runtime_session_changed: the terminal session changed");
+  expect(mocks.refresh).toHaveBeenCalledWith("g_startup");
+});
+
+it("names a non-Claude terminal that closed before its startup input", async () => {
+  const stopped: Actor = {
+    id: "devin",
+    runtime: "devin",
+    runner_effective: "pty",
+    enabled: true,
+    running: false,
+    runtime_confirmation_paused: true,
+  };
+  await render(false, stopped, "g_startup");
+  const notice = host.querySelector('[data-runtime-confirmation="paused"]')!;
+  expect(notice.textContent).toBe("runtimeStartupInputPausedHint");
+  expect(host.textContent).toContain("runtimeStartupInputPaused");
+  expect(host.textContent).not.toContain("runtimeConfirmationPaused");
+});
+
+it("names Hermes's first setup in its terminal and after it ended unfinished", async () => {
+  const hermes: Actor = {
+    id: "hermes",
+    title: "Hermes",
+    runtime: "hermes",
+    runner_effective: "pty",
+    enabled: true,
+    running: true,
+    runtime_state_source: "terminal",
+    runtime_confirmation_required: true,
+  };
+  await render(true, hermes, "g_setup", true, false);
+  const pending = host.querySelector('[data-runtime-confirmation="pending"]')!;
+  expect(pending.textContent).toBe("runtimeSetupHint");
+  expect(host.textContent).toContain("runtimeSetupPending");
+  expect(host.textContent).not.toContain("runtimeConfirmationPending");
+  await render(
+    false,
+    {
+      ...hermes,
+      running: false,
+      runtime_confirmation_required: false,
+      runtime_confirmation_paused: true,
+    },
+    "g_setup",
+  );
+  const paused = host.querySelector('[data-runtime-confirmation="paused"]')!;
+  expect(paused.textContent).toBe("runtimeSetupPausedHint");
+  expect(host.textContent).toContain("runtimeSetupPaused");
+  expect(host.textContent).not.toContain("runtimeStartupInputPaused");
+});
+
+it("keeps distinct LCD status shapes and their accessible Actor labels", async () => {
+  const managed: Actor = {
+    id: "managed",
+    runtime: "pi",
+    enabled: true,
+    running: true,
+    runner_effective: "headless",
+    runtime_state_source: "managed_session",
+    effective_working_state: "working",
+  };
+  await render(true, managed, "g_managed");
+  const status = () => host.querySelector('[data-terminal-title-bar] [role="img"]');
+  expect(status()?.getAttribute("aria-label")).toBe("working");
+  expect(status()?.getAttribute("data-lcd-shape")).toBe("run");
+
+  await render(true, { ...managed, effective_working_state: "error" }, "g_managed");
+  expect(status()?.getAttribute("aria-label")).toBe("common:error");
+  expect(status()?.textContent).toBe("×");
+
+  await render(true, { ...managed, running: false }, "g_managed");
+  expect(status()?.getAttribute("aria-label")).toBe("stopped");
+  expect(status()?.getAttribute("data-lcd-shape")).toBe("stop");
+});
 
 it.each([false, true])(
   "shows a GET-projected managed turn error without offering Start (compact=%s)",
@@ -222,7 +450,8 @@ it("opens the shared ChatGPT settings directly without Actor editing", async () 
   expect(mocks.settings).toHaveBeenCalledWith({
     scope: "global",
     tab: "webModels",
-    webModelProvider: "dots",
+    webModelProvider: "chatgpt_web",
+    webModelSection: "connector",
   });
   expect(mocks.edit).not.toHaveBeenCalled();
 });
@@ -264,8 +493,7 @@ it("does not show a running indicator for an unpaired Dot with a valid subscript
     '[role="img"][aria-label="settings:dotsActor.phases.waiting_pairing"]',
   );
   expect(indicator).not.toBeNull();
-  expect(indicator?.className).toContain("bg-slate-400/65");
-  expect(indicator?.className).not.toContain("bg-emerald-500 ring-");
+  expect(indicator?.getAttribute("data-lcd-shape")).toBe("stop");
 });
 
 it("retains the working indicator for an accepted task after its event subscription expires", async () => {
@@ -283,8 +511,7 @@ it("retains the working indicator for an accepted task after its event subscript
     '[role="img"][aria-label="settings:dotsActor.phases.working"]',
   );
   expect(indicator).not.toBeNull();
-  expect(indicator?.className).toContain("bg-emerald-500 ring-");
-  expect(indicator?.className).not.toContain("bg-slate-400/65");
+  expect(indicator?.getAttribute("data-lcd-shape")).toBe("run");
 });
 
 it("shows an administrator-managed connection for a Group writer without fetching restricted Dots state or losing local Pause", async () => {
@@ -299,6 +526,37 @@ it("shows an administrator-managed connection for a Group writer without fetchin
   await act(async () => vi.advanceTimersByTimeAsync(4_000));
   expect(mocks.load).not.toHaveBeenCalled();
 });
+
+it.each(["working", "interrupted"])(
+  "keeps one Grok access control in the detail footer during %s work",
+  async (phase) => {
+    mocks.load.mockResolvedValue({
+      ok: true,
+      result: {
+        group_id: "g_dot",
+        actor_id: "bot",
+        connected: true,
+        bound: true,
+        configured: true,
+        enabled: true,
+        phase,
+        pending_count: 0,
+        active_turn_id: "unfinished-turn",
+      },
+    });
+    await render(false, { ...actor, id: "bot", runtime: "grok_web_model" });
+    const controls = [...host.querySelectorAll<HTMLButtonElement>("button")].filter(
+      (button) =>
+        button.getAttribute("aria-label") === "dotsPause" ||
+        button.textContent === "actors:dotsPause",
+    );
+    expect(controls).toHaveLength(1);
+    expect(controls[0].getAttribute("aria-label")).toBe("dotsPause");
+    await act(async () => controls[0].click());
+    expect(mocks.pause).toHaveBeenCalledOnce();
+    expect(mocks.update).not.toHaveBeenCalled();
+  },
+);
 
 it("renders a Grok native pane and task status without a terminal or browser", async () => {
   mocks.load.mockResolvedValue({
@@ -326,6 +584,38 @@ it("renders a Grok native pane and task status without a terminal or browser", a
       .click(),
   );
   expect(mocks.edit).toHaveBeenCalledWith(grok, "chatgpt");
+});
+
+it("uses the footer's single Actor editor entry for a configured Dots pane", async () => {
+  mocks.load.mockResolvedValue(
+    dotsState({ connected: true, paired: true, subscribed: true, phase: "ready" }),
+  );
+  await render(false);
+  expect(host.textContent).not.toContain("dotsActor.connectionSettings");
+  expect(host.querySelector('section[aria-label="dotsActor.connectionSettings"]')).toBeNull();
+  await act(async () =>
+    host.querySelector<HTMLButtonElement>('[aria-label="editAgentConfig"]')!.click(),
+  );
+  expect(mocks.edit).toHaveBeenCalledOnce();
+  expect(mocks.update).not.toHaveBeenCalled();
+});
+
+it("uses CCCC access controls and a shared-login destination for the browser runtime", async () => {
+  const browserActor = { ...actor, runtime: "web_model", running: false } as Actor;
+  await render(false, browserActor);
+  expect(host.querySelector('[aria-label="dotsPause"]')).not.toBeNull();
+  expect(host.querySelector('[aria-label="quitAgent"]')).toBeNull();
+  expect(host.querySelector('[aria-label="sendInterruptLabel"]')).toBeNull();
+  expect(host.querySelector('[aria-label="relaunchAgent"]')).toBeNull();
+  expect(host.textContent).toContain("webAccessEnabled");
+  const props = mocks.browser.mock.calls.at(-1)![0];
+  await act(async () => props.onOpenSharedSettings());
+  expect(mocks.settings).toHaveBeenCalledWith({
+    scope: "global",
+    tab: "webModels",
+    webModelProvider: "chatgpt_web",
+    webModelSection: "login",
+  });
 });
 it("does not fetch restricted Grok state for a Group writer", async () => {
   mocks.access = false;
@@ -368,3 +658,171 @@ it("does not carry a Dot's state into Grok after a runtime change", async () => 
     "settings:grokWebhook.phase.unconfigured",
   );
 });
+
+it("passes the same instance-connection permission to the ChatGPT browser panel", async () => {
+  mocks.access = false;
+  await render(false, { ...actor, runtime: "web_model" });
+  expect(mocks.browser).toHaveBeenCalled();
+  expect(mocks.browser.mock.calls.at(-1)?.[0].canAccessConnection).toBe(false);
+});
+
+const nativeActor: Actor = {
+  id: "native",
+  runtime: "codex",
+  external_session_id: "codex:fixture",
+  enabled: true,
+  running: false,
+  runner_effective: "headless",
+  runtime_state_source: "external_session",
+  effective_working_state: "waiting",
+};
+
+it.each([false, true])(
+  "distinguishes native access, Group lifecycle and actual receive availability (compact=%s)",
+  async (compact) => {
+    const cases = [
+      ["active", false, false, "webAccessPaused"],
+      ["active", false, true, "webAccessPaused"],
+      ["paused", true, false, "nativeSession.groupPaused"],
+      ["paused", true, true, "nativeSession.groupPaused"],
+      ["stopped", true, false, "nativeSession.groupStopped"],
+      ["stopped", true, true, "nativeSession.groupStopped"],
+      ["active", true, false, "nativeSession.unavailable"],
+      ["idle", true, false, "nativeSession.unavailable"],
+      ["idle", true, true, "nativeSession.available"],
+      ["active", true, true, "nativeSession.available"],
+    ] as const;
+    for (const [state, enabled, running, status] of cases) {
+      mocks.groupDoc = { group_id: "g_dot", state };
+      await render(compact, { ...nativeActor, enabled, running });
+      expect(host.textContent).toContain(status);
+      expect(host.querySelector('[role="status"]')?.textContent).toBe(status);
+      if (status !== "nativeSession.unavailable")
+        expect(host.textContent).not.toContain("nativeSession.unavailable");
+      if (compact) {
+        const header = host.querySelector("[data-terminal-title-bar]")!;
+        expect(header.textContent).toContain(status);
+        const indicator = header.querySelector('[role="img"]')!;
+        expect(indicator.getAttribute("aria-label")).toBe(status);
+        expect(indicator.getAttribute("data-lcd-shape")).toBe(
+          status === "nativeSession.available" ? "idle" : "stop",
+        );
+      }
+    }
+    expect(mocks.load).not.toHaveBeenCalled();
+    expect(mocks.browser).not.toHaveBeenCalled();
+    expect(host.querySelector(".xterm")).toBeNull();
+  },
+);
+
+it.each([false, true])(
+  "does not diagnose native failure from a missing or different Group snapshot (compact=%s)",
+  async (compact) => {
+    for (const groupDoc of [
+      null,
+      { group_id: "g_other", state: "paused" } as GroupDoc,
+      { group_id: "g_dot" },
+    ]) {
+      mocks.groupDoc = groupDoc;
+      await render(compact, nativeActor);
+      expect(host.querySelector('[role="status"]')?.textContent).toBe("common:loading");
+      expect(host.textContent).not.toContain("nativeSession.unavailable");
+      expect(host.textContent).not.toContain("nativeSession.groupPaused");
+    }
+  },
+);
+
+it.each([false, true])(
+  "reads private native recovery only for a visible, writable administrator outside settings (compact=%s)",
+  async (compact) => {
+    const pausedActor = { ...nativeActor, enabled: false };
+    await render(compact, pausedActor, "g_dot", false, false);
+    expect(mocks.recovery).not.toHaveBeenCalled();
+    mocks.settingsOpen = true;
+    await render(compact, pausedActor);
+    expect(mocks.recovery).not.toHaveBeenCalled();
+    mocks.settingsOpen = false;
+    mocks.access = false;
+    await render(compact, pausedActor);
+    expect(mocks.recovery).not.toHaveBeenCalled();
+    mocks.access = true;
+    await render(compact, pausedActor, "g_dot", true);
+    expect(mocks.recovery).not.toHaveBeenCalled();
+
+    await render(compact, pausedActor);
+    expect(mocks.recovery).toHaveBeenCalledExactlyOnceWith("g_dot", "native");
+    expect(host.querySelector('[role="status"]')?.textContent).toBe("webAccessPaused");
+    expect(host.textContent).toContain("nativeSession.recovery.states.connected");
+    expect(host.querySelector("pre code")?.textContent).toBe(
+      "CCCC_HOME='/synthetic/cccc' codex resume 'fixture'",
+    );
+    const copy = [...host.querySelectorAll("button")].find(
+      (button) => button.textContent === "nativeSession.recovery.copyCommand",
+    )!;
+    expect(copy.disabled).toBe(false);
+
+    mocks.settingsOpen = true;
+    await render(compact, pausedActor);
+    expect(host.querySelector("pre code")).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(9000));
+    expect(mocks.recovery).toHaveBeenCalledOnce();
+    mocks.settingsOpen = false;
+    await render(compact, pausedActor);
+    expect(mocks.recovery).toHaveBeenCalledTimes(2);
+    await render(compact, pausedActor, "g_dot", true);
+    expect(host.querySelector("pre code")).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(9000));
+    expect(mocks.recovery).toHaveBeenCalledTimes(2);
+  },
+);
+
+it.each([false, true])(
+  "resumes native membership without fake runtime controls and preserves read-only gating (compact=%s)",
+  async (compact) => {
+    mocks.access = false;
+    await render(compact, { ...nativeActor, enabled: false });
+    const resume = host.querySelector<HTMLButtonElement>('button[aria-label="dotsResume"]')!;
+    expect(resume).not.toBeNull();
+    expect(host.querySelector('button[aria-label="dotsEnable"]')).toBeNull();
+    await act(async () => resume.click());
+    expect(mocks.launch).toHaveBeenCalledOnce();
+    await render(compact, nativeActor);
+    if (compact) {
+      await act(async () =>
+        host.querySelector<HTMLButtonElement>('button[aria-label="actorControls"]')!.click(),
+      );
+      const pause = [...document.querySelectorAll("button")].find(
+        (button) => button.textContent === "dotsPause",
+      )!;
+      expect(document.body.textContent).not.toContain("terminalHistory");
+      expect(document.body.textContent).not.toContain("relaunch");
+      expect(document.body.textContent).not.toContain("newSession");
+      await act(async () => pause.click());
+    } else {
+      await act(async () =>
+        host.querySelector<HTMLButtonElement>('button[aria-label="dotsPause"]')!.click(),
+      );
+      for (const label of [
+        "newSessionAgent",
+        "relaunchAgent",
+        "sendInterruptLabel",
+        "terminalHistory",
+      ]) {
+        expect(host.querySelector(`button[aria-label="${label}"]`)).toBeNull();
+      }
+    }
+    expect(mocks.pause).toHaveBeenCalledOnce();
+    expect(mocks.load).not.toHaveBeenCalled();
+    expect(mocks.update).not.toHaveBeenCalled();
+    await render(compact, nativeActor, "g_dot", true);
+    for (const label of [
+      "dotsPause",
+      "dotsResume",
+      "editAgentConfig",
+      "removeAgent",
+      "actorControls",
+    ]) {
+      expect(host.querySelector(`button[aria-label="${label}"]`)).toBeNull();
+    }
+  },
+);

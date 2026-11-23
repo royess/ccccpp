@@ -35,6 +35,7 @@ pub(super) fn resolve_operation(request: &DaemonRequest) -> Option<Operation> {
             actor_notes_write(home, request, true)
         }),
         "group_resolve" => Operation::new(Read, resolve),
+        "group_activity" => Operation::new(Read, super::group_activity::activity),
         "group_update" => Operation::new(GlobalWrite, update),
         "group_delete" => Operation::new(GlobalWrite, delete),
         "group_reset" => Operation::new(Write, super::group_reset::reset),
@@ -115,10 +116,14 @@ fn create(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
             error,
         ));
     }
-    object(json!({"group_id": group.group_id, "group": group_runtime::group(group)}))
+    object(json!({"group_id": group.group_id, "group": group_runtime::group(home, group)}))
 }
 
 fn list(home: &HomeLayout) -> OpResult {
+    crate::session_owner::read_scope(|| list_snapshot(home))
+}
+
+fn list_snapshot(home: &HomeLayout) -> OpResult {
     let store = store(home)?;
     let groups = store
         .list()
@@ -128,14 +133,27 @@ fn list(home: &HomeLayout) -> OpResult {
             store
                 .load(&meta.group_id)
                 .ok()
-                .map(|group| group_runtime::summary(meta, &group))
+                .map(|group| group_runtime::summary(home, meta, &group))
         })
         .collect::<Vec<_>>();
     object(json!({"groups": groups}))
 }
 
 fn show(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
-    object(json!({"group": group_runtime::group(load(home, request)?)}))
+    crate::session_owner::read_scope(|| show_snapshot(home, request))
+}
+
+fn show_snapshot(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
+    let group = load(home, request)?;
+    let by = string_arg(request, "by").unwrap_or_else(|| "user".into());
+    let scope = actor_runtime::caller_scope(&group, &by)?;
+    object(json!({
+        "group": group_runtime::group(home, group),
+        // A caller-scoped read projection, outside GroupDoc/Actor persistence.
+        "effective_scope": scope
+            .map(actor_runtime::displayed_scope)
+            .map_or_else(|| json!({}), |scope| json!(scope)),
+    }))
 }
 
 fn preamble_get(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
@@ -516,7 +534,9 @@ fn update(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         json!({"patch": patch}),
     )?;
     let group_id = group.group_id.clone();
-    object(json!({"group_id": group_id, "group": group_runtime::group(group), "event": event}))
+    object(
+        json!({"group_id": group_id, "group": group_runtime::group(home, group), "event": event}),
+    )
 }
 
 fn group_update_patch(request: &DaemonRequest) -> Result<serde_json::Map<String, Value>, OpError> {
@@ -563,6 +583,7 @@ fn group_update_patch(request: &DaemonRequest) -> Result<serde_json::Map<String,
 fn delete(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     let group = load(home, request)?;
     authorize(&group, request)?;
+    let browser_work = actor_runtime::hold_group_browser_work(home, &group)?;
     super::voice_secretary::cancel_group(home, &group.group_id).map_err(OpError::io)?;
     actor_delivery::shutdown_group(&group.group_id);
     actor_runtime::stop_group(home, &group)?;
@@ -575,8 +596,12 @@ fn delete(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     }
     let deleted = store(home)?.delete(&group.group_id).map_err(OpError::io)?;
     if deleted {
+        super::local_headless::clear_group_confirmation_pauses(&group.group_id)
+            .map_err(OpError::io)?;
         super::actor_secrets::remove_group(home, &group.group_id)?;
         super::voice_secretary::purge_deleted_group(home, &group.group_id).map_err(OpError::io)?;
+        drop(browser_work);
+        cccc_core::web_model_connectors::remove_browser_work_locks(home, &group.group_id);
     }
     if active::get(home).map_err(OpError::io)?.as_deref() == Some(&group.group_id) {
         active::clear(home).map_err(OpError::io)?;
@@ -593,6 +618,11 @@ fn set_state(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     authorize(&group, request)?;
     let raw = required_arg(request, "state")?;
     let state: GroupState = serde_json::from_value(Value::String(raw)).map_err(OpError::invalid)?;
+    if state == GroupState::Stopped {
+        return Err(OpError::invalid(
+            "use group_stop to stop a Group and its runtimes",
+        ));
+    }
     let resumes_automation = matches!(group.state, GroupState::Paused)
         && matches!(state, GroupState::Active | GroupState::Idle)
         || matches!(group.state, GroupState::Idle) && matches!(state, GroupState::Active);
@@ -600,7 +630,7 @@ fn set_state(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
         cccc_core::automation::reset_rule_timers_on_resume(home, &group.group_id)
             .map_err(OpError::io)?;
     }
-    if matches!(state, GroupState::Paused | GroupState::Stopped) {
+    if state == GroupState::Paused {
         super::dots_events::invalidate_group(home, &group)?;
         super::grok_webhook::invalidate_group(home, &group)?;
         if group.actors.iter().any(|a| a.runtime.is_web_model()) {
@@ -611,7 +641,7 @@ fn set_state(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
             )
             .map_err(OpError::io)?;
         }
-        actor_delivery::shutdown_group(&group.group_id);
+        actor_delivery::pause_group(&group.group_id);
         super::local_headless::stop_group(&group.group_id).map_err(OpError::io)?;
         super::deepseek_runtime::stop_group(&group.group_id);
     }
@@ -631,7 +661,7 @@ fn set_state(home: &HomeLayout, request: &DaemonRequest) -> OpResult {
     if matches!(updated.state, GroupState::Active | GroupState::Idle) {
         actor_delivery::dispatch_group_unread(home, &updated);
     }
-    object(json!({"group": group_runtime::group(updated)}))
+    object(json!({"group": group_runtime::group(home, updated)}))
 }
 
 fn running(home: &HomeLayout, request: &DaemonRequest, value: bool) -> OpResult {
@@ -641,7 +671,33 @@ fn running(home: &HomeLayout, request: &DaemonRequest, value: bool) -> OpResult 
         cccc_core::automation::reset_rule_timers_on_resume(home, &group.group_id)
             .map_err(OpError::io)?;
     }
+    // Each member's saved-conversation note before the start, to tell whom this start replaced.
+    let replaced_before: Vec<(String, Value)> = if value {
+        group
+            .actors
+            .iter()
+            .filter(|actor| actor.enabled)
+            .map(|actor| {
+                let at = super::runtime_session::replaced_at(home, &group.group_id, &actor.id);
+                (actor.id.clone(), at)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let runtimes = if value {
+        // Scheduler requests also use by=user, so their source marker must retain
+        // confirmation pauses. User controls may retry an Active or Stopped Group.
+        if actor_runtime::user_confirmation_retry(request) {
+            for actor in group.actors.iter().filter(|actor| actor.enabled) {
+                if !actor_runtime::actor_is_running(&group, actor)
+                    && !actor_runtime::hermes_setup_open(home, &group.group_id, actor)?
+                {
+                    super::local_headless::retry_confirmation(&group.group_id, &actor.id)
+                        .map_err(OpError::io)?;
+                }
+            }
+        }
         actor_runtime::start_group(home, &group)?
     } else {
         if group.actors.iter().any(|a| a.runtime.is_web_model()) {
@@ -671,7 +727,20 @@ fn running(home: &HomeLayout, request: &DaemonRequest, value: bool) -> OpResult 
     if value {
         actor_delivery::dispatch_group_unread(home, &updated);
     }
-    object(json!({"group": group_runtime::group(updated), "running": value, "runtimes": runtimes}))
+    let mut result = json!({"group": group_runtime::group(home, updated), "running": value, "runtimes": runtimes});
+    let replaced: Vec<Value> = replaced_before
+        .iter()
+        .filter_map(|(actor_id, before)| {
+            let mut replaced =
+                super::runtime_session::replaced_since(home, &group.group_id, actor_id, before)?;
+            replaced["actor_id"] = json!(actor_id);
+            Some(replaced)
+        })
+        .collect();
+    if !replaced.is_empty() {
+        result["runtime_sessions_replaced"] = Value::Array(replaced);
+    }
+    object(result)
 }
 
 fn load(home: &HomeLayout, request: &DaemonRequest) -> Result<GroupDoc, OpError> {

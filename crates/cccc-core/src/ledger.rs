@@ -25,6 +25,63 @@ pub fn visit_snapshot_oldest_first(
     Ok(())
 }
 
+/// A complete snapshot fold either resumes from its committed offsets or starts
+/// over when the ledger's identity or source sequence changed.
+#[derive(Default)]
+pub struct SnapshotCursor {
+    path: Option<PathBuf>,
+    sources: Vec<snapshot::Source>,
+    offsets: Vec<u64>,
+}
+
+/// Applied in order to the caller's derived state while updating a cursor.
+pub enum SnapshotUpdate {
+    /// Discard the previous state before applying the following events.
+    Reset,
+    Event(Event),
+}
+
+impl SnapshotCursor {
+    /// Visit newly committed events, or reset and visit the whole snapshot
+    /// when the path or captured source identities change.
+    ///
+    /// The caller must not publish its derived state when this returns an
+    /// error. The cursor is invalidated on error, so the next successful call
+    /// begins with `Reset`, including after a partially visited snapshot.
+    pub fn visit(&mut self, path: &Path, mut apply: impl FnMut(SnapshotUpdate)) -> io::Result<()> {
+        let snapshot = match snapshot::Snapshot::open(path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                *self = Self::default();
+                return Err(error);
+            }
+        };
+        let resumes = self.path.as_deref() == Some(path) && snapshot.extends(&self.sources);
+        if !resumes {
+            apply(SnapshotUpdate::Reset);
+        }
+        let offsets = if resumes {
+            self.offsets.as_slice()
+        } else {
+            &[]
+        };
+        let next_offsets = match snapshot.visit(offsets, |event, _| {
+            apply(SnapshotUpdate::Event(event));
+            std::ops::ControlFlow::Continue(())
+        }) {
+            Ok(offsets) => offsets,
+            Err(error) => {
+                *self = Self::default();
+                return Err(error);
+            }
+        };
+        self.path = Some(path.to_path_buf());
+        self.sources = snapshot.sources;
+        self.offsets = next_offsets;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceRevision {
     pub(crate) path: PathBuf,
@@ -226,8 +283,17 @@ pub(crate) fn acquire_reader_lock(path: &Path) -> io::Result<File> {
 
 fn ledger_lock_file(path: &Path) -> io::Result<File> {
     let lock_path = ledger_lock_path(path);
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    // The ledger's directory belongs to its Group, and deleting the Group
+    // renames that directory away. Create only the levels below it, so a
+    // reader or writer that outlives the Group fails with NotFound instead of
+    // recreating an empty Group directory (which would also block a rollback).
+    let mut dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    for name in ["state", "ledger"] {
+        dir.push(name);
+        match std::fs::create_dir(&dir) {
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+            _ => {}
+        }
     }
     let mut lock = OpenOptions::new()
         .create(true)
@@ -305,6 +371,21 @@ fn visit_validated_source(
     source: &Path,
     visit: &mut impl FnMut(Event) -> io::Result<()>,
 ) -> io::Result<()> {
+    let mut line = Vec::new();
+    let mut line_no = 0_usize;
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        line_no += 1;
+        let raw = trim_ascii(&line);
+        if !raw.is_empty() {
+            visit(decode_validated(raw, source, line_no).map_err(io::Error::other)?)?;
+        }
+        line.clear();
+    }
+    Ok(())
+}
+
+/// Decode stored bytes as one complete event, or explain why they are not.
+fn decode_validated(raw: &[u8], source: &Path, line_no: usize) -> Result<Event, String> {
     // Event's construction defaults generate an ID and timestamp. Those are
     // useful for new events, but cannot certify missing fields in stored bytes.
     #[derive(serde::Deserialize)]
@@ -314,37 +395,21 @@ fn visit_validated_source(
         #[serde(borrow)]
         ts: std::borrow::Cow<'a, str>,
     }
-    let mut line = Vec::new();
-    let mut line_no = 0_usize;
-    while reader.read_until(b'\n', &mut line)? != 0 {
-        line_no += 1;
-        let raw = trim_ascii(&line);
-        if !raw.is_empty() {
-            if raw.first() != Some(&b'{') {
-                return Err(io::Error::other(format!(
-                    "malformed ledger JSON at {}:{line_no}: event must be an object",
-                    source.display()
-                )));
-            }
-            let invalid = |error| {
-                io::Error::other(format!(
-                    "malformed ledger JSON at {}:{line_no}: {error}",
-                    source.display()
-                ))
-            };
-            let identity: StoredIdentity<'_> = serde_json::from_slice(raw).map_err(invalid)?;
-            if identity.id.is_empty() || identity.ts.is_empty() {
-                return Err(io::Error::other(format!(
-                    "malformed ledger JSON at {}:{line_no}: stored id and ts must be nonempty",
-                    source.display()
-                )));
-            }
-            let event: Event = serde_json::from_slice(raw).map_err(invalid)?;
-            visit(event)?;
-        }
-        line.clear();
+    let invalid = |error: &dyn std::fmt::Display| {
+        format!(
+            "malformed ledger JSON at {}:{line_no}: {error}",
+            source.display()
+        )
+    };
+    if raw.first() != Some(&b'{') {
+        return Err(invalid(&"event must be an object"));
     }
-    Ok(())
+    let identity: StoredIdentity<'_> =
+        serde_json::from_slice(raw).map_err(|error| invalid(&error))?;
+    if identity.id.is_empty() || identity.ts.is_empty() {
+        return Err(invalid(&"stored id and ts must be nonempty"));
+    }
+    serde_json::from_slice(raw).map_err(|error| invalid(&error))
 }
 
 fn source_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -365,7 +430,22 @@ fn source_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
                 selected.insert(logical, candidate);
             }
         }
-        paths.extend(selected.into_values());
+        // Rotation timestamps can go backwards. Canonical segments follow their
+        // sequence; unsequenced names stay in lexical order before them. Keep
+        // distinct logical sources even when they claim the same sequence.
+        let mut ordered = selected
+            .into_iter()
+            .map(|(logical, physical)| {
+                let sequence = logical
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(crate::ledger_archive::parse_segment_name)
+                    .map_or(0, |(_, sequence, _, _)| sequence);
+                ((sequence, logical), physical)
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        paths.extend(ordered.into_iter().map(|(_, physical)| physical));
     }
     if path.exists() {
         paths.push(path.to_path_buf());
@@ -466,11 +546,14 @@ fn read_events(mut reader: impl BufRead, source: &Path, group_id: &str) -> io::R
     Ok(events)
 }
 
-fn decode_event_line(raw: &[u8], source: &Path, line_no: usize, _group_id: &str) -> Option<Event> {
+fn decode_event_line(raw: &[u8], source: &Path, line_no: usize, group_id: &str) -> Option<Event> {
     match serde_json::from_slice(raw) {
         Ok(event) => Some(event),
         Err(error) => {
             tracing::warn!(
+                group_id,
+                diagnostic_code = "invalid_data",
+                diagnostic_action = "ledger_decode",
                 source = %source.display(),
                 line = line_no,
                 %error,
@@ -616,10 +699,10 @@ pub fn find_relay(path: &Path, source_event_id: &str) -> io::Result<Option<Event
 fn note_index_query(api: &str) {
     if std::env::var_os("CCCC_LEDGER_INDEX_PROBE").is_some_and(|value| value == "1") {
         let caller = std::panic::Location::caller();
-        eprintln!(
+        cccc_runtime::diagnostic(format_args!(
             "CCCC_EVENT_INDEX_QUERY {}",
             serde_json::json!({"api":api,"file":caller.file(),"line":caller.line()})
-        );
+        ));
     }
 }
 
@@ -1065,6 +1148,33 @@ mod tests {
     }
 
     #[test]
+    fn ledger_access_never_recreates_a_removed_group_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let group = temp.path().join("g_test");
+        let path = group.join("ledger.jsonl");
+        std::fs::create_dir(&group).expect("group");
+        append(&path, &Event::new("group.create", "g_test")).expect("append");
+        let mut follower = LedgerFollower::default();
+        follower.poll(&path).expect("follow");
+        // Deletion renames the Group away while this follower still holds its path.
+        std::fs::rename(&group, temp.path().join(".g_test.deleting")).expect("delete");
+
+        let not_found = |result: io::Result<()>, access: &str| {
+            let error = result.expect_err(access);
+            assert_eq!(error.kind(), io::ErrorKind::NotFound, "{access}: {error}");
+            assert!(!group.exists(), "{access} recreated the Group directory");
+        };
+        not_found(follower.poll(&path).map(drop), "poll");
+        not_found(LedgerFollower::at_end(&path).map(drop), "at_end");
+        not_found(acquire_reader_lock(&path).map(drop), "reader lock");
+        not_found(tail(&path, 1).map(drop), "tail");
+        not_found(
+            append(&path, &Event::new("chat.message", "g_test")),
+            "append",
+        );
+    }
+
+    #[test]
     fn follower_starts_at_end_and_only_returns_appended_events() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("ledger.jsonl");
@@ -1181,5 +1291,80 @@ mod tests {
         let events = read_all(&path).expect("read all");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, event.id);
+    }
+
+    fn write_segment_event(path: &Path, event: &Event) {
+        std::fs::write(
+            path,
+            format!("{}\n", serde_json::to_string(event).expect("event JSON")),
+        )
+        .expect("write segment event");
+    }
+
+    #[test]
+    fn segment_order_follows_sequence_when_timestamps_go_backwards() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ledger.jsonl");
+        let segments = temp.path().join("state/ledger/segments");
+        std::fs::create_dir_all(&segments).expect("segments");
+        let events: [Event; 4] = std::array::from_fn(|_| Event::new("chat.message", "g_test"));
+        for (name, event) in [
+            "ledger.20261110T000002Z.000001.jsonl",
+            "ledger.20261110T000001Z.000002.jsonl",
+            "ledger.20261110T000001Z.000003.jsonl",
+        ]
+        .into_iter()
+        .zip(&events)
+        {
+            write_segment_event(&segments.join(name), event);
+        }
+        write_segment_event(&path, &events[3]);
+        let expected = events
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>();
+        let ids = |events: Vec<Event>| events.into_iter().map(|event| event.id).collect::<Vec<_>>();
+
+        assert_eq!(ids(read_all(&path).expect("all events")), expected);
+        assert_eq!(ids(tail(&path, 2).expect("last events")), expected[2..]);
+        let mut snapshot_ids = Vec::new();
+        visit_snapshot_oldest_first(&path, |event| {
+            snapshot_ids.push(event.id);
+            ControlFlow::Continue(())
+        })
+        .expect("snapshot events");
+        assert_eq!(snapshot_ids, expected);
+    }
+
+    #[test]
+    fn segment_order_keeps_unsequenced_and_duplicate_sequence_sources() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ledger.jsonl");
+        let segments = temp.path().join("state/ledger/segments");
+        std::fs::create_dir_all(&segments).expect("segments");
+        let events: [Event; 4] = std::array::from_fn(|_| Event::new("chat.message", "g_test"));
+        for (name, event) in [
+            "ledger.zzz.jsonl",
+            "ledger.20261110T000001Z.000001.jsonl",
+            "ledger.20261110T000002Z.000001.jsonl",
+        ]
+        .into_iter()
+        .zip(&events)
+        {
+            write_segment_event(&segments.join(name), event);
+        }
+        write_segment_event(&path, &events[3]);
+
+        assert_eq!(
+            read_all(&path)
+                .expect("each source remains readable")
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| event.id.clone())
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -16,6 +16,8 @@ import type { ChatWindowState, GroupChatBucket, ObligationStatusPatch } from "./
 
 export interface GroupState {
   groups: GroupMeta[];
+  /** A Group list has been loaded, possibly an empty one. */
+  groupsLoaded: boolean;
   groupOrder: string[];
   archivedGroupIds: string[];
   selectedGroupId: string;
@@ -82,6 +84,7 @@ export interface GroupState {
     pendingEventId?: string;
     streamId: string;
     ts: string;
+    firstTextTs?: string;
     fullText: string;
     eventText: string;
     activities: StreamingActivity[];
@@ -109,7 +112,8 @@ export interface GroupState {
     updates: Array<{
       id: string;
       idle_seconds?: number | null;
-      running: boolean;
+      /** Omitted when the daemon could not observe the agent. */
+      running?: boolean;
       effective_working_state?: string;
       effective_working_reason?: string;
       effective_working_updated_at?: string | null;
@@ -117,6 +121,7 @@ export interface GroupState {
       runtime_session_status?: string | null;
       runtime_session_resume_eligible?: boolean | null;
       runtime_session_last_resume_error?: string | null;
+      runtime_observation_error?: string;
     }>,
     groupId: string,
   ) => void;
@@ -135,11 +140,14 @@ export interface GroupState {
   refreshActors: (groupId?: string, opts?: { includeUnread?: boolean }) => Promise<void>;
   refreshInternalRuntimeActors: (groupId?: string) => Promise<void>;
   refreshSettings: (groupId?: string) => Promise<void>;
-  refreshPresentation: (groupId?: string) => Promise<void>;
+  /** False when the read failed or was superseded by a newer request. */
+  refreshPresentation: (groupId?: string) => Promise<boolean>;
   loadGroup: (groupId: string) => Promise<void>;
   warmGroup: (groupId: string) => Promise<void>;
-  loadMoreHistory: (groupId?: string) => Promise<void>;
-  openChatWindow: (groupId: string, centerEventId: string) => Promise<void>;
+  loadMoreHistory: (groupId?: string) => Promise<void | false>;
+  /** Resolves to false when the message and its neighbours could not be loaded. */
+  openChatWindow: (groupId: string, centerEventId: string) => Promise<boolean>;
+  loadMoreChatWindowAfter: (groupId: string) => Promise<void>;
   closeChatWindow: (groupId?: string) => void;
 }
 
@@ -163,5 +171,6 @@ export type GroupStoreAsyncActions = Pick<
   | "warmGroup"
   | "loadMoreHistory"
   | "openChatWindow"
+  | "loadMoreChatWindowAfter"
   | "closeChatWindow"
 >;

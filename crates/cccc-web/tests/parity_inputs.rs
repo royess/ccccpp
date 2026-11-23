@@ -9,6 +9,127 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn runtime_switch_and_completion_require_an_administrator_and_writable_web() {
+    let temp = tempfile::tempdir().expect("home");
+    let home = HomeLayout::from_path(temp.path().join("home")).expect("home layout");
+    let group = GroupStore::new(home.clone())
+        .expect("groups")
+        .create("runtime switch authority", "")
+        .expect("group");
+    let member = cccc_core::access_tokens::AccessTokenStore::new(home.clone())
+        .expect("token store")
+        .create("member", vec![group.group_id.clone()], false, None)
+        .expect("member token");
+    let path = format!(
+        "/api/v1/groups/{}/actors/old/runtime_switch",
+        group.group_id
+    );
+    let body = json!({
+        "expected_actor_generation":"generation-1",
+        "expected_actor_updated_at":"2026-01-01T00:00:00Z",
+        "target":{"kind":"native","source_id":"codex:new","expected_native_session_id":"new"},
+        "is_admin":true,
+        "by":"user"
+    })
+    .to_string();
+    for suffix in ["", "/complete"] {
+        let response = auth_support::authenticated_app(home.clone())
+            .oneshot(
+                Request::post(format!("{path}{suffix}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", member.token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "permission_denied"
+        );
+
+        let response =
+            auth_support::authenticated_app_with_mode(home.clone(), cccc_web::WebMode::Exhibit)
+                .oneshot(
+                    Request::post(format!("{path}{suffix}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.clone()))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_json(response).await["error"]["code"], "read_only");
+    }
+}
+
+#[tokio::test]
+async fn runtime_switch_web_route_applies_the_confirmed_target_to_the_daemon() {
+    let (_temp, home, group_id, daemon) = running_home("runtime switch route").await;
+    let actor = cccc_contracts::Actor::new("worker");
+    let expected_generation = cccc_core::actors::generation_identity(&actor);
+    let expected_updated_at = actor.updated_at.clone();
+    GroupStore::new(home.clone())
+        .expect("groups")
+        .mutate(&group_id, |group| {
+            group.actors.push(actor);
+            Ok(())
+        })
+        .expect("add fixture actor");
+    let path = format!("/api/v1/groups/{group_id}/actors/worker/runtime_switch");
+    let response = auth_support::authenticated_app(home.clone())
+        .oneshot(
+            Request::post(&path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "expected_actor_generation":expected_generation,
+                        "expected_actor_updated_at":expected_updated_at,
+                        "target":{
+                            "kind":"managed",
+                            "patch":{"runtime":"custom","command":"printf 'hello world'"},
+                            "start":false
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = response_json(response).await;
+    assert_eq!(payload["result"]["switched"], true);
+    assert_eq!(payload["result"]["completion"], "done");
+    assert_eq!(payload["result"]["start"], "stopped");
+    let group = GroupStore::new(home.clone())
+        .expect("groups")
+        .load(&group_id)
+        .expect("group");
+    assert_eq!(
+        group.actors[0].runtime,
+        cccc_contracts::ActorRuntime::Custom
+    );
+    assert_eq!(group.actors[0].command, ["printf", "hello world"]);
+    assert!(!group.actors[0].enabled);
+
+    let response = auth_support::authenticated_app(home.clone())
+        .oneshot(
+            Request::post(format!("{path}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let completion = response_json(response).await;
+    assert_eq!(completion["result"]["switched"], false);
+    assert_eq!(completion["result"]["completion"], "done");
+    shutdown(home, daemon).await;
+}
+
+#[tokio::test]
 async fn terminal_clear_accepts_actor_id_from_query_without_json_body() {
     let (_temp, home, group_id, daemon) = running_home("terminal clear").await;
     let response = auth_support::authenticated_app(home.clone())
@@ -210,6 +331,212 @@ async fn actor_command_uses_shell_quoting_like_python() {
     );
 }
 
+#[tokio::test]
+async fn actor_profile_links_use_the_authenticated_web_principal() {
+    let (_temp, home, group_id, daemon) = running_home("profile link authority").await;
+    let profiles = cccc_core::profiles::ProfileStore::new(home.clone()).expect("profiles");
+    for (profile_id, owner_id) in [("private", "alice"), ("owned", "bob")] {
+        profiles
+            .upsert(
+                json!({
+                    "id":profile_id,
+                    "name":profile_id,
+                    "scope":"user",
+                    "owner_id":owner_id,
+                    "runtime":"custom",
+                    "command":["/bin/true"]
+                })
+                .as_object()
+                .expect("profile")
+                .clone(),
+                None,
+            )
+            .expect("save profile");
+    }
+    let token = cccc_core::access_tokens::AccessTokenStore::new(home.clone())
+        .expect("tokens")
+        .create(
+            "bob",
+            vec![group_id.clone()],
+            false,
+            Some("profile-link-member-token"),
+        )
+        .expect("member token");
+    let app = cccc_web::app(home.clone());
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/groups/{group_id}/actors"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id":"stolen",
+                        "profile_id":"private",
+                        "profile_scope":"user",
+                        "profile_owner":"alice",
+                        "enabled":false,
+                        "by":"user",
+                        "caller_id":"alice",
+                        "is_admin":true,
+                        "allowed_groups":[]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let forbidden_status = forbidden.status();
+    let forbidden = response_json(forbidden).await;
+    assert_eq!(forbidden_status, StatusCode::FORBIDDEN);
+    assert_eq!(forbidden["error"]["code"], "permission_denied");
+
+    let owned = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/groups/{group_id}/actors"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id":"owned",
+                        "profile_id":"owned",
+                        "profile_scope":"user",
+                        "profile_owner":"bob",
+                        "enabled":false,
+                        "by":"another-actor",
+                        "caller_id":"alice",
+                        "is_admin":true
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let owned_status = owned.status();
+    let owned = response_json(owned).await;
+    let relink = app
+        .oneshot(
+            Request::post(format!("/api/v1/groups/{group_id}/actors/owned"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "profile_id":"private",
+                        "profile_scope":"user",
+                        "profile_owner":"alice",
+                        "by":"user",
+                        "caller_id":"alice",
+                        "is_admin":true
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let relink_status = relink.status();
+    let relink = response_json(relink).await;
+    shutdown(home, daemon).await;
+
+    assert_eq!(owned_status, StatusCode::OK);
+    assert_eq!(owned["result"]["actor"]["profile_owner"], "bob");
+    assert_eq!(owned["result"]["event"]["by"], "user");
+    assert_eq!(relink_status, StatusCode::FORBIDDEN);
+    assert_eq!(relink["error"]["code"], "permission_denied");
+}
+
+#[tokio::test]
+async fn reply_request_routes_act_as_the_user_within_the_principals_groups() {
+    let (_temp, home, group_id, daemon) = running_home("reply requests").await;
+    let other = GroupStore::new(home.clone())
+        .expect("store")
+        .create("another group", "")
+        .expect("group");
+    cccc_core::access_tokens::AccessTokenStore::new(home.clone())
+        .expect("tokens")
+        .create(
+            "member",
+            vec![group_id.clone()],
+            false,
+            Some("member-token"),
+        )
+        .expect("member token");
+    let app = auth_support::authenticated_app(home.clone());
+    let get = |path: String, token: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::get(path);
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            (response.status(), response_json(response).await)
+        }
+    };
+    let (pending_status, pending) = get(
+        format!("/api/v1/groups/{group_id}/reply-requests/pending?limit=10"),
+        None,
+    )
+    .await;
+    let (_, admin_summary) = get("/api/v1/reply-requests/summary".into(), None).await;
+    let (member_status, member_summary) = get(
+        "/api/v1/reply-requests/summary".into(),
+        Some("member-token"),
+    )
+    .await;
+    let answer = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/groups/{group_id}/messages/missing-event/reply-request/answer"
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"client_id":"c1","answer":{"v":1,"text":"yes"},"by":"lead"}"#,
+            ))
+            .expect("request"),
+        )
+        .await
+        .expect("response");
+    let answer_status = answer.status();
+    let exhibit =
+        auth_support::authenticated_app_with_mode(home.clone(), cccc_web::WebMode::Exhibit)
+            .oneshot(
+                Request::get("/api/v1/reply-requests/summary")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+    let exhibit_status = exhibit.status();
+    shutdown(home, daemon).await;
+
+    assert_eq!(pending_status, StatusCode::OK);
+    assert_eq!(pending["result"]["total"], 0);
+    let groups = |summary: &Value| {
+        summary["result"]["groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .map(|group| group["group_id"].as_str().expect("id").to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(groups(&admin_summary).contains(&other.group_id));
+    assert_eq!(member_status, StatusCode::OK);
+    assert_eq!(groups(&member_summary), [group_id]);
+    assert_eq!(member_summary["result"]["groups"][0]["state"], "fresh");
+    // The body cannot choose who answers.
+    assert_eq!(answer_status, StatusCode::BAD_REQUEST);
+    assert_eq!(exhibit_status, StatusCode::FORBIDDEN);
+}
+
 async fn running_home(
     title: &str,
 ) -> (
@@ -251,3 +578,5 @@ async fn shutdown(_home: HomeLayout, daemon: tokio::task::JoinHandle<()>) {
     daemon.abort();
     let _ = daemon.await;
 }
+
+cccc_daemon::session_owner_test_entry!();

@@ -61,6 +61,7 @@ async fn file_send_with_only_a_destination_group_delivers_the_file_locally() {
         .expect("args")
         .clone(),
         Some(crate::RequestContext {
+            native_binding: None,
             binding: None,
             group_id: &source.group_id,
             actor_id: "worker",
@@ -73,6 +74,15 @@ async fn file_send_with_only_a_destination_group_delivers_the_file_locally() {
 
     let delivered = &sent["structuredContent"]["result"]["dst_event"];
     assert_eq!(delivered["group_id"], destination.group_id);
+    assert!(delivered["data"].get("insight").is_none());
+    assert!(
+        delivered["data"]["text"].as_str().is_some(),
+        "generated file text is retained"
+    );
+    assert_eq!(
+        sent["structuredContent"]["mcp_omitted_fields"]["result.dst_event"],
+        json!(["insight"])
+    );
     assert_eq!(delivered["data"]["attachments"][0]["kind"], "image");
     let path = delivered["data"]["attachments"][0]["path"]
         .as_str()

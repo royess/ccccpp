@@ -34,7 +34,7 @@ interface SkillAssignmentManagerModalLabels {
   name: string;
   description: string;
   capsule: string;
-  capsuleLimit: string;
+  capsuleCount: string;
   save: string;
   saving: string;
   blockedBanner: string;
@@ -77,7 +77,6 @@ interface SkillAssignmentManagerModalProps {
   name: string;
   description: string;
   capsuleText: string;
-  capsuleTextMax: number;
   qualificationStatus: "qualified" | "blocked";
   error: string;
   notice: string;
@@ -114,7 +113,6 @@ export function SkillAssignmentManagerModal({
   name,
   description,
   capsuleText,
-  capsuleTextMax,
   qualificationStatus,
   error,
   notice,
@@ -150,7 +148,7 @@ export function SkillAssignmentManagerModal({
       <div
         key={capabilityId}
         ref={modalRef}
-        className="fixed inset-0 z-[1000] flex items-end justify-center bg-black/35 px-3 py-4 sm:items-center"
+        className="fixed inset-0 z-[1000] flex items-end justify-center glass-overlay px-3 py-4 sm:items-center"
         role="dialog"
         aria-modal="true"
         aria-labelledby="skill-assignment-manager-title"
@@ -184,14 +182,20 @@ export function SkillAssignmentManagerModal({
                 {sourceId}
               </span>
               {qualificationStatus === "blocked" ? (
-                <span className="rounded bg-rose-500/10 px-1.5 py-0.5 text-[0.625rem] text-rose-600 dark:text-rose-300">
+                <span
+                  className="rounded bg-rose-500/10 px-1.5 py-0.5 text-[0.625rem] text-rose-600 dark:text-rose-300"
+                  data-status-tone="error"
+                >
                   {labels.statusBlocked}
                 </span>
               ) : null}
             </div>
 
             {!String(groupId || "").trim() ? (
-              <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+              <div
+                className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+                data-status-tone="warning"
+              >
                 {labels.noGroupHint}
               </div>
             ) : null}
@@ -199,6 +203,7 @@ export function SkillAssignmentManagerModal({
             {error ? (
               <div
                 className="mt-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-400"
+                data-status-tone="error"
                 role="alert"
               >
                 {error}
@@ -211,7 +216,10 @@ export function SkillAssignmentManagerModal({
             ) : null}
 
             {editable && duplicateCandidates.length ? (
-              <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+              <div
+                className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2"
+                data-status-tone="warning"
+              >
                 <div className="text-xs font-medium text-amber-800 dark:text-amber-200">
                   {labels.duplicateTitle}
                 </div>
@@ -285,12 +293,11 @@ export function SkillAssignmentManagerModal({
                     <textarea
                       value={capsuleText}
                       onChange={(e) => onCapsuleTextChange(e.target.value)}
-                      maxLength={capsuleTextMax}
                       rows={16}
                       className={`mt-1 ${inputClass()} resize-y font-mono text-xs leading-5`}
                     />
                     <span className="mt-1 block text-[0.625rem] text-[var(--color-text-muted)]">
-                      {labels.capsuleLimit}
+                      {labels.capsuleCount}
                     </span>
                   </label>
                 </div>
@@ -309,7 +316,10 @@ export function SkillAssignmentManagerModal({
             ) : null}
 
             {qualificationStatus === "blocked" ? (
-              <div className="mt-4 rounded-lg border border-rose-500/20 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+              <div
+                className="mt-4 rounded-lg border border-rose-500/20 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300"
+                data-status-tone="error"
+              >
                 {labels.blockedBanner}
               </div>
             ) : null}
@@ -371,7 +381,10 @@ export function SkillAssignmentManagerModal({
                         </div>
                       ))}
                       {usage.blocked ? (
-                        <div className="rounded-md bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-300">
+                        <div
+                          className="rounded-md bg-rose-500/10 px-2 py-1.5 text-xs text-rose-600 dark:text-rose-300"
+                          data-status-tone="error"
+                        >
                           {labels.usageBlocked}
                         </div>
                       ) : null}
@@ -423,7 +436,10 @@ export function SkillAssignmentManagerModal({
                             ) : null}
                             <span className="mt-1 flex flex-wrap gap-1">
                               {profileActorIds.has(actorId) ? (
-                                <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[0.625rem] text-amber-700 dark:text-amber-300">
+                                <span
+                                  className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[0.625rem] text-amber-700 dark:text-amber-300"
+                                  data-status-tone="warning"
+                                >
                                   {labels.profileBadge}
                                 </span>
                               ) : null}
@@ -493,6 +509,7 @@ export function SkillAssignmentManagerModal({
                         ? neutralActionButtonClass
                         : "border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-300"
                     }`}
+                    data-status-tone={qualificationStatus === "blocked" ? undefined : "error"}
                     disabled={writeBusy}
                     onClick={onToggleRecordBlock}
                   >
@@ -501,6 +518,7 @@ export function SkillAssignmentManagerModal({
                   <button
                     type="button"
                     className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs min-h-[38px] text-rose-600 dark:text-rose-300 disabled:opacity-60"
+                    data-status-tone="error"
                     disabled={writeBusy}
                     onClick={onRemoveRecord}
                   >

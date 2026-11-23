@@ -1,12 +1,14 @@
 import { supportsAcpMode } from "../../types";
 import { useEffect } from "react";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 import { RefreshCw } from "lucide-react";
 import { useGroupStore } from "../../stores";
 import { RUNTIME_INFO, SUPPORTED_RUNTIMES, type RuntimeMode } from "../../types";
 import { runtimeDetectionKey } from "../../utils/runtimeDetection";
 import { SelectCombobox } from "../SelectCombobox";
 import { Button } from "../ui/button";
+import { LcdSpinner } from "../LcdSpinner";
+import { LcdIcon } from "../Icons";
 
 export function RuntimeSelector({
   value,
@@ -17,6 +19,7 @@ export function RuntimeSelector({
   ariaLabel,
   className,
   allowedRuntimes,
+  showHint = true,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -26,6 +29,7 @@ export function RuntimeSelector({
   ariaLabel?: string;
   className?: string;
   allowedRuntimes?: readonly string[];
+  showHint?: boolean;
 }) {
   const { t } = useTranslation("actors");
   const runtimes = useGroupStore((s) => s.runtimes);
@@ -36,7 +40,12 @@ export function RuntimeSelector({
   }, [status, refresh]);
   const selectedInfo = runtimes.find((item) => item.name === value);
   const selectedKey = runtimeDetectionKey(value, selectedInfo, status, runtimeMode);
-  const captionKey = status === "error" ? "failed" : selectedKey;
+  const captionKey =
+    status === "error"
+      ? "failed"
+      : value === "deepseek" && selectedKey === "detected" && !selectedInfo?.path
+        ? "deepseekSetup"
+        : selectedKey;
   const checking = status === "idle" || status === "loading";
   const modeLabel = supportsAcpMode(value)
     ? runtimeMode === "acp"
@@ -60,28 +69,36 @@ export function RuntimeSelector({
         ariaLabel={ariaLabel || t("runtime")}
         items={SUPPORTED_RUNTIMES.filter(
           (runtime) => !allowedRuntimes || allowedRuntimes.includes(runtime),
-        ).map((runtime) => {
-          const info = runtimes.find((item) => item.name === runtime);
-          const key = runtimeDetectionKey(runtime, info, status);
-          const description =
-            runtime === "antigravity"
-              ? `TUI: ${t(`runtimeDetection.${key}`)} · ACP: ${t(`runtimeDetection.${runtimeDetectionKey(runtime, info, status, "acp")}`)}`
-              : t(`runtimeDetection.${key}`);
-          return {
-            value: runtime,
-            label:
-              runtime === "pi"
-                ? `${RUNTIME_INFO[runtime].label} (RPC)`
-                : RUNTIME_INFO[runtime]?.label || runtime,
-            description,
-            disabled: !allowUndetected && runtime !== "antigravity" && key === "missing",
-          };
-        })}
+        )
+          .map((runtime) => {
+            const info = runtimes.find((item) => item.name === runtime);
+            const key = runtimeDetectionKey(runtime, info, status);
+            const description =
+              runtime === "antigravity"
+                ? `TUI: ${t(`runtimeDetection.${key}`)} · ACP: ${t(`runtimeDetection.${runtimeDetectionKey(runtime, info, status, "acp")}`)}`
+                : key === "failed" || key === "unknown"
+                  ? t(`runtimeDetection.${key}`)
+                  : undefined;
+            return {
+              value: runtime,
+              label:
+                runtime === "pi"
+                  ? `${RUNTIME_INFO[runtime].label} (RPC)`
+                  : RUNTIME_INFO[runtime]?.label || runtime,
+              description,
+              group: key === "missing" ? t("runtimeSwitch.notDetected") : undefined,
+              disabled: !allowUndetected && runtime !== "antigravity" && key === "missing",
+            };
+          })
+          .sort((left, right) => Number(Boolean(left.group)) - Number(Boolean(right.group)))}
         searchable
       />
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs">
         <span
           role="status"
+          data-status-tone={
+            captionKey === "failed" || captionKey === "missing" ? "warning" : undefined
+          }
           className={
             captionKey === "failed" || captionKey === "missing"
               ? "text-orange-700 dark:text-orange-300"
@@ -89,28 +106,41 @@ export function RuntimeSelector({
           }
         >
           {modeLabel ? `${modeLabel}: ` : ""}
-          {t(`runtimeDetection.${captionKey}`)}
+          {captionKey === "deepseekSetup" ? (
+            <Trans
+              ns="actors"
+              i18nKey="runtimeDetection.deepseekSetup"
+              components={[<code key="command" className="whitespace-nowrap" />]}
+            />
+          ) : (
+            t(`runtimeDetection.${captionKey}`)
+          )}
         </span>
         <Button
           type="button"
           variant="ghost"
+          data-lcd-key
           size="sm"
           className="min-h-[44px] gap-1.5 text-xs"
           disabled={disabled || checking}
           onClick={() => void refresh()}
         >
-          <RefreshCw
-            size={13}
-            aria-hidden="true"
-            className={checking ? "animate-spin motion-reduce:animate-none" : ""}
-          />
+          {checking ? (
+            <LcdSpinner className="h-[13px] w-[13px]">
+              <LcdIcon icon={RefreshCw} glyph="reload" size={13} aria-hidden="true" />
+            </LcdSpinner>
+          ) : (
+            <LcdIcon icon={RefreshCw} glyph="reload" size={13} aria-hidden="true" />
+          )}
           {t("runtimeDetection.recheck")}
         </Button>
       </div>
-      <p className="text-[11px] leading-4 text-[var(--color-text-muted)]">
-        {t("runtimeDetection.scope")}
-        {value === "pi" ? ` ${t("piRuntimeHint")}` : ""}
-      </p>
+      {showHint || value === "pi" ? (
+        <p className="text-[11px] leading-4 text-[var(--color-text-muted)]">
+          {showHint ? t("runtimeDetection.scope") : null}
+          {value === "pi" ? ` ${t("piRuntimeHint")}` : ""}
+        </p>
+      ) : null}
     </div>
   );
 }

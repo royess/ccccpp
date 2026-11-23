@@ -15,6 +15,17 @@ fn shared_vectors_cover_valid_and_invalid_frames() {
         fixture["acp_sdk_version"],
         cccc_contracts::DEEPSEEK_ACP_SDK_VERSION
     );
+    let mut expected = fixture["session_new"].clone();
+    if cfg!(windows) {
+        expected["params"]["cwd"] = json!(r"C:\tmp\cccc");
+    }
+    let params = &expected["params"];
+    let request = session_new_request(
+        params["cwd"].as_str().expect("workspace"),
+        params["mcpServers"].as_array().expect("member MCP servers"),
+    )
+    .expect("absolute workspace");
+    assert_eq!(request, expected);
     let mut session = NdjsonSession::default();
     session.register(&json!(1)).expect("register response");
     for frame in fixture["frames"].as_array().expect("frames") {
@@ -50,7 +61,12 @@ fn handshake_and_permission_shapes_are_minimal() {
             .expect("clientCapabilities object")
             .is_empty()
     );
-    let session = session_new_request("/tmp/work").expect("absolute cwd");
+    let cwd = if cfg!(windows) {
+        r"C:\work"
+    } else {
+        "/tmp/work"
+    };
+    let session = session_new_request(cwd, &[]).expect("absolute cwd");
     assert_eq!(session["params"]["mcpServers"], json!([]));
     assert_eq!(
         permission_outcome(&json!([{ "optionId": "reject-once" }]), false)["outcome"]["outcome"],
@@ -79,10 +95,13 @@ fn handshake_and_permission_shapes_are_minimal() {
 }
 
 #[test]
-fn session_new_accepts_unix_and_windows_absolute_paths() {
-    assert!(session_new_request("/tmp/work").is_ok());
-    assert!(session_new_request(r"C:\\work").is_ok());
-    assert!(session_new_request(r"\\\\server\\share\\work").is_ok());
-    assert!(session_new_request("relative/work").is_err());
-    assert!(session_new_request(r"C:relative").is_err());
+fn session_new_checks_absolute_paths_for_the_host() {
+    #[cfg(unix)]
+    assert!(session_new_request("/tmp/work", &[]).is_ok());
+    #[cfg(windows)]
+    assert!(session_new_request("/tmp/work", &[]).is_err());
+    assert!(session_new_request(r"C:\\work", &[]).is_ok());
+    assert!(session_new_request(r"\\\\server\\share\\work", &[]).is_ok());
+    assert!(session_new_request("relative/work", &[]).is_err());
+    assert!(session_new_request(r"C:relative", &[]).is_err());
 }

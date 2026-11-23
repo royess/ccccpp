@@ -1,4 +1,8 @@
 import { actorRuntimeStatusKey } from "../utils/actorRuntimeStatus";
+import { NativeSessionPanel } from "../features/localSessions/NativeSessionPanel";
+import { RuntimeSwitchPendingNotice } from "../features/runtimeSwitch/RuntimeSwitchPendingNotice";
+import { ActorRuntimeConfirmationNotice } from "./agentTerminal/ActorRuntimeConfirmationNotice";
+import { useStartupInputWaiting } from "../hooks/useStartupInputWaiting";
 import { isWebModelRuntime } from "../types";
 import { useTerminalTitlePaging } from "./agentTerminal/useTerminalTitlePaging";
 import {
@@ -13,11 +17,13 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { useTranslation } from "react-i18next";
+import { useShallow } from "zustand/react/shallow";
 import {
   Actor,
   AgentState,
   HeadlessPreviewSession,
   HeadlessStreamEvent,
+  LedgerEvent,
   StreamingActivity,
   RUNTIME_INFO,
 } from "../types";
@@ -47,12 +53,14 @@ import {
   EditIcon,
   TerminalIcon,
   PlusIcon,
-  ClockIcon,
 } from "./Icons";
 import { ActorQuickControls } from "./agentTerminal/ActorQuickControls";
-import { TerminalHistoryPanel } from "./agentTerminal/TerminalHistoryPanel";
+import { SessionReplacedMark } from "./agentTerminal/SessionReplacedMark";
 import { ScrollFade } from "./ScrollFade";
 import { getRuntimeIndicatorState } from "../utils/statusIndicators";
+import { UNOBSERVABLE_WORKING_STATE } from "../utils/terminalWorkingState";
+import { NATIVE_SESSION_AVAILABLE, nativeSessionStatusKey } from "../utils/nativeSessionStatus";
+import { runtimeConfirmationKeys } from "../utils/runtimeConfirmationKeys";
 import {
   getEffectiveActorRunner,
   hasManagedRuntimeControls,
@@ -65,6 +73,7 @@ import { attachTerminalTouchScroll } from "./agentTerminal/terminalTouchScroll";
 import { getTerminalTheme } from "./agentTerminal/terminalTheme";
 import {
   actorHasRuntimeResumeFailure,
+  actorSessionReplacement,
   actorSupportsNewSession,
   shouldFetchStoppedTerminalTail,
   shouldReconcileStoppedActorStatus,
@@ -74,6 +83,7 @@ import { ActorAvatar } from "./ActorAvatar";
 const EMPTY_STREAMING_ACTIVITIES: StreamingActivity[] = [];
 const EMPTY_HEADLESS_PREVIEW_SESSIONS: HeadlessPreviewSession[] = [];
 const EMPTY_HEADLESS_RAW_EVENTS: HeadlessStreamEvent[] = [];
+const EMPTY_STREAMING_EVENTS: LedgerEvent[] = [];
 const STOPPED_TAIL_FETCH_DELAY_MS = 350;
 const STOPPED_ACTOR_STATUS_REFRESH_MS = 3000;
 
@@ -89,7 +99,7 @@ function normalizeActorGroupRole(role: unknown): "foreman" | "peer" {
 
 function actorGroupRoleBadgeClass(role: "foreman" | "peer"): string {
   return classNames(
-    "rounded-md border px-1.5 py-0.5 text-xs font-medium",
+    "shrink-0 whitespace-nowrap rounded-md border px-1.5 py-0.5 text-xs font-medium",
     role === "foreman"
       ? "border-amber-500/25 bg-amber-500/12 text-amber-700 dark:text-amber-300"
       : "border-slate-400/25 bg-slate-500/10 text-slate-600 dark:border-slate-400/20 dark:bg-slate-400/10 dark:text-slate-300",
@@ -160,20 +170,26 @@ export function AgentTab({
   isSmallScreen,
   onStatusChange,
 }: AgentTabProps) {
-  const { t } = useTranslation("actors");
+  const { t, i18n } = useTranslation("actors");
   // Derived state (must be defined before refs that use them)
   const { isRunning, workingState } = useActorDisplayState({
     groupId,
     actor,
     actorStatusProvisional,
   });
+  const startupWaiting = useStartupInputWaiting(groupId, actor);
   const effectiveRunner = getEffectiveActorRunner(actor);
   const isHeadless = effectiveRunner === "headless";
   const isWebModel = isWebModelRuntime(actor.runtime);
   const isDots = actor.runtime === "chatgpt_dots";
   const isGrok = actor.runtime === "grok_web_model";
   const isEventActor = isDots || isGrok;
-  const lifecycleActive = isEventActor ? Boolean(actor.enabled) : isRunning;
+  const isNativeSession = Boolean(actor.external_session_id);
+  const accessOnly = isWebModel || isNativeSession;
+  const lifecycleActive = accessOnly ? Boolean(actor.enabled) : isRunning;
+  const groupState = useGroupStore((state) =>
+    state.groupDoc?.group_id === groupId ? state.groupDoc.state : undefined,
+  );
   const openActorEditor = useModalStore((state) => state.openActorEditor);
   const openSettingsTarget = useModalStore((state) => state.openSettingsTarget);
   const settingsOpen = useModalStore((state) => state.modals.settings);
@@ -204,10 +220,25 @@ export function AgentTab({
     eventSnapshot.actorId === actor.id &&
     eventSnapshot.runtime === actor.runtime;
   const eventState = eventVisit && canAccessGlobalSettings ? eventSnapshot.state : null;
-  const eventStartKey = eventState?.connected ? "dotsResume" : "dotsEnable";
+  const eventStartKey = isNativeSession || eventState?.connected ? "dotsResume" : "dotsEnable";
   const canStartNewSession =
-    !isEventActor && actorSupportsNewSession(actor.runtime, actor.runtime_mode);
+    !accessOnly && actorSupportsNewSession(actor.runtime, actor.runtime_mode);
   const hasRuntimeResumeFailure = actorHasRuntimeResumeFailure(actor);
+  const sessionReplacement = actorSessionReplacement(actor);
+  const sessionReplacedMark = sessionReplacement ? (
+    <SessionReplacedMark
+      summary={t("runtimeSessionReplaced", { time: formatFullTime(sessionReplacement.at) })}
+      reasons={
+        sessionReplacement.reasons.length
+          ? t("runtimeSessionReplacedReasons", {
+              reasons: sessionReplacement.reasons
+                .map((reason) => t(`runtimeSessionReplacedReason.${reason}`))
+                .join(t("runtimeSessionReplacedReasonSeparator")),
+            })
+          : ""
+      }
+    />
+  ) : null;
   const runtimeResumeError = String(actor.runtime_session_last_resume_error || "").trim();
   const canControl = !readOnly;
   const actorBusy = useUIStore(
@@ -245,6 +276,14 @@ export function AgentTab({
     const events = bucket.rawHeadlessEventsByActorId?.[actorId];
     return Array.isArray(events) ? events : EMPTY_HEADLESS_RAW_EVENTS;
   });
+  const actorStreamingEvents = useGroupStore(
+    useShallow((state) => {
+      if (!isHeadless || isWebModel || isNativeSession) return EMPTY_STREAMING_EVENTS;
+      const events =
+        state.chatByGroup[String(groupId || "").trim()]?.streamingEvents || EMPTY_STREAMING_EVENTS;
+      return events.filter((event) => event.by === actor.id);
+    }),
+  );
   const observabilityLoaded = useObservabilityStore((s) => s.loaded);
   const loadObservability = useObservabilityStore((s) => s.load);
   const terminalScrollbackLines = useObservabilityStore((s) => s.terminalScrollbackLines);
@@ -259,7 +298,6 @@ export function AgentTab({
     scrollbackLines: terminalScrollbackLines,
   });
   const [activated, setActivated] = useState(false);
-  const [historyOpen, setHistoryOpen] = useState(false);
   // Bumped to trigger a fresh WebSocket connection from the reconnect button
   const [reconnectTrigger, setReconnectTrigger] = useState(0);
   const [stoppedTerminalText, setStoppedTerminalText] = useState("");
@@ -377,46 +415,32 @@ export function AgentTab({
     overflow: "hidden",
   };
 
+  const nativeStatusKey = nativeSessionStatusKey(actor, groupState);
   const runtimeIndicator = getRuntimeIndicatorState({
-    isRunning: isEventActor
-      ? ["ready", "pending", "delivering", "delivered", "working"].includes(eventState?.phase || "")
-      : Boolean(isRunning),
-    workingState: isEventActor
-      ? eventState?.phase === "working"
-        ? "working"
-        : eventState?.phase === "failed" || eventState?.phase === "interrupted"
-          ? "stuck"
-          : "waiting"
-      : workingState,
+    isRunning: isNativeSession
+      ? nativeStatusKey === NATIVE_SESSION_AVAILABLE
+      : isEventActor
+        ? ["ready", "pending", "delivering", "delivered", "working"].includes(
+            eventState?.phase || "",
+          )
+        : Boolean(isRunning),
+    workingState: isNativeSession
+      ? "waiting"
+      : isEventActor
+        ? eventState?.phase === "working"
+          ? "working"
+          : eventState?.phase === "failed" || eventState?.phase === "interrupted"
+            ? "stuck"
+            : "waiting"
+        : workingState,
   });
-  const statusTone = (() => {
-    switch (runtimeIndicator.tone) {
-      case "stop":
-        return {
-          dotClass: runtimeIndicator.dotClass,
-          pulse: runtimeIndicator.pulse,
-          strongPulse: runtimeIndicator.strongPulse,
-          badgeClass: "bg-slate-500/10 text-slate-500 dark:text-slate-300",
-        };
-      case "working":
-        return {
-          dotClass: runtimeIndicator.dotClass,
-          pulse: runtimeIndicator.pulse,
-          strongPulse: runtimeIndicator.strongPulse,
-          badgeClass: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-300",
-        };
-      case "run":
-      default:
-        return {
-          dotClass: runtimeIndicator.dotClass,
-          pulse: runtimeIndicator.pulse,
-          strongPulse: runtimeIndicator.strongPulse,
-          badgeClass: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-300",
-        };
-    }
-  })();
-
   const runtimeStatusText = (() => {
+    if (actor.runtime_confirmation_required)
+      return t(runtimeConfirmationKeys(actor.runtime).pending);
+    if (startupWaiting) return t("runtimeStartupInputPending");
+    if (actor.runtime_confirmation_paused === true)
+      return t(runtimeConfirmationKeys(actor.runtime).paused);
+    if (isNativeSession) return t(nativeStatusKey);
     if (isEventActor)
       return t(
         !canAccessGlobalSettings
@@ -431,14 +455,41 @@ export function AgentTab({
               ? "settings:dotsActor.unavailable"
               : "common:loading",
       );
+    if (isWebModel) return t(actor.enabled ? "webAccessEnabled" : "webAccessPaused");
+    if (workingState === UNOBSERVABLE_WORKING_STATE) return t("statusUnknown");
     return t(
       actorRuntimeStatusKey({
         ...actor,
         running: isRunning,
-        effective_working_state: workingState,
+        effective_working_state:
+          workingState === "idle" ? actor.effective_working_state : workingState,
       }),
     );
   })();
+  // The LCD shapes reuse the Group's run/idle/stop vocabulary. The accessible
+  // label remains the Actor's more specific status (including waiting/stuck).
+  const lcdStatusShape =
+    runtimeIndicator.tone === "working"
+      ? "run"
+      : runtimeIndicator.tone === "stop"
+        ? "stop"
+        : runtimeIndicator.tone === "error"
+          ? undefined
+          : "idle";
+  const lcdStatusText =
+    runtimeIndicator.tone !== "error"
+      ? ""
+      : workingState === UNOBSERVABLE_WORKING_STATE
+        ? "?"
+        : "×";
+  // Why the status is what it is; the daemon's diagnostic names the next step when it
+  // could not observe the agent.
+  const runtimeStatusDetail = [
+    !isEventActor && actor.effective_working_reason,
+    !isEventActor && actor.runtime_observation_error,
+  ]
+    .filter(Boolean)
+    .join("\n");
   const handleNewSession = () => {
     if (!window.confirm(t("newSessionConfirm"))) return;
     onNewSession();
@@ -451,6 +502,7 @@ export function AgentTab({
         "border-amber-500/30 bg-amber-500/10 text-amber-700",
         "dark:border-amber-300/25 dark:bg-amber-300/10 dark:text-amber-100",
       )}
+      data-status-tone="warning"
     >
       <AlertIcon size={40} />
       <div className="mt-3 text-lg font-semibold text-[var(--color-text-primary)]">
@@ -729,17 +781,18 @@ export function AgentTab({
   const actorGroupRole = normalizeActorGroupRole(actor.role);
   const titlePaging = useTerminalTitlePaging(isVisible && compact ? onPage : undefined);
 
-  const compactStatusText = isEventActor
-    ? runtimeStatusText
-    : !isRunning
+  const compactStatusText =
+    actor.runtime_confirmation_required || startupWaiting || isNativeSession || isEventActor
       ? runtimeStatusText
-      : !isHeadless && connectionStatus !== "connected"
-        ? t(connectionStatus === "disconnected" ? "connectionLost" : "chat:workView.connecting")
-        : workingState === "waiting" || workingState === "stuck" || workingState === "error"
-          ? runtimeStatusText
-          : !isHeadless && terminalReady && !terminalWritable
-            ? t("readOnlyConnection")
-            : "";
+      : !isRunning || workingState === UNOBSERVABLE_WORKING_STATE
+        ? runtimeStatusText
+        : !isHeadless && connectionStatus !== "connected"
+          ? t(connectionStatus === "disconnected" ? "connectionLost" : "chat:workView.connecting")
+          : workingState === "waiting" || workingState === "stuck" || workingState === "error"
+            ? runtimeStatusText
+            : !isHeadless && terminalReady && !terminalWritable
+              ? t("readOnlyConnection")
+              : "";
 
   const compactIdentityTitle = [
     actor.title || actor.id,
@@ -768,27 +821,28 @@ export function AgentTab({
               Boolean(navigation) && "basis-full min-h-8 @min-[480px]/actor-view:basis-auto",
             )}
           >
-            <div className="relative h-5 w-5 shrink-0" title={compactIdentityTitle}>
+            <div className="relative h-7 w-7 shrink-0" title={compactIdentityTitle}>
               <span aria-hidden="true">
                 <ActorAvatar
                   avatarUrl={actor.avatar_url || undefined}
                   runtime={actor.runtime}
                   title={actor.title || actor.id}
                   isDark={isDark}
-                  sizeClassName="h-5 w-5"
-                  textClassName="text-[10px]"
-                  className="!border-0 !shadow-none"
+                  sizeClassName="h-7 w-7"
+                  textClassName="text-[0.625rem]"
+                  className="lcd-tile"
                 />
               </span>
-              <span
-                className={`absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full ring-1 ring-[var(--color-bg-secondary)] ${statusTone.dotClass}`}
-                role="img"
-                aria-label={runtimeStatusText}
-                title={[runtimeStatusText, !isEventActor && actor.effective_working_reason]
-                  .filter(Boolean)
-                  .join("\n")}
-              />
             </div>
+            <span
+              className="lcd-group-symbol"
+              data-lcd-shape={lcdStatusShape}
+              role="img"
+              aria-label={runtimeStatusText}
+              title={[runtimeStatusText, runtimeStatusDetail].filter(Boolean).join("\n")}
+            >
+              {lcdStatusText}
+            </span>
             <span
               id={`runtime-inspector-${groupId}-${actor.id}`}
               className="min-w-0 flex-1 truncate font-semibold"
@@ -799,13 +853,12 @@ export function AgentTab({
             {compactStatusText ? (
               <span
                 className="max-w-[40%] shrink-0 truncate text-[var(--color-text-secondary)]"
-                title={[compactStatusText, !isEventActor && actor.effective_working_reason]
-                  .filter(Boolean)
-                  .join("\n")}
+                title={[compactStatusText, runtimeStatusDetail].filter(Boolean).join("\n")}
               >
                 {compactStatusText}
               </span>
             ) : null}
+            {sessionReplacedMark}
           </div>
           {navigation}
           <ActorQuickControls
@@ -819,14 +872,13 @@ export function AgentTab({
             connected={terminalReady && connectionStatus === "connected"}
             connectionFailed={connectionFailed}
             canStartNewSession={canStartNewSession}
-            pauseCcccAccess={isEventActor}
-            dotsConnected={Boolean(eventState?.connected)}
+            pauseCcccAccess={accessOnly}
+            dotsConnected={isNativeSession || Boolean(eventState?.connected)}
             unreadCount={unreadCount}
             onInterrupt={sendInterrupt}
             onLaunch={onLaunch}
             onReconnect={requestReconnect}
             onTakeover={requestTakeover}
-            onHistory={() => setHistoryOpen(true)}
             onNewSession={handleNewSession}
             onRestart={onRelaunch}
             onStop={onQuit}
@@ -839,9 +891,11 @@ export function AgentTab({
       ) : null}
       {/* Agent Header */}
       <div
+        data-terminal-expanded-header
         className={classNames(
-          compact ? "hidden" : "border-b px-4 py-2 sm:px-5",
-          isEventActor && "max-sm:pr-16",
+          compact
+            ? "hidden"
+            : "border-b py-2 pl-4 pr-[calc(44px+1.25rem)] sm:pl-5 sm:pr-[calc(44px+1.5rem)]",
           isDark
             ? "border-white/8 bg-[linear-gradient(180deg,rgba(255,255,255,0.025),rgba(255,255,255,0.01))]"
             : "border-black/6 bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(248,250,252,0.88))]",
@@ -857,56 +911,43 @@ export function AgentTab({
                 isDark={isDark}
                 sizeClassName={isSmallScreen ? "h-8 w-8" : "h-9 w-9"}
                 textClassName="text-xs"
-                className={classNames(
-                  "shadow-[0_14px_28px_-20px_rgba(15,23,42,0.68)]",
-                  isDark ? "bg-slate-900" : "bg-white",
-                )}
+                className="lcd-tile"
               />
-              <span
-                className={classNames(
-                  "absolute -bottom-0.5 -right-0.5 inline-flex h-2.5 w-2.5 rounded-full ring-2 transition-all",
-                  isDark ? "ring-slate-950" : "ring-white",
-                  statusTone.dotClass,
-                )}
-              >
-                {statusTone.pulse && (
-                  <span
-                    className={classNames(
-                      "absolute inset-[-3px] rounded-full motion-reduce:animate-none",
-                      statusTone.strongPulse
-                        ? "animate-ping bg-emerald-300/35"
-                        : "animate-pulse bg-current/20",
-                    )}
-                  />
-                )}
-                {statusTone.strongPulse && (
-                  <span className="absolute inset-[-7px] rounded-full border border-emerald-300/35 animate-ping motion-reduce:animate-none [animation-duration:1.6s]" />
-                )}
-              </span>
             </div>
 
             <div className="flex min-w-0 items-center gap-3">
-              <div className={classNames("min-w-0", !isEventActor && "shrink-0")}>
+              <div className="min-w-0">
                 <div className="flex items-center gap-2 min-w-0">
                   <span
                     id={compact ? undefined : `runtime-inspector-${groupId}-${actor.id}`}
                     className="min-w-0 truncate font-semibold text-[var(--color-text-primary)]"
+                    title={actor.title || actor.id}
                   >
                     {actor.title || actor.id}
                   </span>
-                  <span className={actorGroupRoleBadgeClass(actorGroupRole)}>
+                  <span className={actorGroupRoleBadgeClass(actorGroupRole)} data-role-badge>
                     {actorGroupRole === "foreman"
                       ? t("groupRoleForeman", { defaultValue: "Foreman" })
                       : t("groupRolePeer", { defaultValue: "Peer" })}
                   </span>
                 </div>
-                <div
-                  className={classNames(
-                    "mt-0.5 text-xs truncate",
-                    "text-[var(--color-text-tertiary)]",
-                  )}
-                >
-                  {rtInfo?.label || t("custom")} • {runtimeStatusText}
+                {/* Only the text is cut short: the mark beside it keeps the area a finger hits. */}
+                <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-[var(--color-text-tertiary)]">
+                  <span
+                    className="min-w-0 truncate"
+                    title={(!isEventActor && actor.runtime_observation_error) || undefined}
+                  >
+                    {rtInfo?.label || t("custom")} •{" "}
+                    <span
+                      className="lcd-group-symbol"
+                      data-lcd-shape={lcdStatusShape}
+                      aria-hidden="true"
+                    >
+                      {lcdStatusText}
+                    </span>{" "}
+                    {runtimeStatusText}
+                  </span>
+                  {sessionReplacedMark}
                 </div>
                 {/* Mobile-only: condensed single-line agent state */}
                 {(!isEventActor || agentState) && (
@@ -933,6 +974,7 @@ export function AgentTab({
                       : "max-w-[min(660px,54vw)] border-black/8 bg-white/78",
                   )}
                   aria-label={t("agentState")}
+                  data-terminal-agent-state
                 >
                   <div className="min-w-0">
                     <div
@@ -944,10 +986,13 @@ export function AgentTab({
                             ? "text-slate-500 italic"
                             : "text-gray-500 italic",
                       )}
+                      data-status-tone={
+                        stateHeadline === t("noAgentStateYet") ? "muted" : undefined
+                      }
                       style={statusClamp2Style}
                       title={
                         agentState?.updated_at
-                          ? `${stateHeadline}\nUpdated: ${formatFullTime(agentState.updated_at)}`
+                          ? `${stateHeadline}\n${t("agentStateUpdated", { time: formatFullTime(agentState.updated_at) })}`
                           : stateHeadline
                       }
                     >
@@ -969,6 +1014,7 @@ export function AgentTab({
                             className={classNames(
                               "shrink-0 rounded-full bg-rose-500/15 px-2 py-0.5 text-xs text-rose-600 dark:text-rose-300",
                             )}
+                            data-status-tone="error"
                           >
                             {t("blockersShort", { count: blockerCount })}
                           </span>
@@ -989,7 +1035,7 @@ export function AgentTab({
                   </div>
                   {agentState?.updated_at ? (
                     <div className="shrink-0 rounded-full border border-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)] px-2 py-0.5 text-xs font-medium leading-4 text-[var(--color-text-tertiary)]">
-                      {formatTime(agentState.updated_at)}
+                      {formatTime(agentState.updated_at, i18n?.language)}
                     </div>
                   ) : null}
                 </div>
@@ -999,13 +1045,24 @@ export function AgentTab({
         </div>
       </div>
 
+      <ActorRuntimeConfirmationNotice actor={actor} groupId={groupId} readOnly={readOnly} />
+      <RuntimeSwitchPendingNotice actor={actor} groupId={groupId} />
+
       {/* Terminal or Status Area */}
       {/* contain: layout prevents terminal content changes from triggering parent layout recalculation */}
       <div
         className={classNames("flex-1 min-h-0 relative", "bg-[var(--color-bg-secondary)]")}
         style={{ contain: "layout", overflow: "hidden" }}
       >
-        {isHeadless ? (
+        {isNativeSession ? (
+          <NativeSessionPanel
+            actor={actor}
+            groupId={groupId}
+            statusText={runtimeStatusText}
+            isVisible={isVisible && !settingsOpen}
+            canAccessRecovery={canAccessGlobalSettings && !readOnly}
+          />
+        ) : isHeadless ? (
           <div
             className={classNames(
               "flex h-full min-h-0 flex-col",
@@ -1031,6 +1088,7 @@ export function AgentTab({
                   readOnly={readOnly}
                   compact={compact}
                   onExpand={onExpand}
+                  onSettings={() => openActorEditor(actor, "chatgpt")}
                   canAccessConnection={canAccessGlobalSettings}
                   onStateChange={receiveEventState}
                   onOpenSharedSettings={
@@ -1039,7 +1097,8 @@ export function AgentTab({
                           openSettingsTarget({
                             scope: "global",
                             tab: "webModels",
-                            webModelProvider: "dots",
+                            webModelProvider: "chatgpt_web",
+                            webModelSection: "connector",
                           })
                       : undefined
                   }
@@ -1075,6 +1134,18 @@ export function AgentTab({
                   isVisible={isVisible}
                   readOnly={readOnly}
                   compact={compact}
+                  canAccessConnection={canAccessGlobalSettings}
+                  onOpenSharedSettings={
+                    canControl && canAccessGlobalSettings
+                      ? () =>
+                          openSettingsTarget({
+                            scope: "global",
+                            tab: "webModels",
+                            webModelProvider: "chatgpt_web",
+                            webModelSection: "login",
+                          })
+                      : undefined
+                  }
                 />
               ) : null}
               {hasManagedRuntimeControls(actor) && (
@@ -1095,6 +1166,8 @@ export function AgentTab({
                     </div>
                   ) : (
                     <HeadlessRuntimePanel
+                      groupId={groupId}
+                      streamingEvents={actorStreamingEvents}
                       actorId={actor.id}
                       previewSessions={headlessPreviewSessions}
                       fallbackText={latestHeadlessText}
@@ -1151,6 +1224,7 @@ export function AgentTab({
                   <button
                     onClick={requestReconnect}
                     className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium min-h-[44px] transition-colors"
+                    data-lcd-primary
                   >
                     <RefreshIcon size={16} />
                     {t("reconnect")}
@@ -1163,7 +1237,10 @@ export function AgentTab({
             connectionStatus === "connected" &&
             terminalReady &&
             !terminalWritable ? (
-              <div className="absolute right-4 top-4 z-10 rounded-lg border border-amber-500/30 bg-amber-500/12 px-3 py-2 text-xs font-medium text-amber-700 shadow-sm backdrop-blur dark:text-amber-200">
+              <div
+                className="absolute right-4 top-4 z-10 rounded-lg border border-amber-500/30 bg-amber-500/12 px-3 py-2 text-xs font-medium text-amber-700 shadow-sm backdrop-blur dark:text-amber-200"
+                data-terminal-notice
+              >
                 {t("terminalReadOnlyNotice", { defaultValue: "Terminal is connected read-only." })}
                 <button type="button" className="ml-2 underline" onClick={requestTakeover}>
                   {t("takeControl")}
@@ -1201,6 +1278,7 @@ export function AgentTab({
                   disabled={isBusy}
                   className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium disabled:opacity-50 min-h-[44px] transition-colors"
                   aria-label={t("launchAgentLabel")}
+                  data-lcd-primary
                 >
                   <PlayIcon size={16} />
                   {isBusy ? t("launching") : t("launchAgent")}
@@ -1225,7 +1303,7 @@ export function AgentTab({
       {/* Action Buttons - Scrollable on mobile with fade edges */}
       {canControl && !compact ? (
         <ScrollFade
-          className={classNames("border-t select-none", "glass-header")}
+          className={classNames("border-t select-none", "glass-header", "terminal-actions")}
           innerClassName="flex items-center gap-2 px-4 py-3 sm:px-5"
           fadeWidth={20}
         >
@@ -1234,17 +1312,19 @@ export function AgentTab({
               <button
                 onClick={onQuit}
                 disabled={isBusy}
+                data-lcd-key
                 className={`${secondaryActionButtonClass} flex-shrink-0 whitespace-nowrap`}
-                aria-label={t(isEventActor ? "dotsPause" : "quitAgent")}
-                title={isEventActor ? t("dotsPauseHint") : undefined}
+                aria-label={t(accessOnly ? "dotsPause" : "quitAgent")}
+                title={accessOnly ? t("dotsPauseHint") : undefined}
               >
                 <StopIcon size={16} />
-                {!isSmallScreen && t(isEventActor ? "dotsPause" : "quit")}
+                {!isSmallScreen && t(accessOnly ? "dotsPause" : "quit")}
               </button>
-              {!isEventActor ? (
+              {!accessOnly ? (
                 <button
                   onClick={sendInterrupt}
                   disabled={connectionStatus !== "connected" || !terminalWritable}
+                  data-lcd-key
                   className={`${ghostActionButtonClass} flex-shrink-0 whitespace-nowrap`}
                   title={t("sendInterruptTitle")}
                   aria-label={t("sendInterruptLabel")}
@@ -1252,10 +1332,11 @@ export function AgentTab({
                   ⌃C
                 </button>
               ) : null}
-              {!isEventActor ? (
+              {!accessOnly ? (
                 <button
                   onClick={onRelaunch}
                   disabled={isBusy}
+                  data-lcd-key
                   className={`${secondaryActionButtonClass} flex-shrink-0 whitespace-nowrap`}
                   aria-label={t("relaunchAgent")}
                 >
@@ -1267,6 +1348,7 @@ export function AgentTab({
                 <button
                   onClick={handleNewSession}
                   disabled={isBusy}
+                  data-lcd-key
                   className={`${secondaryActionButtonClass} flex-shrink-0 whitespace-nowrap`}
                   aria-label={t("newSessionAgent")}
                 >
@@ -1277,6 +1359,7 @@ export function AgentTab({
               <button
                 onClick={onEdit}
                 disabled={isBusy}
+                data-lcd-key
                 className={`${ghostActionButtonClass} flex-shrink-0 whitespace-nowrap`}
                 aria-label={t("editAgentConfig")}
               >
@@ -1290,15 +1373,17 @@ export function AgentTab({
                 onClick={onLaunch}
                 disabled={isBusy}
                 className={`${primaryActionButtonClass} flex-shrink-0 whitespace-nowrap`}
-                aria-label={t(isEventActor ? eventStartKey : "launchAgentLabel")}
+                aria-label={t(accessOnly ? eventStartKey : "launchAgentLabel")}
+                data-lcd-primary
               >
                 <PlayIcon size={16} />
-                {isBusy ? t("common:loading") : t(isEventActor ? eventStartKey : "launch")}
+                {isBusy ? t("common:loading") : t(accessOnly ? eventStartKey : "launch")}
               </button>
               {canStartNewSession ? (
                 <button
                   onClick={handleNewSession}
                   disabled={isBusy}
+                  data-lcd-key
                   className={`${secondaryActionButtonClass} flex-shrink-0 whitespace-nowrap`}
                   aria-label={t("newSessionAgent")}
                 >
@@ -1309,29 +1394,19 @@ export function AgentTab({
               <button
                 onClick={onEdit}
                 disabled={isBusy}
-                className={ghostActionButtonClass}
+                data-lcd-key
+                className={`${ghostActionButtonClass} flex-shrink-0 whitespace-nowrap`}
                 aria-label={t("editAgentConfig")}
               >
-                <EditIcon size={16} /> {t("common:edit")}
+                <EditIcon size={16} />
+                {!isSmallScreen && t("common:edit")}
               </button>
             </>
           )}
-          {!isHeadless ? (
-            // A runtime that repaints in place leaves xterm's scrollback empty,
-            // so scrolling the terminal cannot reach earlier output. The bytes
-            // live on the server either way; this reads them from there.
-            <button
-              onClick={() => setHistoryOpen(true)}
-              className={`${ghostActionButtonClass} flex-shrink-0 whitespace-nowrap`}
-              aria-label={t("openTerminalHistory")}
-              title={t("openTerminalHistory")}
-            >
-              <ClockIcon size={16} />
-              {!isSmallScreen && t("terminalHistory")}
-            </button>
-          ) : null}
           <button
             onClick={onInbox}
+            data-lcd-key
+            data-status-tone="neutral"
             className={classNames(
               "ml-auto flex items-center gap-1.5 rounded-xl px-3.5 py-2.5 text-sm min-h-[44px] transition-colors flex-shrink-0 whitespace-nowrap border",
               unreadCount > 0
@@ -1353,6 +1428,7 @@ export function AgentTab({
                   isDark ? "bg-white text-[rgb(20,20,22)]" : "bg-[rgb(35,36,37)] text-white",
                 )}
                 aria-hidden="true"
+                data-terminal-unread-count
               >
                 {unreadCount > 99 ? "99+" : unreadCount}
               </span>
@@ -1363,7 +1439,7 @@ export function AgentTab({
             disabled={isBusy}
             className={classNames(
               "flex items-center gap-1.5 rounded-xl px-3 py-2.5 text-sm disabled:opacity-50 min-h-[44px] transition-colors flex-shrink-0 whitespace-nowrap",
-              "text-rose-600 hover:bg-rose-500/10 dark:text-rose-400",
+              "destructive-key text-rose-600 hover:bg-rose-500/10 dark:text-rose-400",
             )}
             title={t("removeAgent")}
             aria-label={t("removeAgent")}
@@ -1372,15 +1448,6 @@ export function AgentTab({
             {!isSmallScreen && t("common:remove")}
           </button>
         </ScrollFade>
-      ) : null}
-      {historyOpen ? (
-        <TerminalHistoryPanel
-          groupId={groupId}
-          actorId={actor.id}
-          actorTitle={actor.title || actor.id}
-          isDark={isDark}
-          onClose={() => setHistoryOpen(false)}
-        />
       ) : null}
     </div>
   );

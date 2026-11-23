@@ -1,15 +1,16 @@
-import { useId, useMemo, useReducer, useState } from "react";
-import {
-  AlertTriangle,
-  ClipboardPaste,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Trash2,
-  Undo2,
-  X,
-} from "lucide-react";
+import { useEffect, useId, useMemo, useReducer, useState } from "react";
+import { AlertTriangle, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { LcdSpinner } from "../LcdSpinner";
+import {
+  LcdIcon,
+  SecretAddIcon,
+  SecretClearIcon,
+  SecretDeleteIcon,
+  SecretEditIcon,
+  SecretPasteIcon,
+  SecretUndoIcon,
+} from "../Icons";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { SecretValueInput } from "./SecretValueInput";
@@ -34,6 +35,7 @@ interface ActorSecretManagerProps {
   disabled?: boolean;
   onRefresh: () => void;
   onChangesChange: (changes: ActorSecretChanges) => void;
+  onDraftOpenChange?: (open: boolean) => void;
 }
 export function ActorSecretManager({
   keys,
@@ -44,6 +46,7 @@ export function ActorSecretManager({
   disabled = false,
   onRefresh,
   onChangesChange,
+  onDraftOpenChange,
 }: ActorSecretManagerProps) {
   const { t } = useTranslation("actors");
   const inputId = useId();
@@ -64,6 +67,10 @@ export function ActorSecretManager({
     editValueTouched,
     showEditValue,
   } = drafts;
+  useEffect(() => {
+    onDraftOpenChange?.(addOpen || Boolean(editingKey) || bulkOpen);
+    return () => onDraftOpenChange?.(false);
+  }, [addOpen, editingKey, bulkOpen, onDraftOpenChange]);
   const configuredKeys = useMemo(() => new Set(keys), [keys]);
   const stagedSetKeys = Object.keys(changes.setVars);
   const hasPendingChanges = stagedSetKeys.length > 0 || changes.unsetKeys.length > 0;
@@ -74,6 +81,7 @@ export function ActorSecretManager({
     <Button
       type="button"
       variant="ghost"
+      data-lcd-key
       size="sm"
       className="w-9 shrink-0 px-0"
       disabled={controlsDisabled}
@@ -81,7 +89,13 @@ export function ActorSecretManager({
       title={t("refreshConfiguredKeys")}
       onClick={onRefresh}
     >
-      <RefreshCw size={14} className={loading ? "animate-spin" : ""} aria-hidden="true" />
+      {loading ? (
+        <LcdSpinner className="h-3.5 w-3.5">
+          <LcdIcon icon={RefreshCw} glyph="reload" size={14} aria-hidden="true" />
+        </LcdSpinner>
+      ) : (
+        <LcdIcon icon={RefreshCw} glyph="reload" size={14} aria-hidden="true" />
+      )}
     </Button>
   );
   const submitAdd = () => {
@@ -99,8 +113,17 @@ export function ActorSecretManager({
   if (changes.clearAll) {
     return (
       <section aria-label={t("secretManager.title")} className="mt-4">
-        <div className="flex items-start gap-3 rounded-xl border border-rose-500/25 bg-rose-500/10 p-3 text-rose-700 dark:text-rose-300">
-          <AlertTriangle size={18} className="mt-0.5 shrink-0" aria-hidden="true" />
+        <div
+          className="flex items-start gap-3 rounded-xl border border-rose-500/25 bg-rose-500/10 p-3 text-rose-700 dark:text-rose-300"
+          data-status-tone="error"
+        >
+          <LcdIcon
+            icon={AlertTriangle}
+            glyph="warning-diamond"
+            size={18}
+            className="mt-0.5 shrink-0"
+            aria-hidden="true"
+          />
           <div className="min-w-0 flex-1">
             <div className="text-xs font-semibold">{t("secretManager.clearAllTitle")}</div>
             <div className="mt-1 text-[11px] leading-relaxed">
@@ -116,7 +139,7 @@ export function ActorSecretManager({
               disabled={controlsDisabled}
               onClick={() => onChangesChange(setActorSecretClearAll(changes, false))}
             >
-              <Undo2 size={14} aria-hidden="true" />
+              <SecretUndoIcon size={14} aria-hidden="true" />
               {t("secretManager.undo")}
             </Button>
           </div>
@@ -137,11 +160,12 @@ export function ActorSecretManager({
             <Button
               type="button"
               variant="ghost"
+              data-lcd-key
               size="sm"
               disabled={controlsDisabled}
               onClick={() => setBulkOpen(true)}
             >
-              <ClipboardPaste size={14} aria-hidden="true" />
+              <SecretPasteIcon size={14} aria-hidden="true" />
               {t("secretManager.batchPaste")}
             </Button>
           ) : null}
@@ -153,7 +177,7 @@ export function ActorSecretManager({
               disabled={controlsDisabled}
               onClick={() => dispatchDraft({ type: "openAdd" })}
             >
-              <Plus size={14} aria-hidden="true" />
+              <SecretAddIcon size={14} aria-hidden="true" />
               {t("secretManager.addVariable")}
             </Button>
           ) : null}
@@ -206,18 +230,22 @@ export function ActorSecretManager({
               <Button
                 type="button"
                 variant="ghost"
+                data-lcd-key
                 size="icon"
                 disabled={controlsDisabled}
                 aria-label={t("common:cancel")}
                 title={t("common:cancel")}
                 onClick={() => dispatchDraft({ type: "closeAdd" })}
               >
-                <X size={16} aria-hidden="true" />
+                <SecretClearIcon size={16} aria-hidden="true" />
               </Button>
             </div>
           </div>
           {normalizedAddKey && !addKeyValid ? (
-            <div className="mt-2 text-[10px] text-rose-600 dark:text-rose-400">
+            <div
+              className="mt-2 text-[10px] text-rose-600 dark:text-rose-400"
+              data-status-tone="error"
+            >
               {t("secretManager.invalidKey")}
             </div>
           ) : null}
@@ -254,6 +282,7 @@ export function ActorSecretManager({
           return (
             <div
               key={key}
+              data-secret-row={pendingRemove ? "remove" : undefined}
               className={`rounded-xl border px-3 py-2.5 ${pendingRemove ? "border-rose-500/25 bg-rose-500/5" : "border-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)]"}`}
             >
               <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -270,7 +299,10 @@ export function ActorSecretManager({
                   ••••••
                 </span>
                 {pendingUpdate ? (
-                  <span className="max-w-full rounded-md bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-700 dark:text-emerald-300">
+                  <span
+                    className="max-w-full rounded-md bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-700 dark:text-emerald-300"
+                    data-secret-pending
+                  >
                     {t("secretManager.pendingUpdate")}
                   </span>
                 ) : null}
@@ -278,11 +310,12 @@ export function ActorSecretManager({
                   <Button
                     type="button"
                     variant="ghost"
+                    data-lcd-key
                     size="sm"
                     disabled={controlsDisabled}
                     onClick={() => onChangesChange(undoActorSecretUnset(changes, key))}
                   >
-                    <Undo2 size={14} aria-hidden="true" />
+                    <SecretUndoIcon size={14} aria-hidden="true" />
                     {t("secretManager.undo")}
                   </Button>
                 ) : (
@@ -290,20 +323,22 @@ export function ActorSecretManager({
                     <Button
                       type="button"
                       variant="ghost"
+                      data-lcd-key
                       size="sm"
                       className="w-9 px-0"
-                      disabled={controlsDisabled}
+                      disabled={controlsDisabled || Boolean(editingKey)}
                       aria-label={`${t("secretManager.update")} ${key}`}
                       title={`${t("secretManager.update")} ${key}`}
                       onClick={() => dispatchDraft({ type: "startEdit", key })}
                     >
-                      <Pencil size={14} aria-hidden="true" />
+                      <SecretEditIcon size={14} aria-hidden="true" />
                     </Button>
                     <Button
                       type="button"
                       variant="ghost"
                       size="sm"
                       className="w-9 px-0 text-rose-600 hover:text-rose-700 dark:text-rose-400"
+                      data-status-tone="error"
                       disabled={controlsDisabled}
                       aria-label={`${t("secretManager.remove")} ${key}`}
                       title={`${t("secretManager.remove")} ${key}`}
@@ -312,7 +347,7 @@ export function ActorSecretManager({
                         onChangesChange(stageActorSecretUnset(changes, key));
                       }}
                     >
-                      <Trash2 size={14} aria-hidden="true" />
+                      <SecretDeleteIcon size={14} aria-hidden="true" />
                     </Button>
                   </>
                 )}
@@ -343,13 +378,14 @@ export function ActorSecretManager({
                     <Button
                       type="button"
                       variant="ghost"
+                      data-lcd-key
                       size="icon"
                       disabled={controlsDisabled}
                       aria-label={t("common:cancel")}
                       title={t("common:cancel")}
                       onClick={() => dispatchDraft({ type: "closeEdit" })}
                     >
-                      <X size={16} aria-hidden="true" />
+                      <SecretClearIcon size={16} aria-hidden="true" />
                     </Button>
                   </div>
                 </div>
@@ -363,6 +399,7 @@ export function ActorSecretManager({
         <div
           aria-live="polite"
           className="mt-3 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3"
+          data-secret-pending
         >
           <div className="text-[11px] font-semibold text-emerald-800 dark:text-emerald-200">
             {t("secretManager.pendingChanges")}
@@ -390,9 +427,10 @@ export function ActorSecretManager({
                   type="button"
                   disabled={controlsDisabled}
                   className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-emerald-700 hover:bg-emerald-500/10 disabled:opacity-50 dark:text-emerald-300"
+                  data-lcd-key
                   onClick={() => onChangesChange(undoActorSecretSet(changes, key))}
                 >
-                  <Undo2 size={12} aria-hidden="true" />
+                  <SecretUndoIcon size={12} aria-hidden="true" />
                   {t("secretManager.undo")}
                 </button>
               </div>
@@ -413,9 +451,10 @@ export function ActorSecretManager({
                   type="button"
                   disabled={controlsDisabled}
                   className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-emerald-700 hover:bg-emerald-500/10 disabled:opacity-50 dark:text-emerald-300"
+                  data-lcd-key
                   onClick={() => onChangesChange(undoActorSecretUnset(changes, key))}
                 >
-                  <Undo2 size={12} aria-hidden="true" />
+                  <SecretUndoIcon size={12} aria-hidden="true" />
                   {t("secretManager.undo")}
                 </button>
               </div>
@@ -440,10 +479,11 @@ export function ActorSecretManager({
           disabled={controlsDisabled || keysLoadFailed || keys.length === 0}
           onClick={() => {
             dispatchDraft({ type: "discardAll" });
+            setBulkOpen(false);
             onChangesChange(setActorSecretClearAll(changes, true));
           }}
         >
-          <Trash2 size={14} aria-hidden="true" />
+          <SecretDeleteIcon size={14} aria-hidden="true" />
           {t("secretManager.clearAllAction")}
         </Button>
       </div>

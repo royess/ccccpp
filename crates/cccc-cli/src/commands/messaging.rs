@@ -4,16 +4,18 @@ use cccc_core::HomeLayout;
 use serde_json::json;
 
 use crate::args::{
-    CancelReplyArgs, ConnectArgs, DeliverArgs, InboxArgs, LedgerAction, LedgerArgs, ReplyArgs,
-    SendArgs, TailArgs, TrackedSendArgs,
+    CancelReplyArgs, ConnectArgs, DeliverArgs, InboxArgs, InboxSummaryArgs, LedgerAction,
+    LedgerArgs, ReplyArgs, SendArgs, TailArgs, TrackedSendArgs,
 };
 use crate::commands::common::{call, group, print};
 
 pub async fn send(client: &DaemonClient, home: &HomeLayout, args: SendArgs) -> Result<()> {
     let group_id = group(home, args.group_id)?;
-    let scope_key = if args.path.trim().is_empty() {
-        String::new()
-    } else {
+    let mut request = json!({
+        "group_id":group_id, "text":args.text, "by":sender(args.by),
+        "to":args.recipients, "message_mode":args.mode.replace('-', "_")
+    });
+    if !args.path.trim().is_empty() {
         let scope = cccc_core::scope::detect(std::path::Path::new(&args.path))?;
         let attached = cccc_core::GroupStore::new(home.clone())?
             .load(&group_id)?
@@ -21,13 +23,9 @@ pub async fn send(client: &DaemonClient, home: &HomeLayout, args: SendArgs) -> R
             .iter()
             .any(|item| item.scope_key == scope.scope_key);
         anyhow::ensure!(attached, "scope not attached: {}", scope.scope_key);
-        scope.scope_key
-    };
-    let mut request = json!({
-        "group_id":group_id, "text":args.text, "by":sender(args.by),
-        "to":args.recipients, "message_mode":args.mode.replace('-', "_"),
-        "scope_key":scope_key
-    });
+        // The daemon resolves a relative path from its own directory, not this one.
+        request["path"] = json!(std::path::absolute(&args.path)?.to_string_lossy());
+    }
     if let Some(insight) = args.insight {
         request["insight"] = json!(insight);
     }
@@ -133,7 +131,7 @@ pub async fn deliver(client: &DaemonClient, home: &HomeLayout, args: DeliverArgs
         .collect::<Vec<_>>();
     anyhow::ensure!(
         !actor_ids.is_empty(),
-        "deliver requires at least one --to actor id"
+        "deliver requires at least one --to agent ID"
     );
     print(
         call(
@@ -209,6 +207,21 @@ pub async fn tail(client: &DaemonClient, home: &HomeLayout, args: TailArgs) -> R
     }
 }
 
+pub async fn inbox_summary(
+    client: &DaemonClient,
+    home: &HomeLayout,
+    args: InboxSummaryArgs,
+) -> Result<()> {
+    let group_id = group(home, args.group_id)?;
+    let response = call(
+        client,
+        "inbox_summary",
+        json!({"group_id":group_id,"cutoff":args.cutoff,"by":args.by}),
+    )
+    .await?;
+    print(response)
+}
+
 pub async fn inbox(client: &DaemonClient, home: &HomeLayout, args: InboxArgs) -> Result<()> {
     let group_id = group(home, args.group_id)?;
     let response = call(
@@ -247,6 +260,41 @@ pub async fn ledger(client: &DaemonClient, home: &HomeLayout, args: LedgerArgs) 
                 json!({"group_id":group(home,group_id)?,"by":by,"reason":reason,"force":force}),
             )
             .await?
+        }
+        LedgerAction::Search(args) => {
+            let mut request = json!({
+                "group_id":group(home,args.group_id)?,
+                "kind":args.kind,
+                "limit":args.limit,
+            });
+            if args.with_obligation_status {
+                request["with_obligation_status"] = json!(true);
+            }
+            if let Some(value) = args.by {
+                request["by"] = json!(value);
+            }
+            if !args.by_any.is_empty() {
+                request["by_any"] = json!(args.by_any);
+            }
+            if let Some(value) = args.to {
+                request["to"] = json!(value);
+            }
+            if let Some(value) = args.since {
+                request["since_ts"] = json!(value);
+            }
+            if let Some(value) = args.until {
+                request["until_ts"] = json!(value);
+            }
+            if let Some(value) = args.query {
+                request["q"] = json!(value);
+            }
+            if let Some(value) = args.before {
+                request["before"] = json!(value);
+            }
+            if let Some(value) = args.after {
+                request["after"] = json!(value);
+            }
+            call(client, "ledger_search", request).await?
         }
     };
     print(response)

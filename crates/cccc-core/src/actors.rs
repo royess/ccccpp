@@ -15,6 +15,46 @@ const WEB_MODEL_BROWSER_TARGETS_KEY: &str = "web_model_browser_targets";
 /// Existing recipient selector used when a cross-group caller omits `to`.
 pub const CROSS_GROUP_FOREMAN_RECIPIENT: &str = "@foreman";
 
+/// Canonical ledger identity of the instance-wide Chet service. This value is
+/// not, by itself, proof that a message was authored by the service.
+pub const CHET_SERVICE_PRINCIPAL: &str = "svc:chet";
+/// Host-provided Web admission, removed before storing message data.
+pub const CHET_WEB_ADMISSION_ARG: &str = "_cccc_chet_web_admin";
+
+/// Verify both host provenance and ledger membership before treating an
+/// event's author as the local Chet service. A copied Group has a different
+/// generation and must not inherit the original Group's service address.
+pub fn is_chet_message(
+    home: &crate::HomeLayout,
+    group: &GroupDoc,
+    event: &cccc_contracts::Event,
+) -> io::Result<bool> {
+    if !has_current_chet_provenance(group, event) {
+        return Ok(false);
+    }
+    let path = crate::GroupStore::new(home.clone())?.ledger_path(&group.group_id)?;
+    Ok(crate::ledger::find_event(&path, &event.id)?.as_ref() == Some(event))
+}
+
+/// Check the service author and generation on an event already proven to be
+/// in this Group's ledger. This predicate does not establish ledger membership;
+/// callers without an existing ledger snapshot must use `is_chet_message`.
+pub fn has_current_chet_provenance(group: &GroupDoc, event: &cccc_contracts::Event) -> bool {
+    if event.kind != "chat.message"
+        || event.group_id != group.group_id
+        || event.by != CHET_SERVICE_PRINCIPAL
+    {
+        return false;
+    }
+    let generation = crate::connect_groups::generation(group);
+    generation != "legacy:"
+        && event
+            .data
+            .get(cccc_contracts::chet::GROUP_AUTHOR_GENERATION_FIELD)
+            .and_then(Value::as_str)
+            == Some(generation.as_str())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UniqueForemanError {
     NotFound,
@@ -27,16 +67,32 @@ pub fn validate_actor_id(value: &str) -> io::Result<String> {
     let first = chars
         .next()
         .ok_or_else(|| io::Error::other("actor id is required"))?;
-    let valid = id.chars().count() <= 32
+    let well_formed = id.chars().count() <= 32
         && first.is_alphanumeric()
-        && chars.all(|ch| ch.is_alphanumeric() || ch == '-' || ch == '_')
-        && !RESERVED.contains(&id.to_lowercase().as_str());
-    if !valid {
+        && chars.all(|ch| ch.is_alphanumeric() || ch == '-' || ch == '_');
+    if !well_formed {
         return Err(io::Error::other(
             "actor id must be 1-32 letters or numbers, optionally followed by '-' or '_'",
         ));
     }
+    if RESERVED.contains(&id.to_lowercase().as_str()) {
+        return Err(io::Error::other(format!(
+            "actor id \"{id}\" is reserved; choose another id"
+        )));
+    }
     Ok(id.to_owned())
+}
+
+/// An Actor's `model_label`, trimmed: at most 128 characters and no control
+/// characters. Empty clears it.
+pub fn validate_model_label(value: &str) -> io::Result<String> {
+    let label = value.trim();
+    if label.chars().count() > 128 || label.chars().any(char::is_control) {
+        return Err(io::Error::other(
+            "model_label must be at most 128 characters, without control characters",
+        ));
+    }
+    Ok(label.to_owned())
 }
 
 pub fn visible(group: &GroupDoc) -> impl Iterator<Item = &Actor> {
@@ -44,6 +100,25 @@ pub fn visible(group: &GroupDoc) -> impl Iterator<Item = &Actor> {
         .actors
         .iter()
         .filter(|actor| actor.internal_kind.is_none())
+}
+
+/// Recognize an explicit service selector without reinterpreting an existing
+/// Actor ID or display title as Chet. Bare `chet` remains an ordinary token.
+pub fn is_chet_selector(group: &GroupDoc, raw: &str) -> io::Result<bool> {
+    if !raw.trim().eq_ignore_ascii_case("@chet") {
+        return Ok(false);
+    }
+    if visible(group).any(|actor| actor.id.eq_ignore_ascii_case("chet")) {
+        return Err(io::Error::other(
+            "@chet is ambiguous with an existing member ID. Ask Chet in its panel to message this Group, then reply to that message",
+        ));
+    }
+    if visible(group).any(|actor| actor.title.eq_ignore_ascii_case("chet")) {
+        return Err(io::Error::other(
+            "@chet is ambiguous with an existing member title. Change that title, or reply to a message sent by Chet",
+        ));
+    }
+    Ok(true)
 }
 
 pub fn find<'a>(group: &'a GroupDoc, actor_id: &str) -> Option<&'a Actor> {
@@ -95,6 +170,20 @@ pub fn add(group: &mut GroupDoc, mut actor: Actor) -> io::Result<Actor> {
     }
 
     actor.id = validate_actor_id(&actor.id)?;
+    actor.model_label = validate_model_label(&actor.model_label)?;
+    if !actor.external_session_id.is_empty()
+        && !matches!(
+            actor.runtime,
+            cccc_contracts::ActorRuntime::Codex
+                | cccc_contracts::ActorRuntime::Claude
+                | cccc_contracts::ActorRuntime::Pi
+                | cccc_contracts::ActorRuntime::Opencode
+        )
+    {
+        return Err(io::Error::other(
+            "This runtime does not support native-session Actors",
+        ));
+    }
     actor
         .runtime_mode
         .validate(actor.runtime)
@@ -135,6 +224,13 @@ pub fn update(
         .position(|actor| actor.id == actor_id)
         .ok_or_else(|| io::Error::other(format!("actor not found: {actor_id}")))?;
     let mut value = serde_json::to_value(&group.actors[index]).map_err(io::Error::other)?;
+    if let Some(source) = patch.get("external_session_id")
+        && source.as_str() != Some(group.actors[index].external_session_id.as_str())
+    {
+        return Err(io::Error::other(
+            "Native session binding is managed by local-session access",
+        ));
+    }
     let object = value
         .as_object_mut()
         .ok_or_else(|| io::Error::other("invalid actor"))?;
@@ -152,7 +248,22 @@ pub fn update(
     }
     object.insert("updated_at".into(), Value::String(utc_now()));
     let mut actor: Actor = serde_json::from_value(value).map_err(io::Error::other)?;
+    let current = &group.actors[index];
+    if !current.external_session_id.is_empty()
+        && (actor.runtime != current.runtime
+            || actor.runtime_mode != current.runtime_mode
+            || actor.command != current.command
+            || actor.env != current.env
+            || actor.profile_id != current.profile_id
+            || actor.profile_scope != current.profile_scope
+            || actor.profile_owner != current.profile_owner)
+    {
+        return Err(io::Error::other(
+            "Native runtime configuration belongs to the original session",
+        ));
+    }
     actor.role = None;
+    actor.model_label = validate_model_label(&actor.model_label)?;
     actor
         .runtime_mode
         .validate(actor.runtime)
@@ -191,7 +302,7 @@ fn retire_runtime_state(group: &mut GroupDoc, actor_id: &str) -> Option<Value> {
         .and_then(|states| states.remove(actor_id))
 }
 
-fn retire_web_model_browser_target(
+pub fn retire_web_model_browser_target(
     group: &mut GroupDoc,
     actor_id: &str,
 ) -> io::Result<Option<Value>> {

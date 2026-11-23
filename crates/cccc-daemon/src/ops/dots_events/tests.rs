@@ -201,6 +201,108 @@ impl Fixture {
 }
 
 #[test]
+fn dots_outer_claim_failure_does_not_consume_an_instruction_notice() {
+    let f = Fixture::new();
+    let workspace = f._temp.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let instructions = workspace.join("AGENTS.md");
+    std::fs::write(&instructions, "first").expect("original instructions");
+    let groups = GroupStore::new(f.home.clone()).expect("store");
+    cccc_core::group_scope::attach(
+        &groups,
+        &f.group.group_id,
+        cccc_core::scope::detect(&workspace).expect("scope"),
+    )
+    .expect("attach");
+    f.start();
+    std::fs::write(instructions, "changed").expect("changed instructions");
+    let event_id = f.source("first task");
+    let delivery = f.delivery();
+    let captured = f.captured(&delivery, "cccc_runtime_wait_next_turn");
+    // Make token creation fail after the inner runtime accepted the turn.
+    store::update_connector(&f.home, &f.connector_id, |connector| {
+        connector["routing_key"] = Value::Null
+    })
+    .expect("corrupt isolated fixture key");
+    assert!(
+        !f.response(
+            "dots_work_claim",
+            json!({"by":"dot","_cccc_web_binding":captured})
+        )
+        .ok
+    );
+    let group = groups.load(&f.group.group_id).expect("group");
+    let actor = group
+        .actors
+        .iter()
+        .find(|actor| actor.id == "dot")
+        .expect("actor");
+    let state = super::super::runtime_delivery::latest_state(
+        &f.home,
+        &group.group_id,
+        &actor.id,
+        &event_id,
+    )
+    .expect("delivery state");
+    assert!(
+        state.is_some_and(|(state, _)| state == "accepted"),
+        "the inner claim must have been reached"
+    );
+    let root = workspace.canonicalize().expect("workspace root");
+    assert!(
+        super::super::instruction_files::check(
+            &f.home,
+            &group.group_id,
+            actor,
+            &format!("web:{}", root.display()),
+            &root
+        )
+        .is_some(),
+        "failed outer claim must leave the notice pending"
+    );
+}
+
+#[test]
+fn dots_claim_delivers_instruction_changes_once_after_successful_outer_commit() {
+    let f = Fixture::new();
+    let workspace = f._temp.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let instructions = workspace.join("AGENTS.md");
+    std::fs::write(&instructions, "first").expect("original instructions");
+    let groups = GroupStore::new(f.home.clone()).expect("store");
+    cccc_core::group_scope::attach(
+        &groups,
+        &f.group.group_id,
+        cccc_core::scope::detect(&workspace).expect("scope"),
+    )
+    .expect("attach");
+    f.start();
+    std::fs::write(instructions, "changed").expect("changed instructions");
+    f.source("first task");
+    let delivery = f.delivery();
+    let first = f.claim(&f.captured(&delivery, "cccc_runtime_wait_next_turn"));
+    assert!(
+        first["turn"]["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("AGENTS.md changed")
+    );
+    f.complete(
+        &first["turn"],
+        &f.captured(&delivery, "cccc_runtime_complete_turn"),
+    );
+    f.source("second task");
+    let next = f.delivery();
+    let second = f.claim(&f.captured(&next, "cccc_runtime_wait_next_turn"));
+    assert!(
+        !second["turn"]["coalesced_text"]
+            .as_str()
+            .expect("text")
+            .contains("INSTRUCTION FILES CHANGED")
+    );
+}
+
+#[test]
 fn dots_waits_for_explicit_pairing_and_duplicate_setup_does_not_interrupt_a_turn() {
     let mut f = Fixture::default_enabled();
     let setup = f.call("dots_events_connect", json!({}));
@@ -251,6 +353,44 @@ fn dots_waits_for_explicit_pairing_and_duplicate_setup_does_not_interrupt_a_turn
         "a used setup code cannot pair a different conversation"
     );
     assert!(f.private() == state_before);
+}
+
+#[test]
+fn dots_pairing_code_from_before_a_switch_waits_for_it_to_finish() {
+    use cccc_core::runtime_switches::{self, Endpoint, SwitchRecord};
+    let f = Fixture::default_enabled();
+    let setup = f.call("dots_events_connect", json!({}));
+    let key = store::session_key(
+        &f.private(),
+        &json!({"openai/session":"synthetic-dot-session"}),
+    )
+    .expect("host key");
+    GroupStore::new(f.home.clone())
+        .expect("store")
+        .mutate(&f.group.group_id, |doc| {
+            let actor = doc.actors.iter().find(|a| a.id == "dot").expect("Actor");
+            let record = SwitchRecord {
+                op_id: "op".into(),
+                actor_id: "dot".into(),
+                actor_generation: cccc_core::actors::generation_identity(actor),
+                from: Endpoint::of(actor),
+                to: Endpoint::of(actor),
+                at: cccc_contracts::utc_now(),
+                pending: true,
+                clear_private_env: false,
+            };
+            runtime_switches::set_records(doc, &[record]);
+            Ok(())
+        })
+        .expect("pending switch");
+
+    let refused = f.response(
+        "web_model_pairing_accept",
+        json!({"connector_id":f.connector_id,"code":setup["pairing_code"],"session_key":key}),
+    );
+
+    assert_eq!(refused.error.expect("refused").code, "actor_switch_pending");
+    assert_eq!(f.call("dots_events_status", json!({}))["paired"], false);
 }
 
 #[test]
@@ -556,6 +696,20 @@ fn dots_claim_handshake_returns_execution_credential_only_to_the_first_owner() {
         assert_eq!(duplicate["status"], "turn_in_progress");
         assert_eq!(duplicate["turn"], Value::Null);
         assert!(duplicate.get("actor_token").is_none());
+        assert_eq!(duplicate["reason_code"], "dots_turn_unfinished");
+        let instructions = duplicate["instructions"]
+            .as_str()
+            .expect("recovery guidance");
+        assert!(instructions.contains("No new work was claimed"));
+        assert!(instructions.contains("do not retrieve credentials from another run"));
+        assert!(instructions.contains("End this turn"));
+        assert!(instructions.contains("does not stop cloud work or replay its messages"));
+        assert!(!duplicate.to_string().contains(token));
+        assert!(
+            !duplicate
+                .to_string()
+                .contains("content is fetched only by the winning claim")
+        );
     }
     assert!(
         !f.call("dots_events_status", json!({}))
@@ -573,6 +727,72 @@ fn dots_claim_handshake_returns_execution_credential_only_to_the_first_owner() {
     );
     f.complete(&claimed["turn"], &live);
     assert!(store::dots_binding_for_token(&f.private(), token, "cccc_message_send").is_none());
+}
+
+#[test]
+fn dots_completed_wake_is_idle_without_replaying_work_or_claiming_later_input() {
+    let f = Fixture::new();
+    f.start();
+    f.source("first private task");
+    let delivery = f.delivery();
+    let captured = f.claim_capture();
+    let claimed = f.claim(&captured);
+    let execution = f.captured(&delivery, "cccc_runtime_complete_turn");
+    f.complete(&claimed["turn"], &execution);
+    let later = f.source("later queued input");
+    let before = f.private();
+    for duplicate in [f.claim(&captured), f.claim(&f.claim_capture())] {
+        assert_eq!(duplicate["status"], "idle");
+        assert_eq!(duplicate["reason_code"], "dots_wake_already_completed");
+        assert_eq!(duplicate["turn"], Value::Null);
+        assert!(duplicate.get("actor_token").is_none());
+        assert!(!duplicate.to_string().contains("first private task"));
+        assert!(!duplicate.to_string().contains("later queued input"));
+    }
+    assert_eq!(
+        f.private(),
+        before,
+        "duplicate claims must not change execution state"
+    );
+    let status = f.call("dots_events_status", json!({}));
+    assert_eq!(status["active_turn_id"], "");
+    assert_eq!(status["pending_count"], 1);
+    assert_eq!(status["last_execution"]["status"], "done");
+    let next = f.delivery();
+    let next_claim = f.claim(&f.claim_capture());
+    assert_eq!(next_claim["turn"]["event_ids"], json!([later]));
+    f.complete(
+        &next_claim["turn"],
+        &f.captured(&next, "cccc_runtime_complete_turn"),
+    );
+}
+
+#[test]
+fn dots_completed_private_record_does_not_hide_an_unfinished_canonical_turn() {
+    let f = Fixture::new();
+    f.start();
+    f.source("completion projection crash");
+    f.delivery();
+    let claimed = f.claim(&f.claim_capture());
+    store::dots_update(&f.home, &f.connector_id, |c| {
+        let mut completed = c["dots"]["execution"].clone();
+        completed["state"] = json!("completed");
+        completed["status"] = json!("done");
+        c["dots"]["last_execution"] = completed;
+        c["dots"]["execution"] = Value::Null;
+        c["dots"]["wake"]["state"] = json!("completed");
+        Ok(())
+    })
+    .expect("simulate private completion before canonical cleanup");
+    let blocked = f.claim(&f.claim_capture());
+    assert_eq!(blocked["status"], "turn_in_progress");
+    assert_eq!(blocked["reason_code"], "dots_turn_unfinished");
+    assert_eq!(blocked["turn"], Value::Null);
+    assert!(blocked.get("actor_token").is_none());
+    assert_eq!(
+        f.call("dots_events_status", json!({}))["active_turn_id"],
+        claimed["turn"]["turn_id"]
+    );
 }
 
 #[test]
@@ -730,6 +950,10 @@ fn dots_stop_start_fences_late_work_and_requires_explicit_resolution_without_rep
     let delivery = f.delivery();
     let original_claim = f.claim_capture();
     let turn = f.claim(&original_claim)["turn"].clone();
+    assert!(f.call("dots_events_status", json!({}))["active_turn_elapsed_seconds"].is_u64());
+    let reopened = HomeLayout::from_path(f.home.root()).expect("reopen isolated home");
+    super::super::runtime_restore::restore_running(&reopened).expect("daemon startup restore");
+    assert!(f.call("dots_events_status", json!({}))["active_turn_elapsed_seconds"].is_u64());
     let live = f.captured(&delivery, "cccc_runtime_complete_turn");
     let subscription = f.private()["dots"]["subscription"].clone();
     f.call("actor_stop", json!({}));
@@ -751,10 +975,9 @@ fn dots_stop_start_fences_late_work_and_requires_explicit_resolution_without_rep
     let epoch = f.private()["dots"]["epoch"].clone();
     f.call("actor_start", json!({}));
     assert_eq!(f.private()["dots"]["epoch"], epoch);
-    assert_eq!(
-        f.call("dots_events_status", json!({}))["phase"],
-        "interrupted"
-    );
+    let interrupted = f.call("dots_events_status", json!({}));
+    assert_eq!(interrupted["phase"], "interrupted");
+    assert!(interrupted["active_turn_elapsed_seconds"].is_u64());
     assert!(f.delivery().is_null());
     assert!(
         !f.response(
@@ -771,6 +994,7 @@ fn dots_stop_start_fences_late_work_and_requires_explicit_resolution_without_rep
     let current = f.call("dots_events_status", json!({}));
     assert_eq!(current["last_execution"]["status"], "cancelled");
     assert_eq!(current["active_turn_id"], "");
+    assert!(current["active_turn_elapsed_seconds"].is_null());
     f.source("new independent input");
     assert!(f.delivery().is_object());
 }
@@ -1040,6 +1264,45 @@ fn dots_revoked_binding_does_not_strand_explicit_user_resolution() {
 }
 
 #[test]
+fn user_can_resolve_enabled_turn_without_replaying_inputs_or_reviving_credentials() {
+    let f = Fixture::new();
+    f.start();
+    f.source("abandoned input");
+    let delivery = f.delivery();
+    let claimed = f.claim(&f.claim_capture());
+    let execution = f.captured(&delivery, "cccc_message_send");
+    let exact = json!({"action":"resolve","turn_id":claimed["turn"]["turn_id"],"event_ids":claimed["turn"]["event_ids"]});
+    let mut denied = exact.clone();
+    denied["by"] = json!("dot");
+    assert!(!f.response("dots_work_control", denied).ok);
+    let mut stale = exact.clone();
+    stale["event_ids"] = json!(["different-input"]);
+    assert!(!f.response("dots_work_control", stale).ok);
+    assert!(store::validate_binding(&f.home, &execution).is_ok());
+    let later = f.source("independent queued input");
+    f.call("dots_work_control", exact.clone());
+    let status = f.call("dots_events_status", json!({}));
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["paired"], true);
+    assert_eq!(status["subscribed"], true);
+    assert_eq!(status["active_turn_id"], "");
+    assert_eq!(status["last_execution"]["status"], "cancelled");
+    assert!(store::validate_binding(&f.home, &execution).is_err());
+    let next = f.delivery();
+    let next_claim = f.claim(&f.claim_capture());
+    assert_eq!(next_claim["turn"]["event_ids"], json!([later]));
+    assert!(!f.response("dots_work_control", exact).ok);
+    assert_eq!(
+        f.call("dots_events_status", json!({}))["active_turn_id"],
+        next_claim["turn"]["turn_id"]
+    );
+    f.complete(
+        &next_claim["turn"],
+        &f.captured(&next, "cccc_runtime_complete_turn"),
+    );
+}
+
+#[test]
 fn dots_partial_admission_crash_resolution_does_not_replay_claimed_source() {
     let f = Fixture::new();
     f.start();
@@ -1082,4 +1345,38 @@ fn dots_partial_admission_crash_resolution_does_not_replay_claimed_source() {
             .0,
         "ambiguous"
     );
+}
+
+#[test]
+fn a_dots_notification_does_not_store_the_captured_binding() {
+    let f = Fixture::new();
+    f.start();
+    f.source("work that wakes the Dot");
+    let delivery = f.delivery();
+    let turn = f.claim(&f.captured(&delivery, "cccc_runtime_wait_next_turn"))["turn"].clone();
+    assert!(turn.is_object());
+    let live = f.captured(&delivery, "cccc_notify");
+    let session_key = live["session_key"]
+        .as_str()
+        .filter(|key| !key.is_empty())
+        .expect("captured session key")
+        .to_owned();
+    let sent = f.call(
+        "system_notify",
+        json!({"by":"dot","kind":"info","title":"Build finished","_cccc_web_binding":live}),
+    );
+    let groups = GroupStore::new(f.home.clone()).expect("group store");
+    let stored = ledger::read_all(&groups.ledger_path(&f.group.group_id).expect("ledger path"))
+        .expect("ledger")
+        .into_iter()
+        .find(|event| event.kind == "system.notify" && event.by == "dot")
+        .expect("stored notification");
+    for event in [
+        serde_json::to_value(&stored).expect("stored event"),
+        sent["event"].clone(),
+    ] {
+        assert_eq!(event["data"]["title"], "Build finished");
+        assert!(event["data"].get("_cccc_web_binding").is_none());
+        assert!(!event.to_string().contains(&session_key));
+    }
 }

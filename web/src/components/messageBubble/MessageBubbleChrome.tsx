@@ -1,118 +1,18 @@
 import { MessageSelectionCheckbox } from "../../features/messageRelay/MessageSelection";
 import { useTranslation } from "react-i18next";
 import type { ChatMessageData, LedgerEvent } from "../../types";
+import { CHET_PRINCIPAL } from "../../utils/chetIdentity";
 import { classNames } from "../../utils/classNames";
 import type { WebModelDeliveryStatus } from "../../utils/webModelDeliveryStatus";
-import { ActorAvatar } from "../ActorAvatar";
-import { InboxIcon } from "../Icons";
 import { WebModelDeliveryRecovery } from "../webModel/WebModelDeliveryRecovery";
 
-export function MessageMetadataHeader({
-  mobile,
-  isUserMessage,
-  isDark,
-  senderAccentTextClass,
-  senderDisplayName,
-  messageTimestamp,
-  fullMessageTimestamp,
-  senderAvatarUrl,
-  senderRuntime,
-  avatarRingClassName,
-  remoteBadgeLabel,
-}: {
-  mobile?: boolean;
-  isUserMessage: boolean;
-  isDark: boolean;
-  senderAccentTextClass?: string | null;
-  senderDisplayName: string;
-  messageTimestamp: string;
-  fullMessageTimestamp: string;
-  senderAvatarUrl?: string;
-  senderRuntime?: string;
-  avatarRingClassName?: string;
-  remoteBadgeLabel?: string;
-}) {
-  const senderTextClass = isUserMessage
-    ? isDark
-      ? "text-slate-300"
-      : "text-gray-700"
-    : senderAccentTextClass
-      ? senderAccentTextClass
-      : isDark
-        ? "text-slate-300"
-        : "text-gray-700";
-
-  if (mobile) {
-    return (
-      <div
-        className={classNames(
-          "mb-1 flex min-w-0 items-center gap-2 sm:hidden",
-          isUserMessage ? "justify-end" : "justify-start",
-        )}
-      >
-        <ActorAvatar
-          avatarUrl={senderAvatarUrl}
-          runtime={senderRuntime}
-          title={senderDisplayName}
-          isUser={isUserMessage}
-          isDark={isDark}
-          accentRingClassName={avatarRingClassName}
-          sizeClassName="h-6 w-6"
-          textClassName="text-xs"
-        />
-        <span
-          className={classNames("min-w-0 truncate text-xs font-medium", senderTextClass)}
-          title={senderDisplayName}
-        >
-          {senderDisplayName}
-        </span>
-        {remoteBadgeLabel ? (
-          <span
-            className="shrink-0 rounded-full border border-emerald-300/70 bg-emerald-50/85 px-1.5 py-0.5 text-xs font-semibold leading-none text-emerald-800 dark:border-emerald-300/30 dark:bg-emerald-950/35 dark:text-emerald-100"
-            title={remoteBadgeLabel}
-          >
-            {remoteBadgeLabel}
-          </span>
-        ) : null}
-        <span className="shrink-0 text-xs text-[var(--color-text-tertiary)]">
-          <span title={fullMessageTimestamp}>{messageTimestamp}</span>
-        </span>
-      </div>
-    );
-  }
-
-  return (
-    <div className="hidden min-w-0 items-center gap-2 px-1 sm:flex">
-      <span
-        className={classNames(
-          "min-w-0 truncate text-xs font-semibold tracking-[0.01em]",
-          isUserMessage
-            ? isDark
-              ? "text-[var(--color-text-secondary)]"
-              : "text-gray-500"
-            : senderAccentTextClass
-              ? senderAccentTextClass
-              : isDark
-                ? "text-[var(--color-text-secondary)]"
-                : "text-gray-500",
-        )}
-      >
-        {senderDisplayName}
-      </span>
-      {remoteBadgeLabel ? (
-        <span
-          className="shrink-0 rounded-full border border-emerald-300/70 bg-emerald-50/80 px-1.5 py-0.5 text-xs font-semibold leading-none text-emerald-800 dark:border-emerald-300/30 dark:bg-emerald-950/35 dark:text-emerald-100"
-          title={remoteBadgeLabel}
-        >
-          {remoteBadgeLabel}
-        </span>
-      ) : null}
-      <span className="shrink-0 text-xs text-[var(--color-text-tertiary)]">
-        <span title={fullMessageTimestamp}>{messageTimestamp}</span>
-      </span>
-    </div>
-  );
-}
+/** Daemon reason: the host held a request to Chet until its wait expired. */
+const CHET_WAIT_EXPIRED_REASON = "chet_wait_expired";
+// A framed label in the status tone: no fill, no rounding.
+const STATUS_LABEL_CLASS =
+  "inline-flex min-w-0 max-w-full items-center gap-1.5 border px-2 py-0.5 text-xs font-semibold tracking-tight";
+// A reply still owed reads like any status; one cancelled without a reply steps back.
+const OBLIGATION_TONE = { replied: "ok", open: "neutral", closed: "muted" } as const;
 
 export function MessageFooter({
   readOnly,
@@ -123,40 +23,18 @@ export function MessageFooter({
   readPreviewOverflow,
   displayNameMap,
   isDark,
-  isMail,
-  replyRequested,
-  copiedMessageText,
-  copyableMessageText,
-  onCopyMessageText,
   onShowRecipients,
-  onCopyLink,
-  onViewContext,
-  onRelay,
-  onReply,
-  canReply,
-  eventId,
   event,
 }: {
   readOnly?: boolean;
-  obligationSummary: { done: number; total: number } | null;
+  obligationSummary: { replied: number; cancelled: number; total: number } | null;
   visibleReadStatusEntries: readonly (readonly [string, boolean])[];
   webModelDeliveryStatus?: WebModelDeliveryStatus;
   readPreviewEntries: readonly (readonly [string, boolean])[];
   readPreviewOverflow: number;
   displayNameMap: Map<string, string>;
   isDark: boolean;
-  isMail: boolean;
-  replyRequested: boolean;
-  copiedMessageText: boolean;
-  copyableMessageText: string;
-  onCopyMessageText: () => void;
   onShowRecipients: () => void;
-  onCopyLink?: (eventId: string) => void;
-  onViewContext?: (eventId: string) => void;
-  onRelay?: (ev: LedgerEvent) => void;
-  onReply: () => void;
-  canReply: boolean;
-  eventId?: string;
   event: LedgerEvent;
 }) {
   const { t } = useTranslation(["chat", "common"]);
@@ -169,13 +47,7 @@ export function MessageFooter({
           <span
             className={classNames(
               "text-xs font-semibold tracking-tight",
-              cleared
-                ? isDark
-                  ? "text-emerald-400"
-                  : "text-emerald-600"
-                : isDark
-                  ? "text-slate-500"
-                  : "text-gray-500",
+              cleared ? "text-[var(--color-text-primary)]" : "text-[var(--color-text-tertiary)]",
             )}
             aria-label={cleared ? t("read") : t("pending")}
           >
@@ -197,57 +69,90 @@ export function MessageFooter({
       ? { state: "queued" as const }
       : undefined);
   const connectCancellation = event._connect_cancellation;
+  // Mail stays in the Inbox whatever became of an extra push. A Web Model shows
+  // its own delivery above, with its way to recover.
+  const isMail = (event.data as ChatMessageData | undefined)?.message_mode === "mail";
+  const undelivered = Object.entries(isMail ? {} : (event._obligation_status ?? {})).filter(
+    ([id, status]) =>
+      status.delivery_state === "failed" &&
+      !status.waiting_reason &&
+      id !== webModelDeliveryStatus?.actorId,
+  );
+  // Chet is addressed alone. CCCC proved this request never reached it, so the
+  // whole outcome is shown, not only a reason on hover.
+  const chetNotSent = undelivered.some(
+    ([id, status]) => id === CHET_PRINCIPAL && status.delivery_reason === CHET_WAIT_EXPIRED_REASON,
+  );
+  const undeliveredLabel = chetNotSent
+    ? t("chetRequestNotSent")
+    : undelivered.length
+      ? t("deliveryFailedFor", {
+          names: undelivered.map(([id]) => displayNameMap.get(id) || id).join(", "),
+        })
+      : "";
+  const undeliveredReason = chetNotSent
+    ? undefined
+    : undelivered.find(([, status]) => status.delivery_reason)?.[1].delivery_reason;
+  const undeliveredTextClass = chetNotSent ? "min-w-0 whitespace-normal" : "truncate";
   const deliveryLabel = webModelDeliveryStatus
     ? t(`webModelDelivery.${webModelDeliveryStatus.state}`)
     : "";
   const deliveryDetail = String(webModelDeliveryStatus?.detail || "").trim();
-  const deliveryToneClass =
+  // Tones, not palette colours: the waiting colour is kept for what waits on the user.
+  const deliveryTone =
     webModelDeliveryStatus?.state === "failed"
-      ? "border-rose-500/20 bg-rose-500/8 text-rose-700 dark:text-rose-300"
+      ? "error"
       : webModelDeliveryStatus?.state === "submitted" || webModelDeliveryStatus?.state === "bound"
-        ? "border-emerald-500/20 bg-emerald-500/8 text-emerald-700 dark:text-emerald-300"
-        : "border-amber-500/20 bg-amber-500/8 text-amber-700 dark:text-amber-300";
+        ? "ok"
+        : "muted";
+  // A cancellation closes an obligation without a reply, so it must not look like one.
+  const obligationState = obligationSummary
+    ? obligationSummary.replied >= obligationSummary.total
+      ? "replied"
+      : obligationSummary.replied + obligationSummary.cancelled >= obligationSummary.total
+        ? "closed"
+        : "open"
+    : null;
+  const obligationText = obligationSummary
+    ? `${t("reply")} ${obligationSummary.replied}/${obligationSummary.total}${
+        obligationSummary.cancelled
+          ? ` · ${t("replyCancelledCount", { cancelled: obligationSummary.cancelled })}`
+          : ""
+      }`
+    : "";
   const allRead =
     visibleReadStatusEntries.length > 0 &&
     visibleReadStatusEntries.every(([_, cleared]) => cleared);
+  const hasStatus = Boolean(
+    connectDelivery ||
+    connectCancellation ||
+    webModelDeliveryStatus ||
+    undelivered.length > 0 ||
+    obligationSummary ||
+    visibleReadStatusEntries.length > 0,
+  );
+  if (!hasStatus) return null;
 
   return (
     <div
+      data-message-footer
       className={classNames(
-        "mt-2 flex flex-wrap items-center gap-2 px-1 text-xs transition-opacity",
-        webModelDeliveryStatus ||
-          connectDelivery ||
-          connectCancellation ||
-          isMail ||
-          obligationSummary ||
-          visibleReadStatusEntries.length > 0 ||
-          replyRequested
-          ? "justify-between"
-          : "justify-end",
-
+        "mt-1 flex w-full min-w-0 flex-wrap items-center gap-2 px-1 text-xs",
+        event.by === "user" ? "flex-row-reverse" : "justify-start",
         "text-[var(--color-text-tertiary)]",
       )}
     >
-      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+      <div
+        className={classNames(
+          "flex min-w-0 flex-wrap items-center gap-1.5",
+          event.by === "user" ? "mr-auto" : "ml-auto",
+        )}
+      >
         {!readOnly && <MessageSelectionCheckbox event={event} />}
-        {isMail ? (
-          <span
-            className="inline-flex items-center gap-1 rounded-full border border-sky-500/20 bg-sky-500/8 px-2 py-1 text-xs font-semibold tracking-tight text-sky-700 dark:text-sky-300"
-            title={t("mailMessageHint")}
-            aria-label={t("mailMessageHint")}
-          >
-            <InboxIcon size={11} aria-hidden="true" />
-            <span>{t("modeMail")}</span>
-          </span>
-        ) : null}
         {connectDelivery ? (
           <span
-            className={classNames(
-              "max-w-full rounded-full border px-2.5 py-1 text-xs font-semibold",
-              connectDelivery.state === "failed"
-                ? "border-rose-500/20 text-rose-700 dark:text-rose-300"
-                : "border-[var(--glass-border-subtle)]",
-            )}
+            className={STATUS_LABEL_CLASS}
+            data-status-tone={connectDelivery.state === "failed" ? "error" : "muted"}
             title={connectDelivery.error || t(`connectDelivery.${connectDelivery.state}Hint`)}
           >
             {t(`connectDelivery.${connectDelivery.state}`)}
@@ -255,7 +160,8 @@ export function MessageFooter({
         ) : null}
         {connectCancellation ? (
           <span
-            className="max-w-full rounded-full border border-[var(--glass-border-subtle)] px-2.5 py-1 text-xs font-semibold"
+            className={STATUS_LABEL_CLASS}
+            data-status-tone="muted"
             title={
               connectCancellation.error || t(`connectCancellation.${connectCancellation.state}Hint`)
             }
@@ -265,15 +171,14 @@ export function MessageFooter({
         ) : null}
         {webModelDeliveryStatus ? (
           <span
-            className={classNames(
-              "inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold tracking-tight",
-              deliveryToneClass,
-            )}
+            className={STATUS_LABEL_CLASS}
+            data-status-tone={deliveryTone}
             title={deliveryDetail || undefined}
           >
             {webModelDeliveryStatus.state === "submitting" ? (
               <span
                 className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-current"
+                data-status-motion="working"
                 aria-hidden="true"
               />
             ) : null}
@@ -291,58 +196,63 @@ export function MessageFooter({
             readOnly={readOnly}
           />
         ) : null}
+        {undelivered.length > 0 ? (
+          readOnly ? (
+            <span className={STATUS_LABEL_CLASS} data-status-tone="error">
+              <span className={undeliveredTextClass}>{undeliveredLabel}</span>
+            </span>
+          ) : (
+            <button
+              type="button"
+              className={classNames("touch-target-sm text-left", STATUS_LABEL_CLASS)}
+              data-status-tone="error"
+              title={undeliveredReason}
+              onClick={onShowRecipients}
+            >
+              <span className={undeliveredTextClass}>{undeliveredLabel}</span>
+            </button>
+          )
+        ) : null}
         {obligationSummary ? (
           readOnly ? (
             <div
-              className={classNames(
-                "flex min-w-0 items-center gap-2 rounded-full border px-2.5 py-1",
-                obligationSummary.done >= obligationSummary.total
-                  ? "border-emerald-500/20 bg-emerald-500/5 text-emerald-600 dark:text-emerald-400 dark:border-emerald-500/20 dark:bg-emerald-500/5"
-                  : "border-amber-500/20 bg-amber-500/5 text-amber-600 dark:text-amber-400 dark:border-amber-500/20 dark:bg-amber-500/5",
-              )}
+              className={STATUS_LABEL_CLASS}
+              data-status-tone={OBLIGATION_TONE[obligationState!]}
+              data-obligation-state={obligationState}
             >
-              <span className="text-xs font-semibold tracking-tight">
-                {t("reply")} {obligationSummary.done}/{obligationSummary.total}
-              </span>
+              <span className="text-xs font-semibold tracking-tight">{obligationText}</span>
             </div>
           ) : (
             <button
               type="button"
-              className={classNames(
-                "touch-target-sm flex min-w-0 items-center gap-2 rounded-full border px-2.5 py-1 transition-all duration-150",
-                obligationSummary.done >= obligationSummary.total
-                  ? "border-emerald-500/25 bg-emerald-500/6 hover:bg-emerald-500/12 text-emerald-600 dark:text-emerald-400 dark:border-emerald-500/20 dark:bg-emerald-500/8 dark:hover:bg-emerald-500/15"
-                  : "border-amber-500/25 bg-amber-500/6 hover:bg-amber-500/12 text-amber-600 dark:text-amber-400 dark:border-amber-500/20 dark:bg-amber-500/8 dark:hover:bg-amber-500/15",
-              )}
+              className={classNames("touch-target-sm", STATUS_LABEL_CLASS)}
+              data-status-tone={OBLIGATION_TONE[obligationState!]}
+              data-obligation-state={obligationState}
               onClick={onShowRecipients}
-              aria-label={t("showObligationStatus")}
+              aria-label={t(
+                obligationSummary.cancelled
+                  ? "showObligationStatusCancelled"
+                  : "showObligationStatusCounts",
+                {
+                  replied: obligationSummary.replied,
+                  cancelled: obligationSummary.cancelled,
+                  total: obligationSummary.total,
+                },
+              )}
             >
-              <span className="text-xs font-semibold tracking-tight">
-                {t("reply")} {obligationSummary.done}/{obligationSummary.total}
-              </span>
+              <span className="text-xs font-semibold tracking-tight">{obligationText}</span>
             </button>
           )
         ) : visibleReadStatusEntries.length > 0 ? (
           readOnly ? (
-            <div
-              className={classNames(
-                "flex min-w-0 items-center gap-2 rounded-full border px-2.5 py-1",
-                allRead
-                  ? "border-emerald-500/15 bg-emerald-500/5 text-emerald-600 dark:text-emerald-400 dark:border-emerald-500/15 dark:bg-emerald-500/5"
-                  : "border-black/5 bg-black/[0.025] dark:border-white/8 dark:bg-white/[0.035]",
-              )}
-            >
+            <div className={STATUS_LABEL_CLASS} data-status-tone={allRead ? "ok" : "muted"}>
               {renderRecipientStatus()}
             </div>
           ) : (
             <button
               type="button"
-              className={classNames(
-                "touch-target-sm flex min-w-0 items-center gap-2 rounded-full border px-2.5 py-1 transition-all duration-150",
-                allRead
-                  ? "border-emerald-500/15 bg-emerald-500/5 hover:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 dark:border-emerald-500/15 dark:bg-emerald-500/5 dark:hover:bg-emerald-500/10"
-                  : "border-black/5 bg-black/[0.025] hover:bg-black/[0.045] dark:border-white/8 dark:bg-white/[0.035] dark:hover:bg-white/[0.055]",
-              )}
+              className={classNames("touch-target-sm", STATUS_LABEL_CLASS)}
+              data-status-tone={allRead ? "ok" : "muted"}
               onClick={onShowRecipients}
               aria-label={t("showRecipientStatus")}
             >
@@ -350,83 +260,7 @@ export function MessageFooter({
             </button>
           )
         ) : null}
-
-        {!obligationSummary && replyRequested ? (
-          <span
-            className={classNames(
-              "rounded-full border border-violet-500/20 bg-violet-500/8 px-2.5 py-1 text-xs font-semibold tracking-tight",
-              "text-violet-700 dark:text-violet-300",
-            )}
-          >
-            {t("needReply")}
-          </span>
-        ) : null}
       </div>
-
-      {!readOnly ? (
-        <div className="flex flex-wrap items-center justify-end gap-1">
-          {copyableMessageText ? (
-            <button
-              type="button"
-              className={classNames(
-                "touch-target-sm rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
-                "text-[var(--color-text-secondary)] hover:bg-black/8 hover:text-[var(--color-text-primary)] dark:hover:bg-white/12",
-              )}
-              onClick={() => void onCopyMessageText()}
-              title={copiedMessageText ? t("common:copied") : t("copyText")}
-            >
-              {copiedMessageText ? t("common:copied") : t("copyText")}
-            </button>
-          ) : null}
-          {eventId && onViewContext ? (
-            <button
-              type="button"
-              className="touch-target-sm rounded-full px-2.5 py-1 text-xs font-medium text-[var(--color-text-secondary)] hover:bg-black/8 dark:hover:bg-white/12"
-              onClick={() => onViewContext(eventId)}
-            >
-              {t("viewMessageContext")}
-            </button>
-          ) : null}
-          {eventId && onCopyLink ? (
-            <button
-              type="button"
-              className={classNames(
-                "touch-target-sm rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
-                "text-[var(--color-text-secondary)] hover:bg-black/8 hover:text-[var(--color-text-primary)] dark:hover:bg-white/12",
-              )}
-              onClick={() => onCopyLink(eventId)}
-              title={t("copyLink")}
-            >
-              {t("copyLink")}
-            </button>
-          ) : null}
-          {eventId && onRelay ? (
-            <button
-              type="button"
-              className={classNames(
-                "touch-target-sm rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
-                "text-[var(--color-text-secondary)] hover:bg-black/8 hover:text-[var(--color-text-primary)] dark:hover:bg-white/12",
-              )}
-              onClick={() => onRelay(event)}
-              title={t("relayToGroup")}
-            >
-              {t("relay")}
-            </button>
-          ) : null}
-          {canReply ? (
-            <button
-              type="button"
-              className={classNames(
-                "touch-target-sm rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
-                "text-[var(--color-text-secondary)] hover:bg-black/8 hover:text-[var(--color-text-primary)] dark:hover:bg-white/12",
-              )}
-              onClick={onReply}
-            >
-              {t("reply")}
-            </button>
-          ) : null}
-        </div>
-      ) : null}
     </div>
   );
 }

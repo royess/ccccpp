@@ -77,7 +77,10 @@ fn group_actor(home: &HomeLayout, r: &DaemonRequest) -> Result<(GroupDoc, Actor)
     Ok((g, a))
 }
 fn active(g: &GroupDoc, a: &Actor) -> bool {
-    a.enabled && g.running && !matches!(g.state, GroupState::Paused | GroupState::Stopped)
+    a.enabled
+        && g.running
+        && !matches!(g.state, GroupState::Paused | GroupState::Stopped)
+        && super::runtime_state::pull_admitted(g, a)
 }
 fn connector(home: &HomeLayout, g: &GroupDoc, a: &Actor) -> Result<Option<Value>, OpError> {
     Ok(store::load(home)
@@ -113,6 +116,11 @@ fn project(home: &HomeLayout, g: &GroupDoc, a: &Actor) -> Result<Value, OpError>
     )
     .unwrap_or(Value::Null);
     let runtime = super::runtime_state::actor_state(home, &g.group_id, &a.id)?;
+    let elapsed = super::runtime_state::active_turn_elapsed_seconds(
+        &runtime,
+        &s["execution"],
+        chrono::Utc::now(),
+    );
     let has_turn = runtime["active_turn_id"]
         .as_str()
         .is_some_and(|s| !s.is_empty());
@@ -154,6 +162,7 @@ fn project(home: &HomeLayout, g: &GroupDoc, a: &Actor) -> Result<Value, OpError>
         json!({"group_id":g.group_id,"actor_id":a.id,"connected":c.is_object(),"bound":b.is_object(),
         "configured":configured,"phase":phase,"enabled":a.enabled,
         "pending_count":pending,"bot_url":b["url"],"active_turn_id":runtime["active_turn_id"],
+        "active_turn_elapsed_seconds":elapsed,
         "active_event_ids":runtime["active_event_ids"],"error_code":s["wake"]["error_code"],
         "http_status":s["wake"]["http_status"],"attempt":s["wake"]["attempt"],"last_execution":s["last_execution"]}),
     )
@@ -161,8 +170,15 @@ fn project(home: &HomeLayout, g: &GroupDoc, a: &Actor) -> Result<Value, OpError>
 fn configure(home: &HomeLayout, r: &DaemonRequest) -> OpResult {
     user(r)?;
     let (g, a) = group_actor(home, r)?;
+    super::actor_switch::refuse_pending(home, &g.group_id, &a.id)?;
     // GlobalWrite fences claims through validation and the private configuration
     // write. Native Actors need no process restart; preserve their enabled state.
+    if super::actor_runtime::actor_is_running(&g, &a) {
+        return Err(OpError::new(
+            "actor_must_be_stopped",
+            "Stop the previous Actor runtime before configuring Grok delivery",
+        ));
+    }
     if super::runtime_state::actor_state(home, &g.group_id, &a.id)?["active_turn_id"]
         .as_str()
         .is_some_and(|s| !s.is_empty())

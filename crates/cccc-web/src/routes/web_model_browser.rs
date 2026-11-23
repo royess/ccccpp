@@ -97,10 +97,11 @@ pub(super) async fn ensure_open_for_actor(
         .find(|a| a.id == actor_id)
         .ok_or_else(|| ApiError::not_found("Web Model Actor was removed"))?;
     let generation = crate::browser_surface::actor_identity(actor);
+    // Read again here: a runtime switch can land after the caller's check.
     let provider = actor
         .runtime
         .web_model_provider()
-        .expect("validated runtime");
+        .ok_or_else(|| ApiError::not_found("This Actor is no longer a Web Model"))?;
     let target = super::web_model_delivery_state::target(state, group_id, actor_id)?;
     let open_url = browser_open_url(&target, provider_url(provider))?;
     let profile = super::web_model_shared_browser::profile(state, provider);
@@ -112,6 +113,7 @@ pub(super) async fn ensure_open_for_actor(
             &open_url,
             (width, height),
             &generation,
+            &actor.created_at,
         )
         .await
         .map_err(|error| ApiError::bad(format!("{error:#}")))?;
@@ -183,7 +185,9 @@ async fn bind_current(State(state): State<AppState>, Json(body): Json<Value>) ->
     let group_id = required(&body, "group_id")?;
     let actor_id = required(&body, "actor_id")?;
     validate_actor(&state, &group_id, &actor_id)?;
-    let _control = super::web_model_delivery::control_guard(&group_id, &actor_id)?;
+    let _work = super::web_model_delivery::control_work(&state, &group_id, &actor_id)?;
+    // A switch may have finished while this waited for the lock.
+    validate_actor(&state, &group_id, &actor_id)?;
     require_stopped(&state, &group_id, &actor_id)?;
     let url = if body["new_chat"] == true {
         "https://chatgpt.com/".to_owned()
@@ -365,12 +369,14 @@ async fn payload(state: &AppState, group_id: &str, actor_id: &str, inspect: bool
             .browser_surfaces
             .prompt_readiness(&session_key)
             .await
-            .unwrap_or_else(|error| {
+            .unwrap_or_else(|_| {
                 json!({
                     "ready":false,
-                    "login_required":true,
+                    "login_required":false,
+                    "state":"inspection_failed",
+                    "checked_at":cccc_contracts::utc_now(),
                     "tab_url":surface["url"],
-                    "message":error.to_string()
+                    "message":"The browser page could not be inspected. Check again without reloading the conversation."
                 })
             });
         surface = state.browser_surfaces.info(&session_key).await;
@@ -390,6 +396,17 @@ async fn payload(state: &AppState, group_id: &str, actor_id: &str, inspect: bool
     let verification_required = readiness["verification_required"]
         .as_bool()
         .unwrap_or(false);
+    let browser_state = if verification_required {
+        "verification_required"
+    } else if ready {
+        "ready"
+    } else if login_required {
+        "sign_in_required"
+    } else if active {
+        readiness["state"].as_str().unwrap_or("open")
+    } else {
+        "idle"
+    };
     let url = readiness["tab_url"]
         .as_str()
         .or_else(|| surface["url"].as_str())
@@ -571,8 +588,26 @@ async fn payload(state: &AppState, group_id: &str, actor_id: &str, inspect: bool
             "Sign in",
             "Sign in using the shared browser for this provider.",
         )
+    } else if !ready {
+        (
+            "check_browser",
+            "Check page",
+            "The conversation input is not ready or its status is unknown. Check the page without reloading it.",
+        )
     } else if matches!(target_state, "missing" | "invalid" | "unavailable") {
-        ("bind_chat", "Choose a conversation", target_reason)
+        // Choosing a conversation is refused while the box holds an unsent draft,
+        // so the draft comes first.
+        if readiness["composer_chars"].as_u64().unwrap_or(0) > 0
+            || readiness["composer_has_attachments"] == true
+        {
+            (
+                "clear_composer",
+                "Clear the message box",
+                "The message box in this browser holds an unsent draft. Send or clear it there, then choose a conversation.",
+            )
+        } else {
+            ("bind_chat", "Choose a conversation", target_reason)
+        }
     } else if delivery_state == "pending_bind" {
         (
             "wait_for_chat_bind",
@@ -604,10 +639,10 @@ async fn payload(state: &AppState, group_id: &str, actor_id: &str, inspect: bool
         "tone":tone,
         "summary":next_label,
         "browser":{
-            "state":if verification_required{"verification_required"}else if ready{"ready"}else if login_required{"sign_in_required"}else if active{"open"}else{"closed"},
+            "state":if active {browser_state} else {"closed"},
             "label":if verification_required{"Needs verification"}else if ready{"Ready"}else if login_required{"Needs sign-in"}else if active{"Open"}else{"Not open"},
             "reason":readiness["message"].as_str().unwrap_or(if active {
-                "Sign in using the shared browser for this provider."
+                "Check the conversation input in this browser."
             } else {
                 "Open the shared browser to sign in or inspect the page."
             }),
@@ -639,13 +674,14 @@ async fn payload(state: &AppState, group_id: &str, actor_id: &str, inspect: bool
         "ready":ready,
         "login_required":login_required,
         "verification_required":verification_required,
+        "checked_at":readiness["checked_at"],
         "pid":metadata["pid"],
         "cdp_port":metadata["cdp_port"],
         "profile_dir":metadata["profile_dir"],
         "visibility":metadata["visibility"],
         "started_at":surface["started_at"],
         "updated_at":surface["updated_at"],
-        "state":if verification_required{"verification_required"}else if ready{"ready"}else if login_required{"sign_in_required"}else if active{"open"}else{"idle"},
+        "state":browser_state,
         "message":readiness["message"],
         "tab_url":url,
         "last_tab_url":url,
@@ -708,8 +744,9 @@ fn cached_readiness(surface: &Value) -> Value {
     json!({
         "ready":false,
         "login_required":false,
+        "state":"unchecked",
         "tab_url":current_url,
-        "message":"Browser is open; sign-in readiness has not been checked yet."
+        "message":"Browser is open; the conversation input has not been checked yet."
     })
 }
 

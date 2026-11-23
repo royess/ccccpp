@@ -16,6 +16,15 @@ impl AnalystLifecycle {
             .await
     }
 
+    pub(crate) async fn admit_group(
+        &self,
+        delegation_id: &str,
+        text: &str,
+    ) -> Result<VoiceDelegationAdmission> {
+        self.admit_input(delegation_id, text, AnalystTurnOrigin::Group)
+            .await
+    }
+
     pub(crate) async fn begin_actor_result(
         &self,
         correlation_id: &str,
@@ -28,6 +37,100 @@ impl AnalystLifecycle {
             AnalystTurnOrigin::ActorResult { speakable },
         )
         .await
+    }
+
+    pub(crate) async fn admit_chet_text(
+        &self,
+        id: &str,
+        text: &str,
+    ) -> Result<VoiceDelegationAdmission> {
+        if self.session.runtime() != cccc_contracts::ActorRuntime::Opencode {
+            return self.admit_terminal(id, text).await;
+        }
+        let delegation_id = id.trim();
+        let text = text.trim();
+        if delegation_id.is_empty() || text.is_empty() {
+            bail!("Chet input ID and text are required");
+        }
+        let origin = AnalystTurnOrigin::ChetText;
+        let mut state = self.state.lock().await;
+        if state.invalidated {
+            bail!("OpenCode lifecycle is unavailable");
+        }
+        if !state.queue.is_empty() || !super::queue::can_admit_private(&state) {
+            return self.enqueue(delegation_id, text, origin, state);
+        }
+        use sha2::Digest;
+        let fingerprint: [u8; 32] = sha2::Sha256::digest(text.as_bytes()).into();
+        if let Some(previous) = state.acp_inputs.get(delegation_id) {
+            if previous != &(fingerprint, origin) {
+                bail!("Input ID reused with different content or origin");
+            }
+            return Ok(state
+                .delegations
+                .get(delegation_id)
+                .cloned()
+                .map(VoiceDelegationAdmission::Turn)
+                .unwrap_or(VoiceDelegationAdmission::NativeInputPending));
+        }
+        match self
+            .submit_private_inbox(delegation_id, text, &mut state)
+            .await
+        {
+            Ok(()) => {
+                state
+                    .acp_inputs
+                    .insert(delegation_id.into(), (fingerprint, origin));
+                Ok(VoiceDelegationAdmission::NativeInputPending)
+            }
+            Err(error) if is_would_block(&error) => {
+                self.enqueue(delegation_id, text, origin, state)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Keep admission serialized with Group reservations and with delivery events.
+    /// A private input released by the host queue needs the same inbox evidence.
+    pub(super) async fn submit_private_inbox(
+        &self,
+        id: &str,
+        text: &str,
+        state: &mut LifecycleState,
+    ) -> Result<()> {
+        self.session
+            .submit_bound_opencode(self.session.generation(), id, text)
+            .await?;
+        // Account for any deadline that elapsed before this acceptance.
+        super::queue::update_group_waits(state, tokio::time::Instant::now());
+        state.native_pending.push_back(PendingStart {
+            delegation_id: id.into(),
+            origin: AnalystTurnOrigin::ChetText,
+            cancelling: false,
+        });
+        self.queue_notify.notify_one();
+        Ok(())
+    }
+
+    pub(crate) async fn admit_group_until(
+        &self,
+        id: &str,
+        text: &str,
+        deadline: &GroupWaitDeadline,
+    ) -> Result<VoiceDelegationAdmission> {
+        if self.session.runtime() != cccc_contracts::ActorRuntime::Opencode {
+            return self.admit_group(id, text).await;
+        }
+        let id = id.trim();
+        let text = text.trim();
+        if id.is_empty() || text.is_empty() {
+            bail!("Group input ID and text are required");
+        }
+        let state = self.state.lock().await;
+        if state.invalidated {
+            bail!("OpenCode lifecycle is unavailable");
+        }
+        self.enqueue_until(id, text, AnalystTurnOrigin::Group, state, Some(deadline))
     }
 
     pub(super) async fn admit_input(
@@ -45,9 +148,47 @@ impl AnalystLifecycle {
         if state.invalidated {
             bail!("Voice Analyst lifecycle is no longer trustworthy");
         }
-        if self.session.structured_only() {
-            // Pure ACP has no native busy-input surface. Every accepted input
-            // uses a visible FIFO, never an overlapping session/prompt request.
+        let bound_opencode_input = self.session.runtime() == cccc_contracts::ActorRuntime::Opencode
+            && origin != AnalystTurnOrigin::Voice;
+        if self.session.runtime() == cccc_contracts::ActorRuntime::Opencode
+            && origin == AnalystTurnOrigin::Voice
+            && state
+                .queue
+                .iter()
+                .any(|input| input.origin == AnalystTurnOrigin::Group)
+        {
+            return self.enqueue(delegation_id, text, origin, state);
+        }
+        if self.session.structured_only() || bound_opencode_input {
+            // These requests use the host queue to reserve their own turn.
+            // OpenCode's visible TUI may have switched sessions; use the bound
+            // HTTP session, as Actor delivery does. Voice retains native admission.
+            return self.enqueue(delegation_id, text, origin, state);
+        }
+        if origin == AnalystTurnOrigin::Group {
+            let idle = state.active.is_none()
+                && state.pending.is_none()
+                && state.native_pending.is_empty()
+                && state.queue.is_empty();
+            if !idle {
+                return self.enqueue(delegation_id, text, origin, state);
+            }
+        }
+        // No other input, including an older Voice notification, can join a
+        // Group turn whose result belongs to a single Group message.
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|turn| turn.origin == AnalystTurnOrigin::Group)
+            || state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.origin == AnalystTurnOrigin::Group)
+            || state
+                .native_pending
+                .iter()
+                .any(|pending| pending.origin == AnalystTurnOrigin::Group)
+        {
             return self.enqueue(delegation_id, text, origin, state);
         }
         if let Some(receipt) = state.delegations.get(delegation_id) {
@@ -112,13 +253,18 @@ impl AnalystLifecycle {
         }
     }
 
-    async fn register_native_input(
+    pub(super) async fn register_native_input(
         &self,
         delegation_id: &str,
         text: &str,
         origin: AnalystTurnOrigin,
         mut state: tokio::sync::MutexGuard<'_, LifecycleState>,
     ) -> Result<VoiceDelegationAdmission> {
+        // A start request can return busy after the lifecycle was invalidated.
+        // Do not queue a new native delivery on an owner that cannot track it.
+        if state.invalidated {
+            bail!("Voice Analyst lifecycle ended before native input could be registered");
+        }
         state.native_pending.push_back(PendingStart {
             delegation_id: delegation_id.to_owned(),
             origin,
@@ -132,6 +278,7 @@ impl AnalystLifecycle {
         {
             let mut state = self.state.lock().await;
             remove_native_pending(&mut state.native_pending, delegation_id);
+            self.queue_notify.notify_one();
             return Err(error).context("register Voice delegation for native Runtime input");
         }
         Ok(VoiceDelegationAdmission::NativeInput {
@@ -179,6 +326,7 @@ impl AnalystLifecycle {
             pending.delegation_id == delegation_id && pending.origin == origin
         }) {
             state.pending = None;
+            self.queue_notify.notify_one();
         }
         let settled_pending = if state
             .settled_pending
@@ -202,6 +350,13 @@ impl AnalystLifecycle {
                         .delegations
                         .insert(delegation_id.to_owned(), receipt.clone());
                     return Ok(receipt);
+                }
+                // The receipt alone cannot restore event tracking after a gap or
+                // disconnect. The Runtime may have done work, so do not replay it.
+                if state.invalidated {
+                    bail!(
+                        "Voice Analyst lifecycle ended during admission; the outcome is unconfirmed"
+                    );
                 }
                 let emit_started = if let Some(active) = state.active.as_mut() {
                     if active.turn_id != receipt.turn_id {
@@ -270,6 +425,7 @@ impl AnalystLifecycle {
             // rolled back or replayed.
             return Ok(false);
         }
+        self.queue_notify.notify_one();
         self.session
             .forget_native_input(self.session.generation(), delegation_id)
             .await
@@ -282,12 +438,40 @@ impl AnalystLifecycle {
         let mut lifecycle_events = wait_for_settlement.then(|| self.subscribe());
         let (turn_id, pending_id) = {
             let mut state = self.state.lock().await;
-            let queued = state.queue.drain(..).collect::<Vec<_>>();
+            // Cancelling the user's current turn must not discard an
+            // independent Group request waiting behind it. If the current
+            // turn itself came from a Group, retain the existing cancel-all
+            // behavior for that work and its queued inputs.
+            let current_origin = state
+                .active
+                .as_ref()
+                .map(|active| active.origin)
+                .or_else(|| state.pending.as_ref().map(|pending| pending.origin))
+                .or_else(|| state.native_pending.front().map(|pending| pending.origin))
+                .or_else(|| state.queue.front().map(|input| input.origin));
+            let preserve_group =
+                current_origin.is_some_and(|origin| origin != AnalystTurnOrigin::Group);
+            let (retained, queued): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) =
+                state.queue.drain(..).partition(|input| {
+                    input.wait_expired()
+                        || (preserve_group && input.origin == AnalystTurnOrigin::Group)
+                });
+            state.queue = retained;
             self.queue_len
-                .store(0, std::sync::atomic::Ordering::Release);
+                .store(state.queue.len(), std::sync::atomic::Ordering::Release);
             let had_queued = !queued.is_empty();
             for input in queued {
-                self.complete_unadmitted_input(&input.delegation_id, input.origin, "cancelled", "");
+                self.complete_unadmitted_input(
+                    &input.delegation_id,
+                    input.origin,
+                    "cancelled",
+                    "",
+                    AnalystCompletionSource::HostNotStarted,
+                );
+            }
+            if !state.queue.is_empty() {
+                // A retained Group input may now be the next runnable item.
+                self.queue_notify.notify_one();
             }
             if let Some(active) = state.active.as_mut() {
                 if active.cancelling {
@@ -351,7 +535,9 @@ impl AnalystLifecycle {
             };
             if let Err(error) = settled {
                 self.invalidate().await;
-                if let Err(stop_error) = self.session.stop(self.session.generation()).await {
+                if let Err(stop_error) =
+                    self.session.stop_for_voice(self.session.generation()).await
+                {
                     tracing::warn!(%stop_error, "failed to stop an untrustworthy managed Runtime after cancellation");
                 }
                 return Err(error);

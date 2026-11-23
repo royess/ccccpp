@@ -607,7 +607,7 @@ async fn offline_provider_child() {
                 );
                 json!({"thread":{"id":thread},"activePermissionProfile":{"id":profile},"sandbox":{"type":"workspaceWrite","networkAccess":false},"runtimeWorkspaceRoots":[std::env::current_dir().expect("cwd")]})
             }
-            "thread/read" => json!({"thread":{"id":thread,"turns":[]}}),
+            "thread/read" => json!({"thread":{"id":thread,"path":"fixture-rollout.jsonl","turns":[]}}),
             "turn/start" => {
                 let prompt = message["params"]["input"][0]["text"]
                     .as_str()

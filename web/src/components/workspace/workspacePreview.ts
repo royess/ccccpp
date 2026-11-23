@@ -9,12 +9,24 @@ export function workspacePreviewKind(file: WorkspaceFile) {
   if (mime.startsWith("video/")) return file.binary ? "video" : "text";
   if (mime.startsWith("audio/")) return file.binary ? "audio" : "text";
   if (mime === "application/pdf") return "pdf";
-  if (file.binary || file.truncated) return "text";
+  if (file.binary) return "text";
+  // HTML has a separate, preview-only read budget. Never render its truncated text prefix.
+  if (mime === "text/html" || extension === "html" || extension === "htm") return "html";
+  if (file.truncated) return "text";
   if (mime === "text/markdown" || extension === "md" || extension === "markdown") return "markdown";
   if (mime === "text/csv" || extension === "csv") return "csv";
   if (mime === "text/tab-separated-values" || extension === "tsv") return "tsv";
-  if (mime === "text/html" || extension === "html" || extension === "htm") return "html";
   return "text";
+}
+
+/** A URL a document may use as it stands, or null when it is relative to the document. */
+export function absoluteDocumentUrl(href: string, target: "image" | "link"): string | null {
+  if (href.startsWith("#")) return target === "link" ? href : "";
+  if (/^https?:\/\//i.test(href)) return href;
+  if (target === "link" && /^mailto:/i.test(href)) return href;
+  if (target === "image" && /^data:image\/(png|gif|jpeg|webp|svg\+xml)[;,]/i.test(href))
+    return href;
+  return null;
 }
 
 /** Resolve document URLs without converting literal POSIX backslashes to separators. */
